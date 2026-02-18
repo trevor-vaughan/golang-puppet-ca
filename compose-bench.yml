@@ -1,0 +1,53 @@
+# Load / performance test topology for puppet-ca.
+#
+# Services
+# --------
+#   puppet-ca  — CA server with autosign=true so the workflow scenario
+#                (generate → status → cert → clean) is fully self-contained.
+#   k6         — Grafana k6 load runner executing test/load.js.
+#
+# Usage (from project root):
+#   mage bench                        # build images, run k6, tear down
+#   podman-compose -f compose-bench.yml up --build   # interactive
+
+name: puppet-ca-bench
+
+services:
+
+  # ── CA server ─────────────────────────────────────────────────────────────
+  puppet-ca:
+    build:
+      context: .
+    image: puppet-ca-integ:latest   # reuse the image built by mage build / integCompose
+    command:
+      - --cadir=/data
+      - --autosign-config=true      # workflow scenario needs immediate signing
+      - -v=0                        # quiet logging; reduces I/O noise during load
+    expose:
+      - "8140"
+    volumes:
+      - ca-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8140/puppet-ca/v1/certificate/ca"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 8s
+
+  # ── k6 load runner ────────────────────────────────────────────────────────
+  k6:
+    image: grafana/k6:latest
+    command:
+      - run
+      - --env
+      - CA_URL=http://puppet-ca:8140
+      - /test/load.js
+    volumes:
+      # Mount the test directory read-only; :z relabels for SELinux (RHEL/CentOS).
+      - ./test:/test:ro,z
+    depends_on:
+      puppet-ca:
+        condition: service_healthy
+
+volumes:
+  ca-data:

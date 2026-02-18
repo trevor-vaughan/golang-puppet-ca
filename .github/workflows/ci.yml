@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+# Cancel in-flight runs for the same branch/PR so pushes don't queue up.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ── Format / vet / tidy ──────────────────────────────────────────────────────
+  check:
+    name: Format / vet / tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+      - name: Check formatting, vet, and module tidy
+        run: mage dev:check
+
+  # ── Unit tests ───────────────────────────────────────────────────────────────
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+      - name: Run unit tests
+        run: mage test:unit
+
+  # ── Integration tests (podman, single container) ─────────────────────────────
+  # ubuntu-latest ships podman; integration.sh uses it directly.
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+      - name: Run integration tests
+        run: mage test:integ
+
+  # ── Compose integration tests (docker compose) ───────────────────────────────
+  # podman-compose is not pre-installed on GitHub runners; composeCmd() in
+  # magefile.go falls back to `docker compose` (v2 plugin, always available).
+  compose:
+    name: Compose integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+      - name: Run compose integration tests
+        run: mage test:integCompose

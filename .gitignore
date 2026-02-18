@@ -1,0 +1,24 @@
+# Compiled binaries
+bin/
+*.exe
+
+# Test binaries and output
+*.test
+*.out
+coverage.html
+
+# Local CA runtime data (used during development with --cadir=tmp)
+tmp/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Mage build cache
+.mage/

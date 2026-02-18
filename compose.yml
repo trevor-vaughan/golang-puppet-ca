@@ -1,0 +1,60 @@
+# Multi-host integration test topology for puppet-ca.
+#
+# Services
+# --------
+#   puppet-ca   — CA server (no autosign; operators must sign manually)
+#   test-runner — Separate container acting as both puppet-agent and operator.
+#                 Communicates with puppet-ca over the internal network,
+#                 validating true cross-host behaviour.
+#
+# Usage (from project root):
+#   mage integCompose          # build, run, tear down (exit 0 on all pass)
+#   podman-compose up --build  # interactive; ctrl-c to stop
+#
+# Environment variables honoured by test-runner:
+#   DO_LOAD=true    Enable concurrency / load tests (default: false)
+
+name: puppet-ca-integ
+
+services:
+
+  # ── CA server ─────────────────────────────────────────────────────────────
+  puppet-ca:
+    build:
+      context: .
+    image: puppet-ca-integ:latest
+    # autosign=false so the test-runner must explicitly sign via puppet-ca-ctl,
+    # exercising the full operator workflow.
+    command:
+      - --cadir=/data
+      - --autosign-config=false
+      - -v=1
+    expose:
+      - "8140"
+    volumes:
+      - ca-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8140/puppet-ca/v1/certificate/ca"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 8s
+
+  # ── Test runner ───────────────────────────────────────────────────────────
+  # Simulates a separate host (puppet-agent + operator) talking to puppet-ca
+  # over the compose network using the DNS name "puppet-ca".
+  test-runner:
+    image: puppet-ca-integ:latest
+    depends_on:
+      puppet-ca:
+        condition: service_healthy
+    environment:
+      - CA_URL=http://puppet-ca:8140
+      - DO_LOAD=${DO_LOAD:-false}
+    volumes:
+      # Mount the test script read-only; :z relabels for SELinux (required on RHEL/CentOS).
+      - ./test:/test:ro,z
+    entrypoint: ["bash", "/test/integration-compose.sh"]
+
+volumes:
+  ca-data:

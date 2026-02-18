@@ -1,0 +1,10 @@
+- [x] Verbosity is not working (not enough debug) — fixed: use `-v 1` for Debug, `-v 2` for Trace; slog.Debug added throughout CA operations
+- [x] app immediately dies when running in a container — fixed: server now runs in foreground by default; daemon mode requires explicit `--daemon` flag
+- [x] File naming used SHA256 hashes instead of `<subject>.pem` — broke Puppet compatibility and tests
+- [x] Missing API endpoints: GET /certificate/{subject}, GET /certificate_revocation_list/ca, GET /certificate_request/{subject}
+- [x] FilePermPublic was 0640 (should be 0644)
+- [x] Deprecated cert.CreateCRL() replaced with x509.CreateRevocationList()
+- [x] Hardcoded CA hostname — now configurable via --hostname flag
+- [x] Subject regex not applied in SaveRequest
+- [x] CSR not deleted after signing
+- [x] GET /certificate_status always returned "signed", never "revoked"

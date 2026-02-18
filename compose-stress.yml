@@ -1,0 +1,54 @@
+# Upper-limit stress test topology for puppet-ca.
+#
+# Purpose: find the saturation ceiling — NOT a pass/fail test.
+# k6 ramps arrival rate until the server can no longer keep up,
+# then reports where latency and dropped_iterations spike.
+#
+# WARNING: This will deliberately push puppet-ca to (and past) its limits.
+#          Do not run against a shared or production server.
+#
+# Usage:
+#   mage stress                                          # run and tear down
+#   podman-compose -f compose-stress.yml up --build     # interactive
+
+name: puppet-ca-stress
+
+services:
+
+  # ── CA server ─────────────────────────────────────────────────────────────
+  puppet-ca:
+    build:
+      context: .
+    image: puppet-ca-integ:latest
+    command:
+      - --cadir=/data
+      - --autosign-config=true   # write scenario uses /generate (no CSR needed)
+      - --logfile=/dev/null      # discard all server logs; k6 progress lines are the status bar
+    expose:
+      - "8140"
+    volumes:
+      - ca-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8140/puppet-ca/v1/certificate/ca"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 8s
+
+  # ── k6 stress runner ──────────────────────────────────────────────────────
+  k6:
+    image: grafana/k6:latest
+    command:
+      - run
+      - --quiet                        # suppress per-second metric dumps (non-TTY noise)
+      - --env
+      - CA_URL=http://puppet-ca:8140
+      - /test/stress.js
+    volumes:
+      - ./test:/test:ro,z
+    depends_on:
+      puppet-ca:
+        condition: service_healthy
+
+volumes:
+  ca-data:
