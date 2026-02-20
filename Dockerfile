@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-FROM centos:stream10 AS builder
+FROM quay.io/centos/centos:stream10 AS builder
 
 RUN dnf install -y golang git && dnf clean all
 
@@ -15,7 +15,7 @@ RUN GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux \
     go build -ldflags="-s -w" -o /puppet-ca-ctl ./cmd/puppet-ca-ctl/
 
 # ---- Runtime Stage ----
-FROM centos:stream10
+FROM quay.io/centos/centos:stream10
 
 # curl: health checks and agent CSR submission
 # openssl: CSR generation and cert verification in integration tests
