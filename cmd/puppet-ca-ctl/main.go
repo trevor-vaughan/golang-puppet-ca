@@ -15,11 +15,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 // puppet-ca-ctl is an operator management CLI for the puppet-ca server.
-// It mirrors the subcommands of tvaughan-server-ca:
 //
-//	list, sign, revoke, clean, generate, setup, import
-//
-// Global flags must appear before the subcommand.
 // Usage:
 //
 //	puppet-ca-ctl [global-flags] <subcommand> [subcommand-flags]
@@ -31,8 +27,6 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -42,11 +36,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/tvaughan/puppet-ca/internal/ca"
 	"github.com/tvaughan/puppet-ca/internal/storage"
 )
 
-// ---------- global state ----------
+// ---------- global state (set by persistent flags) ----------
 
 var (
 	globalServerURL  string
@@ -63,46 +58,40 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-func newClient() *Client {
+func newClient() (*Client, error) {
 	transport := &http.Transport{}
 
 	tlsCfg := &tls.Config{}
-	needTLS := false
 
 	if globalCACert != "" {
 		caCertPEM, err := os.ReadFile(globalCACert)
 		if err != nil {
-			fatalf("Error reading --ca-cert %s: %v", globalCACert, err)
+			return nil, fmt.Errorf("reading --ca-cert %s: %w", globalCACert, err)
 		}
 		pool := x509.NewCertPool()
 		block, _ := pem.Decode(caCertPEM)
 		if block != nil {
 			cert, err := x509.ParseCertificate(block.Bytes)
 			if err != nil {
-				fatalf("Error parsing --ca-cert: %v", err)
+				return nil, fmt.Errorf("parsing --ca-cert: %w", err)
 			}
 			pool.AddCert(cert)
 		}
 		tlsCfg.RootCAs = pool
-		needTLS = true
 	} else {
 		// No CA cert provided: skip TLS verification (useful for self-signed dev certs).
 		tlsCfg.InsecureSkipVerify = true //nolint:gosec
-		needTLS = true
 	}
 
 	if globalClientCert != "" && globalClientKey != "" {
 		cert, err := tls.LoadX509KeyPair(globalClientCert, globalClientKey)
 		if err != nil {
-			fatalf("Error loading --client-cert/--client-key: %v", err)
+			return nil, fmt.Errorf("loading --client-cert/--client-key: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
-		needTLS = true
 	}
 
-	if needTLS {
-		transport.TLSClientConfig = tlsCfg
-	}
+	transport.TLSClientConfig = tlsCfg
 
 	return &Client{
 		BaseURL: strings.TrimRight(globalServerURL, "/"),
@@ -110,7 +99,7 @@ func newClient() *Client {
 			Transport: transport,
 			Timeout:   30 * time.Second,
 		},
-	}
+	}, nil
 }
 
 func (c *Client) do(method, path string, body []byte) (int, []byte, error) {
@@ -153,16 +142,11 @@ func (c *Client) post(path string, body []byte) (int, []byte, error) {
 
 // ---------- helpers ----------
 
-func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
-	os.Exit(1)
-}
-
-func checkHTTP(code int, body []byte, method, path string) {
+func checkHTTP(code int, body []byte, method, path string) error {
 	if code >= 200 && code < 300 {
-		return
+		return nil
 	}
-	fatalf("HTTP %d on %s %s: %s", code, method, path, strings.TrimSpace(string(body)))
+	return fmt.Errorf("HTTP %d on %s %s: %s", code, method, path, strings.TrimSpace(string(body)))
 }
 
 func printTable(rows [][2]string) {
@@ -177,307 +161,330 @@ func printTable(rows [][2]string) {
 	}
 }
 
-// ---------- subcommand: list ----------
+// ---------- subcommand constructors ----------
 
-func cmdList(args []string) {
-	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	all := fs.Bool("all", false, "List all certs (default: only pending CSRs)")
-	if err := fs.Parse(args); err != nil {
-		fatalf("list: %v", err)
-	}
+func newListCmd() *cobra.Command {
+	var all bool
+	cmd := &cobra.Command{
+		Use:          "list",
+		Short:        "List pending (or all) certificate requests",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newClient()
+			if err != nil {
+				return err
+			}
 
-	c := newClient()
-	path := "/puppet-ca/v1/certificate_statuses/all"
-	if !*all {
-		path += "?state=requested"
-	}
+			path := "/puppet-ca/v1/certificate_statuses/all"
+			if !all {
+				path += "?state=requested"
+			}
 
-	code, body, err := c.get(path)
-	if err != nil {
-		fatalf("list: %v", err)
-	}
-	checkHTTP(code, body, "GET", path)
+			code, body, err := c.get(path)
+			if err != nil {
+				return err
+			}
+			if err := checkHTTP(code, body, "GET", path); err != nil {
+				return err
+			}
 
-	var statuses []struct {
-		Name  string `json:"name"`
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(body, &statuses); err != nil {
-		fatalf("list: could not parse response: %v", err)
-	}
+			var statuses []struct {
+				Name  string `json:"name"`
+				State string `json:"state"`
+			}
+			if err := json.Unmarshal(body, &statuses); err != nil {
+				return fmt.Errorf("could not parse response: %w", err)
+			}
 
-	if len(statuses) == 0 {
-		fmt.Println("(no certificates)")
-		return
+			if len(statuses) == 0 {
+				fmt.Println("(no certificates)")
+				return nil
+			}
+			rows := make([][2]string, len(statuses))
+			for i, s := range statuses {
+				rows[i] = [2]string{s.Name, s.State}
+			}
+			printTable(rows)
+			return nil
+		},
 	}
-	rows := make([][2]string, len(statuses))
-	for i, s := range statuses {
-		rows[i] = [2]string{s.Name, s.State}
-	}
-	printTable(rows)
+	cmd.Flags().BoolVar(&all, "all", false, "List all certs (default: only pending CSRs)")
+	return cmd
 }
 
-// ---------- subcommand: sign ----------
+func newSignCmd() *cobra.Command {
+	var certname string
+	var all bool
+	cmd := &cobra.Command{
+		Use:          "sign",
+		Short:        "Sign a pending CSR (or --all)",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newClient()
+			if err != nil {
+				return err
+			}
 
-func cmdSign(args []string) {
-	fs := flag.NewFlagSet("sign", flag.ExitOnError)
-	certname := fs.String("certname", "", "Subject name to sign")
-	all := fs.Bool("all", false, "Sign all pending CSRs")
-	if err := fs.Parse(args); err != nil {
-		fatalf("sign: %v", err)
+			if all {
+				code, body, err := c.post("/puppet-ca/v1/sign/all", nil)
+				if err != nil {
+					return err
+				}
+				if err := checkHTTP(code, body, "POST", "/puppet-ca/v1/sign/all"); err != nil {
+					return err
+				}
+				var result struct {
+					Signed []string `json:"signed"`
+				}
+				if err := json.Unmarshal(body, &result); err != nil {
+					return fmt.Errorf("parse error: %w", err)
+				}
+				if len(result.Signed) == 0 {
+					fmt.Println("Signed: (none)")
+				} else {
+					fmt.Printf("Signed: %s\n", strings.Join(result.Signed, ", "))
+				}
+				return nil
+			}
+
+			if certname == "" {
+				return fmt.Errorf("--certname or --all is required")
+			}
+
+			path := "/puppet-ca/v1/certificate_status/" + certname
+			body, _ := json.Marshal(map[string]string{"desired_state": "signed"})
+			code, respBody, err := c.put(path, body)
+			if err != nil {
+				return err
+			}
+			if err := checkHTTP(code, respBody, "PUT", path); err != nil {
+				return err
+			}
+			fmt.Printf("Signed %s\n", certname)
+			return nil
+		},
 	}
-
-	c := newClient()
-
-	if *all {
-		code, body, err := c.post("/puppet-ca/v1/sign/all", nil)
-		if err != nil {
-			fatalf("sign --all: %v", err)
-		}
-		checkHTTP(code, body, "POST", "/puppet-ca/v1/sign/all")
-		var result struct {
-			Signed []string `json:"signed"`
-		}
-		if err := json.Unmarshal(body, &result); err != nil {
-			fatalf("sign --all: parse error: %v", err)
-		}
-		if len(result.Signed) == 0 {
-			fmt.Println("Signed: (none)")
-		} else {
-			fmt.Printf("Signed: %s\n", strings.Join(result.Signed, ", "))
-		}
-		return
-	}
-
-	if *certname == "" {
-		fatalf("sign: --certname or --all is required")
-	}
-
-	path := "/puppet-ca/v1/certificate_status/" + *certname
-	body, _ := json.Marshal(map[string]string{"desired_state": "signed"})
-	code, respBody, err := c.put(path, body)
-	if err != nil {
-		fatalf("sign: %v", err)
-	}
-	checkHTTP(code, respBody, "PUT", path)
-	fmt.Printf("Signed %s\n", *certname)
+	cmd.Flags().StringVar(&certname, "certname", "", "Subject name to sign")
+	cmd.Flags().BoolVar(&all, "all", false, "Sign all pending CSRs")
+	return cmd
 }
 
-// ---------- subcommand: revoke ----------
+func newRevokeCmd() *cobra.Command {
+	var certname string
+	cmd := &cobra.Command{
+		Use:          "revoke",
+		Short:        "Revoke a certificate",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newClient()
+			if err != nil {
+				return err
+			}
 
-func cmdRevoke(args []string) {
-	fs := flag.NewFlagSet("revoke", flag.ExitOnError)
-	certname := fs.String("certname", "", "Subject name to revoke (required)")
-	if err := fs.Parse(args); err != nil {
-		fatalf("revoke: %v", err)
+			path := "/puppet-ca/v1/certificate_status/" + certname
+			body, _ := json.Marshal(map[string]string{"desired_state": "revoked"})
+			code, respBody, err := c.put(path, body)
+			if err != nil {
+				return err
+			}
+			if err := checkHTTP(code, respBody, "PUT", path); err != nil {
+				return err
+			}
+			fmt.Printf("Revoked %s\n", certname)
+			return nil
+		},
 	}
-	if *certname == "" {
-		fatalf("revoke: --certname is required")
-	}
-
-	c := newClient()
-	path := "/puppet-ca/v1/certificate_status/" + *certname
-	body, _ := json.Marshal(map[string]string{"desired_state": "revoked"})
-	code, respBody, err := c.put(path, body)
-	if err != nil {
-		fatalf("revoke: %v", err)
-	}
-	checkHTTP(code, respBody, "PUT", path)
-	fmt.Printf("Revoked %s\n", *certname)
+	cmd.Flags().StringVar(&certname, "certname", "", "Subject name to revoke")
+	_ = cmd.MarkFlagRequired("certname")
+	return cmd
 }
 
-// ---------- subcommand: clean ----------
+func newCleanCmd() *cobra.Command {
+	var certname string
+	cmd := &cobra.Command{
+		Use:          "clean",
+		Short:        "Revoke and delete a certificate/CSR",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newClient()
+			if err != nil {
+				return err
+			}
 
-func cmdClean(args []string) {
-	fs := flag.NewFlagSet("clean", flag.ExitOnError)
-	certname := fs.String("certname", "", "Subject name to clean (required)")
-	if err := fs.Parse(args); err != nil {
-		fatalf("clean: %v", err)
+			path := "/puppet-ca/v1/certificate_status/" + certname
+			code, respBody, err := c.delete(path)
+			if err != nil {
+				return err
+			}
+			if err := checkHTTP(code, respBody, "DELETE", path); err != nil {
+				return err
+			}
+			fmt.Printf("Cleaned %s\n", certname)
+			return nil
+		},
 	}
-	if *certname == "" {
-		fatalf("clean: --certname is required")
-	}
-
-	c := newClient()
-	path := "/puppet-ca/v1/certificate_status/" + *certname
-	code, respBody, err := c.delete(path)
-	if err != nil {
-		fatalf("clean: %v", err)
-	}
-	checkHTTP(code, respBody, "DELETE", path)
-	fmt.Printf("Cleaned %s\n", *certname)
+	cmd.Flags().StringVar(&certname, "certname", "", "Subject name to clean")
+	_ = cmd.MarkFlagRequired("certname")
+	return cmd
 }
 
-// ---------- subcommand: generate ----------
+func newGenerateCmd() *cobra.Command {
+	var certname, outDir, dns string
+	cmd := &cobra.Command{
+		Use:          "generate",
+		Short:        "Generate a server-side key+cert pair",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newClient()
+			if err != nil {
+				return err
+			}
 
-func cmdGenerate(args []string) {
-	fs := flag.NewFlagSet("generate", flag.ExitOnError)
-	certname := fs.String("certname", "", "Subject name to generate (required)")
-	outDir := fs.String("out-dir", ".", "Directory to save the private key file")
-	dns := fs.String("dns", "", "Comma-separated DNS alt names")
-	if err := fs.Parse(args); err != nil {
-		fatalf("generate: %v", err)
-	}
-	if *certname == "" {
-		fatalf("generate: --certname is required")
-	}
+			path := "/puppet-ca/v1/generate/" + certname
+			if dns != "" {
+				path += "?dns=" + strings.ReplaceAll(dns, ",", "&dns=")
+			}
 
-	path := "/puppet-ca/v1/generate/" + *certname
-	if *dns != "" {
-		path += "?dns=" + strings.ReplaceAll(*dns, ",", "&dns=")
-	}
+			code, body, err := c.post(path, nil)
+			if err != nil {
+				return err
+			}
+			if err := checkHTTP(code, body, "POST", path); err != nil {
+				return err
+			}
 
-	c := newClient()
-	code, body, err := c.post(path, nil)
-	if err != nil {
-		fatalf("generate: %v", err)
-	}
-	checkHTTP(code, body, "POST", path)
+			var result struct {
+				PrivateKey  string `json:"private_key"`
+				Certificate string `json:"certificate"`
+			}
+			if err := json.Unmarshal(body, &result); err != nil {
+				return fmt.Errorf("could not parse response: %w", err)
+			}
 
-	var result struct {
-		PrivateKey  string `json:"private_key"`
-		Certificate string `json:"certificate"`
+			keyPath := filepath.Join(outDir, certname+"_key.pem")
+			if err := os.WriteFile(keyPath, []byte(result.PrivateKey), 0640); err != nil {
+				return fmt.Errorf("failed to save private key to %s: %w", keyPath, err)
+			}
+			fmt.Fprintf(os.Stderr, "Private key saved to %s\n", keyPath)
+			fmt.Print(result.Certificate)
+			return nil
+		},
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		fatalf("generate: could not parse response: %v", err)
-	}
-
-	// Save private key.
-	keyPath := filepath.Join(*outDir, *certname+"_key.pem")
-	if err := os.WriteFile(keyPath, []byte(result.PrivateKey), 0640); err != nil {
-		fatalf("generate: failed to save private key to %s: %v", keyPath, err)
-	}
-	fmt.Fprintf(os.Stderr, "Private key saved to %s\n", keyPath)
-
-	// Print certificate to stdout.
-	fmt.Print(result.Certificate)
+	cmd.Flags().StringVar(&certname, "certname", "", "Subject name to generate")
+	cmd.Flags().StringVar(&outDir, "out-dir", ".", "Directory to save the private key file")
+	cmd.Flags().StringVar(&dns, "dns", "", "Comma-separated DNS alt names")
+	_ = cmd.MarkFlagRequired("certname")
+	return cmd
 }
 
-// ---------- subcommand: setup ----------
+func newSetupCmd() *cobra.Command {
+	var caDir, hostname string
+	cmd := &cobra.Command{
+		Use:          "setup",
+		Short:        "Initialise a new CA (offline)",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			absDir, err := filepath.Abs(caDir)
+			if err != nil {
+				return fmt.Errorf("invalid --cadir: %w", err)
+			}
 
-func cmdSetup(args []string) {
-	fs := flag.NewFlagSet("setup", flag.ExitOnError)
-	caDir := fs.String("cadir", "", "Directory to initialise CA in (required)")
-	hostname := fs.String("hostname", "puppet", "Hostname for the CA certificate CN")
-	if err := fs.Parse(args); err != nil {
-		fatalf("setup: %v", err)
+			store := storage.New(absDir)
+			myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
+			if err := myCA.Init(); err != nil {
+				return err
+			}
+			fmt.Printf("CA initialized in %s (CN: Puppet CA: %s)\n", absDir, hostname)
+			return nil
+		},
 	}
-	if *caDir == "" {
-		fatalf("setup: --cadir is required")
-	}
-
-	absDir, err := filepath.Abs(*caDir)
-	if err != nil {
-		fatalf("setup: invalid --cadir: %v", err)
-	}
-
-	store := storage.New(absDir)
-	myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, *hostname)
-	if err := myCA.Init(); err != nil {
-		fatalf("setup: %v", err)
-	}
-	fmt.Printf("CA initialized in %s (CN: Puppet CA: %s)\n", absDir, *hostname)
+	cmd.Flags().StringVar(&caDir, "cadir", "", "Directory to initialise CA in")
+	cmd.Flags().StringVar(&hostname, "hostname", "puppet", "Hostname for the CA certificate CN")
+	_ = cmd.MarkFlagRequired("cadir")
+	return cmd
 }
 
-// ---------- subcommand: import ----------
+func newImportCmd() *cobra.Command {
+	var caDir, certBundle, privateKey, crlChain string
+	cmd := &cobra.Command{
+		Use:          "import",
+		Short:        "Import an external CA cert/key (offline)",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			absDir, err := filepath.Abs(caDir)
+			if err != nil {
+				return fmt.Errorf("invalid --cadir: %w", err)
+			}
 
-func cmdImport(args []string) {
-	fs := flag.NewFlagSet("import", flag.ExitOnError)
-	caDir := fs.String("cadir", "", "CA storage directory (required)")
-	certBundle := fs.String("cert-bundle", "", "Path to CA certificate PEM (required)")
-	privateKey := fs.String("private-key", "", "Path to CA private key PEM (required)")
-	crlChain := fs.String("crl-chain", "", "Path to CRL PEM (optional; one will be generated if absent)")
-	if err := fs.Parse(args); err != nil {
-		fatalf("import: %v", err)
-	}
-	if *caDir == "" {
-		fatalf("import: --cadir is required")
-	}
-	if *certBundle == "" {
-		fatalf("import: --cert-bundle is required")
-	}
-	if *privateKey == "" {
-		fatalf("import: --private-key is required")
-	}
+			certPEM, err := os.ReadFile(certBundle)
+			if err != nil {
+				return fmt.Errorf("reading --cert-bundle: %w", err)
+			}
+			keyPEM, err := os.ReadFile(privateKey)
+			if err != nil {
+				return fmt.Errorf("reading --private-key: %w", err)
+			}
+			var crlPEM []byte
+			if crlChain != "" {
+				crlPEM, err = os.ReadFile(crlChain)
+				if err != nil {
+					return fmt.Errorf("reading --crl-chain: %w", err)
+				}
+			}
 
-	absDir, err := filepath.Abs(*caDir)
-	if err != nil {
-		fatalf("import: invalid --cadir: %v", err)
+			store := storage.New(absDir)
+			if err := ca.ImportCA(store, certPEM, keyPEM, crlPEM); err != nil {
+				return err
+			}
+			fmt.Printf("CA imported into %s\n", absDir)
+			return nil
+		},
 	}
-	certPEM, err := os.ReadFile(*certBundle)
-	if err != nil {
-		fatalf("import: reading --cert-bundle: %v", err)
-	}
-	keyPEM, err := os.ReadFile(*privateKey)
-	if err != nil {
-		fatalf("import: reading --private-key: %v", err)
-	}
-	var crlPEM []byte
-	if *crlChain != "" {
-		crlPEM, err = os.ReadFile(*crlChain)
-		if err != nil {
-			fatalf("import: reading --crl-chain: %v", err)
-		}
-	}
-
-	store := storage.New(absDir)
-	if err := ca.ImportCA(store, certPEM, keyPEM, crlPEM); err != nil {
-		fatalf("import: %v", err)
-	}
-	fmt.Printf("CA imported into %s\n", absDir)
+	cmd.Flags().StringVar(&caDir, "cadir", "", "CA storage directory")
+	cmd.Flags().StringVar(&certBundle, "cert-bundle", "", "Path to CA certificate PEM")
+	cmd.Flags().StringVar(&privateKey, "private-key", "", "Path to CA private key PEM")
+	cmd.Flags().StringVar(&crlChain, "crl-chain", "", "Path to CRL PEM (optional; one will be generated if absent)")
+	_ = cmd.MarkFlagRequired("cadir")
+	_ = cmd.MarkFlagRequired("cert-bundle")
+	_ = cmd.MarkFlagRequired("private-key")
+	return cmd
 }
 
 // ---------- main ----------
 
 func main() {
-	// Parse global flags before the subcommand.
-	flag.StringVar(&globalServerURL, "server-url", "https://localhost:8140", "puppet-ca server URL")
-	flag.StringVar(&globalCACert, "ca-cert", "", "Path to CA cert PEM for TLS verification (omit to skip verify)")
-	flag.StringVar(&globalClientCert, "client-cert", "", "Path to client certificate PEM for mTLS")
-	flag.StringVar(&globalClientKey, "client-key", "", "Path to client private key PEM for mTLS")
-	flag.BoolVar(&globalVerbose, "verbose", false, "Enable verbose logging")
-	flag.Parse()
+	rootCmd := &cobra.Command{
+		Use:   "puppet-ca-ctl",
+		Short: "Operator management CLI for puppet-ca",
+		Long: `puppet-ca-ctl manages certificates on a running puppet-ca server.
 
-	if globalVerbose {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+Global flags must be specified before the subcommand.`,
+		SilenceUsage: true,
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			if globalVerbose {
+				slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			}
+		},
 	}
 
-	subcmdArgs := flag.Args()
-	if len(subcmdArgs) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: puppet-ca-ctl [global-flags] <subcommand> [flags]\n\n")
-		fmt.Fprintf(os.Stderr, "Subcommands:\n")
-		fmt.Fprintf(os.Stderr, "  list      List pending (or all) certificate requests\n")
-		fmt.Fprintf(os.Stderr, "  sign      Sign a pending CSR (or --all)\n")
-		fmt.Fprintf(os.Stderr, "  revoke    Revoke a certificate\n")
-		fmt.Fprintf(os.Stderr, "  clean     Revoke and delete a certificate/CSR\n")
-		fmt.Fprintf(os.Stderr, "  generate  Generate a server-side key+cert pair\n")
-		fmt.Fprintf(os.Stderr, "  setup     Initialise a new CA (offline)\n")
-		fmt.Fprintf(os.Stderr, "  import    Import an external CA cert/key (offline)\n")
+	pf := rootCmd.PersistentFlags()
+	pf.StringVar(&globalServerURL, "server-url", "https://localhost:8140", "puppet-ca server URL")
+	pf.StringVar(&globalCACert, "ca-cert", "", "Path to CA cert PEM for TLS verification (omit to skip verify)")
+	pf.StringVar(&globalClientCert, "client-cert", "", "Path to client certificate PEM for mTLS")
+	pf.StringVar(&globalClientKey, "client-key", "", "Path to client private key PEM for mTLS")
+	pf.BoolVar(&globalVerbose, "verbose", false, "Enable verbose logging")
+
+	rootCmd.AddCommand(
+		newListCmd(),
+		newSignCmd(),
+		newRevokeCmd(),
+		newCleanCmd(),
+		newGenerateCmd(),
+		newSetupCmd(),
+		newImportCmd(),
+	)
+
+	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
-
-	subcmd := subcmdArgs[0]
-	rest := subcmdArgs[1:]
-
-	switch subcmd {
-	case "list":
-		cmdList(rest)
-	case "sign":
-		cmdSign(rest)
-	case "revoke":
-		cmdRevoke(rest)
-	case "clean":
-		cmdClean(rest)
-	case "generate":
-		cmdGenerate(rest)
-	case "setup":
-		cmdSetup(rest)
-	case "import":
-		cmdImport(rest)
-	default:
-		fatalf("unknown subcommand %q (run without arguments for help)", subcmd)
-	}
 }
-
-// Ensure errors package is used (it's imported for future extensions).
-var _ = errors.New

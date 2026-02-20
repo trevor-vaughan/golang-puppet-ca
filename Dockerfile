@@ -30,10 +30,10 @@ COPY --from=builder /puppet-ca-ctl /usr/local/bin/puppet-ca-ctl
 USER puppet
 EXPOSE 8140
 
-# --cadir      : where CA state is stored
-# --autosign-config=true : sign all incoming CSRs immediately (dev/test only)
-# -v=1         : debug logging
+# --cadir             : where CA state is stored
+# --autosign-config   : sign all incoming CSRs immediately (dev/test only)
+# --verbosity         : debug logging
 ENTRYPOINT ["/usr/local/bin/puppet-ca"]
 CMD ["--cadir=/etc/puppetlabs/puppet/ssl/ca", \
      "--autosign-config=true", \
-     "-v=1"]
+     "--verbosity=1"]

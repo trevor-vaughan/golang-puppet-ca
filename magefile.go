@@ -157,10 +157,10 @@ func (Test) Load() error {
 	return sh.RunV("bash", "test/integration.sh", "--up", "--load")
 }
 
-// IntegCompose runs the multi-host compose integration test suite.
-// Spins up puppet-ca and test-runner on an isolated compose network, then
-// tears down on exit.
+// IntegCompose builds the binaries locally then runs the multi-host compose
+// integration test suite, tearing down on exit.
 func (Test) IntegCompose() error {
+	mg.Deps(Build{}.All)
 	fmt.Println("Building compose images...")
 	if err := runCompose(nil, "-f", "compose.yml", "build"); err != nil {
 		return err
@@ -180,6 +180,7 @@ func (Test) IntegCompose() error {
 // LoadCompose is like IntegCompose but also enables the concurrency / load
 // tests (DO_LOAD=true).
 func (Test) LoadCompose() error {
+	mg.Deps(Build{}.All)
 	extra := map[string]string{"DO_LOAD": "true"}
 
 	fmt.Println("Building compose images...")
@@ -198,11 +199,12 @@ func (Test) LoadCompose() error {
 	return err
 }
 
-// Bench runs the k6 load test suite (correctness, throughput, saturation ramp)
-// against a dedicated compose stack (compose-bench.yml).
-// Requires podman-compose and network access to pull grafana/k6:latest on
-// first run.
+// Bench builds the binaries locally then runs the k6 load test suite
+// (correctness, throughput, saturation ramp) against a dedicated compose stack
+// (compose-bench.yml). Requires podman-compose and network access to pull
+// grafana/k6:latest on first run.
 func (Test) Bench() error {
+	mg.Deps(Build{}.All)
 	fmt.Println("Building compose images for benchmark...")
 	if err := runCompose(nil, "-f", "compose-bench.yml", "build"); err != nil {
 		return err
@@ -219,12 +221,14 @@ func (Test) Bench() error {
 	return err
 }
 
-// Stress runs the upper-limit stress test (compose-stress.yml). Deliberately
-// ramps request rates past the server's saturation point to find the
-// performance ceiling. Always exits 0 — observational, no thresholds.
+// Stress builds the binaries locally then runs the upper-limit stress test
+// (compose-stress.yml). Deliberately ramps request rates past the server's
+// saturation point to find the performance ceiling. Always exits 0 —
+// observational, no thresholds.
 //
 // WARNING: Do not run against a shared or production server.
 func (Test) Stress() error {
+	mg.Deps(Build{}.All)
 	fmt.Println("Building compose images for stress test...")
 	if err := runCompose(nil, "-f", "compose-stress.yml", "build"); err != nil {
 		return err

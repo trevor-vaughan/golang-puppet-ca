@@ -18,6 +18,7 @@ services:
   puppet-ca:
     build:
       context: .
+      dockerfile: Dockerfile.run
     image: puppet-ca-integ:latest   # reuse the image built by mage build / integCompose
     command:
       - --cadir=/data

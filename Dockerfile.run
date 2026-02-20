@@ -1,0 +1,31 @@
+# Runtime image built from locally-compiled binaries.
+#
+# Build the binaries first:
+#   mage build:all
+#   # or: go build -o bin/ ./cmd/...
+#
+# Then build this image:
+#   podman build -f Dockerfile.run -t puppet-ca:latest .
+#
+# Integration test targets (mage test:integ, test:integCompose, etc.) handle
+# both steps automatically.
+
+FROM quay.io/centos/centos:stream10
+
+# curl: health checks and agent CSR submission
+# openssl: CSR generation and cert verification in integration tests
+RUN dnf install -y curl openssl && dnf clean all && \
+    useradd -m puppet && \
+    mkdir -p /etc/puppetlabs/puppet/ssl/ca /data && \
+    chown -R puppet:puppet /etc/puppetlabs/puppet /data
+
+COPY bin/puppet-ca     /usr/local/bin/puppet-ca
+COPY bin/puppet-ca-ctl /usr/local/bin/puppet-ca-ctl
+
+USER puppet
+EXPOSE 8140
+
+ENTRYPOINT ["/usr/local/bin/puppet-ca"]
+CMD ["--cadir=/etc/puppetlabs/puppet/ssl/ca", \
+     "--autosign-config=true", \
+     "--verbosity=1"]

@@ -22,6 +22,7 @@ services:
   puppet-ca:
     build:
       context: .
+      dockerfile: Dockerfile.run
     image: puppet-ca-integ:latest
     # autosign=false so the test-runner must explicitly sign via puppet-ca-ctl,
     # exercising the full operator workflow.

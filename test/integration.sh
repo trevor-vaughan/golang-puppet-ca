@@ -116,7 +116,7 @@ if $DO_UP; then
     podman rm -f "$CA_CONTAINER" 2>/dev/null || true
 
     printf '# Building container image %s...\n' "$CA_IMAGE"
-    podman build -t "$CA_IMAGE" . 2>&1 | tail -5
+    podman build -f Dockerfile.run -t "$CA_IMAGE" . 2>&1 | tail -5
 
     printf '# Starting CA container...\n'
     podman run -d \

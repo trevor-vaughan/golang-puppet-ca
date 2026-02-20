@@ -63,7 +63,7 @@ mage build:fips   # → bin/puppet-ca-fips  (GOEXPERIMENT=boringcrypto)
 | `--puppet-server` | `""` | Comma-separated CNs granted admin API access (mTLS only) |
 | `--daemon` | `false` | Fork to background (not recommended in containers) |
 | `--logfile` | `""` | Write JSON logs to this file instead of stderr |
-| `-v` | `0` | Verbosity: `0`=Info, `1`=Debug, `2`=Trace |
+| `--verbosity` / `-v` | `0` | Verbosity: `0`=Info, `1`=Debug, `2`=Trace |
 
 ### Quick start (plain HTTP, auto-bootstrap CA)
 
@@ -246,7 +246,7 @@ In plain HTTP mode (no TLS), all endpoints are accessible without authentication
 --verbose                               Enable debug logging
 ```
 
-Global flags must be placed **before** the subcommand name.
+Global flags may be placed before or after the subcommand name.
 
 ### Subcommands
 
