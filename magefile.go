@@ -117,9 +117,15 @@ func (Build) FIPS() error {
 		"GOARCH":       "amd64",
 	}
 
-	return sh.RunWith(env, "go", "build",
+	if err := sh.RunWith(env, "go", "build",
 		"-o", filepath.Join(binDir, "puppet-ca-fips"),
-		"./cmd/puppet-ca")
+		"./cmd/puppet-ca"); err != nil {
+		return err
+	}
+
+	return sh.RunWith(env, "go", "build",
+		"-o", filepath.Join(binDir, "puppet-ca-ctl-fips"),
+		"./cmd/puppet-ca-ctl")
 }
 
 // ── test:* ────────────────────────────────────────────────────────────────────
