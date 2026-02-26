@@ -115,12 +115,10 @@ func lookupTier(method, path string) authTier {
 	// Public — no cert needed.
 	case method == "GET" && p == "/certificate/ca":
 		return tierPublic
+	case method == "GET" && strings.HasPrefix(p, "/certificate_revocation_list/"):
+		return tierPublic
 	case method == "PUT" && strings.HasPrefix(p, "/certificate_request/"):
 		return tierPublic
-
-	// Any CA-signed cert.
-	case method == "GET" && strings.HasPrefix(p, "/certificate_revocation_list/"):
-		return tierAnyClient
 
 	// Self or admin.
 	case method == "GET" && strings.HasPrefix(p, "/certificate/"):

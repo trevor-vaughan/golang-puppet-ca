@@ -129,19 +129,18 @@ var _ = Describe("Auth Middleware", func() {
 			mux.ServeHTTP(rr, req)
 			Expect(rr.Code).To(Equal(http.StatusOK))
 		})
+
+		It("allows GET /certificate_revocation_list/ca with no client cert", func() {
+			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
 	})
 
 	// ── No client cert on protected endpoints ──────────────────────────────────
 
 	Context("no client cert presented to a protected endpoint", func() {
-		It("returns 403 for GET /certificate_revocation_list/ca (any-client tier)", func() {
-			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
-			req.TLS = &tls.ConnectionState{} // TLS connection but no peer certificates
-			rr := httptest.NewRecorder()
-			mux.ServeHTTP(rr, req)
-			Expect(rr.Code).To(Equal(http.StatusForbidden))
-		})
-
 		It("returns 403 for GET /certificate_status/{subject} (self-or-admin tier)", func() {
 			req := httptest.NewRequest("GET", "/certificate_status/some-node", nil)
 			req.TLS = &tls.ConnectionState{}
@@ -175,7 +174,7 @@ var _ = Describe("Auth Middleware", func() {
 
 			// CN matches the admin allow list, but chain is wrong.
 			clientCert := issueClientCert("puppet-server", altCACert, altCAKey)
-			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			req := httptest.NewRequest("POST", "/sign/all", nil)
 			req = withClientCert(req, clientCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -202,7 +201,7 @@ var _ = Describe("Auth Middleware", func() {
 			// presented cert's serial is not consulted; only the CN is used to
 			// locate the revoked record on disk.
 			clientCert := issueClientCert("revoked-client", caCert, caKey)
-			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			req := httptest.NewRequest("GET", "/certificate_status/revoked-client", nil)
 			req = withClientCert(req, clientCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -310,17 +309,101 @@ var _ = Describe("Auth Middleware", func() {
 		})
 	})
 
-	// ── Positive: any valid CA-signed cert reaches tierAnyClient ──────────────
+	// ── Positive: CRL is public, accessible with or without a cert ───────────
 
-	Context("any CA-signed cert passes any-client endpoints", func() {
-		It("regular node cert is not rejected for GET /certificate_revocation_list/ca", func() {
+	Context("CRL endpoint is public", func() {
+		It("returns CRL without presenting any cert", func() {
+			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			// r.TLS is nil; the public tier check fires before the TLS check.
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
+
+		It("returns CRL over a TLS connection with no peer certificate", func() {
+			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			// Simulate a TLS connection where the client chose not to send a cert.
+			req.TLS = &tls.ConnectionState{} // no PeerCertificates
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
+
+		It("returns CRL when a valid CA-signed cert is presented", func() {
 			clientCert := issueClientCert("regular-node", caCert, caKey)
 			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
 			req = withClientCert(req, clientCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
-			// Should return the CRL (200), not 403.
 			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
+
+		It("returns CRL even when a revoked cert is presented", func() {
+			// Revoked nodes must still be able to fetch the CRL — it is the
+			// mechanism by which they (and others) learn they are revoked.
+			// The public tier check must fire before the revocation check.
+			csrPEM, err := testutil.GenerateCSR("revoked-crl-fetcher")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.SaveRequest("revoked-crl-fetcher", csrPEM)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.Sign("revoked-crl-fetcher")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.Revoke("revoked-crl-fetcher")).To(Succeed())
+
+			clientCert := issueClientCert("revoked-crl-fetcher", caCert, caKey)
+			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			req = withClientCert(req, clientCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
+
+		It("returns CRL even when a cert from an untrusted CA is presented", func() {
+			// The public tier bypasses cert chain verification entirely.
+			altKeyPEM, altCertPEM, _, err := testutil.GenerateTestCA()
+			Expect(err).NotTo(HaveOccurred())
+			altCACertBlock, _ := pem.Decode(altCertPEM)
+			altCACert, err := x509.ParseCertificate(altCACertBlock.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+			altKeyBlock, _ := pem.Decode(altKeyPEM)
+			altCAKey, err := x509.ParsePKCS1PrivateKey(altKeyBlock.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			clientCert := issueClientCert("some-node", altCACert, altCAKey)
+			req := httptest.NewRequest("GET", "/certificate_revocation_list/ca", nil)
+			req = withClientCert(req, clientCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
+	})
+
+	// ── Non-GET methods on the CRL path are NOT public ─────────────────────────
+
+	Context("non-GET methods on /certificate_revocation_list/ca require auth", func() {
+		It("returns 403 for POST /certificate_revocation_list/ca with no cert", func() {
+			req := httptest.NewRequest("POST", "/certificate_revocation_list/ca", nil)
+			req.TLS = &tls.ConnectionState{}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+		})
+
+		It("returns 403 for DELETE /certificate_revocation_list/ca with no cert", func() {
+			req := httptest.NewRequest("DELETE", "/certificate_revocation_list/ca", nil)
+			req.TLS = &tls.ConnectionState{}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+		})
+
+		It("returns 403 for POST /certificate_revocation_list/ca even with a valid non-admin cert", func() {
+			clientCert := issueClientCert("regular-node", caCert, caKey)
+			req := httptest.NewRequest("POST", "/certificate_revocation_list/ca", nil)
+			req = withClientCert(req, clientCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
 		})
 	})
 
@@ -341,6 +424,13 @@ var _ = Describe("Auth Middleware", func() {
 			csrPEM, err := testutil.GenerateCSR("pfx-public-node")
 			Expect(err).NotTo(HaveOccurred())
 			req := httptest.NewRequest("PUT", "/puppet-ca/v1/certificate_request/pfx-public-node", bytes.NewReader(csrPEM))
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusOK))
+		})
+
+		It("allows GET /puppet-ca/v1/certificate_revocation_list/ca with no cert (public tier)", func() {
+			req := httptest.NewRequest("GET", "/puppet-ca/v1/certificate_revocation_list/ca", nil)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
 			Expect(rr.Code).To(Equal(http.StatusOK))
