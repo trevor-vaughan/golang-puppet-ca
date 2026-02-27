@@ -76,6 +76,34 @@ jobs:
           MAGE_TARGET: ${{ matrix.mage_target }}
         run: mage "$MAGE_TARGET"
 
+  # ── Puppet stack integration tests ──────────────────────────────────────────
+  # Runs the full OpenVox 8 stack: Go CA (TLS) → OpenVox Server (WEBrick) →
+  # OpenVoxDB.  Requires docker compose and network access to pull base images
+  # on first run.  Same standard/FIPS matrix as the other integration jobs.
+  puppet:
+    name: Puppet stack tests (${{ matrix.build }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: standard
+            mage_target: test:puppet
+          - build: fips
+            mage_target: test:puppetFIPS
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+      - name: Run Puppet stack integration tests
+        env:
+          MAGE_TARGET: ${{ matrix.mage_target }}
+        run: mage "$MAGE_TARGET"
+
   # ── Compose integration tests (docker compose) ───────────────────────────────
   # podman-compose is not pre-installed on GitHub runners; composeCmd() in
   # magefile.go falls back to `docker compose` (v2 plugin, always available).

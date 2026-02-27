@@ -46,7 +46,7 @@ import (
 // ── Namespaces ────────────────────────────────────────────────────────────────
 
 type Build mg.Namespace // build:all  build:fips
-type Test  mg.Namespace // test:unit  test:integ  test:integfips  test:load  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:stress  test:puppet
+type Test  mg.Namespace // test:unit  test:integ  test:integfips  test:load  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:stress  test:puppet  test:puppetfips
 type Dev   mg.Namespace // dev:check  dev:tidy    dev:clean  dev:container
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -292,6 +292,19 @@ func (Test) Puppet() error {
 	}
 
 	fmt.Println("Running puppet stack integration tests...")
+	return sh.RunV("bash", "test/puppet/puppet-stack.sh", "--up")
+}
+
+// PuppetFIPS is like Puppet but compiles with GOEXPERIMENT=boringcrypto so the
+// full Puppet stack integration suite runs against the FIPS-compliant binary.
+func (Test) PuppetFIPS() error {
+	mg.Deps(Build{}.FIPS)
+	fmt.Println("Building compose images for puppet stack (FIPS build)...")
+	if err := runCompose(nil, "-f", "compose-puppet.yml", "build"); err != nil {
+		return err
+	}
+
+	fmt.Println("Running puppet stack integration tests (FIPS build)...")
 	return sh.RunV("bash", "test/puppet/puppet-stack.sh", "--up")
 }
 
