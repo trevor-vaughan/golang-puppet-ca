@@ -46,7 +46,7 @@ import (
 // ── Namespaces ────────────────────────────────────────────────────────────────
 
 type Build mg.Namespace // build:all  build:fips
-type Test  mg.Namespace // test:unit  test:integ  test:load  test:integcompose  test:loadcompose  test:bench  test:stress  test:puppet
+type Test  mg.Namespace // test:unit  test:integ  test:integfips  test:load  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:stress  test:puppet
 type Dev   mg.Namespace // dev:check  dev:tidy    dev:clean  dev:container
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -149,6 +149,14 @@ func (Test) Integ() error {
 	return sh.RunV("bash", "test/integration.sh", "--up")
 }
 
+// IntegFIPS is like Integ but compiles with GOEXPERIMENT=boringcrypto so the
+// integration suite runs against the FIPS-compliant binary.
+func (Test) IntegFIPS() error {
+	mg.Deps(Build{}.FIPS)
+	fmt.Println("Running integration tests (FIPS build)...")
+	return sh.RunV("bash", "test/integration.sh", "--up")
+}
+
 // Load builds the binary and container image, starts a single container, runs
 // the integration suite plus the concurrency / load tests, then tears down.
 func (Test) Load() error {
@@ -167,6 +175,27 @@ func (Test) IntegCompose() error {
 	}
 
 	fmt.Println("Running compose integration tests...")
+	err := runCompose(nil, "-f", "compose.yml", "up",
+		"--exit-code-from", "test-runner",
+		"--abort-on-container-exit")
+
+	fmt.Println("Tearing down compose stack...")
+	_ = runCompose(nil, "-f", "compose.yml", "down", "--volumes")
+
+	return err
+}
+
+// IntegComposeFIPS is like IntegCompose but compiles with
+// GOEXPERIMENT=boringcrypto so the compose integration suite runs against the
+// FIPS-compliant binary.
+func (Test) IntegComposeFIPS() error {
+	mg.Deps(Build{}.FIPS)
+	fmt.Println("Building compose images (FIPS build)...")
+	if err := runCompose(nil, "-f", "compose.yml", "build"); err != nil {
+		return err
+	}
+
+	fmt.Println("Running compose integration tests (FIPS build)...")
 	err := runCompose(nil, "-f", "compose.yml", "up",
 		"--exit-code-from", "test-runner",
 		"--abort-on-container-exit")
