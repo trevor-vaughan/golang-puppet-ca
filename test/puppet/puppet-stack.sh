@@ -29,21 +29,19 @@ else
     exit 1
 fi
 
-if [[ "$_ENGINE" == podman ]]; then
-    if ! command -v podman-compose &>/dev/null; then
-        printf 'Error: podman found but podman-compose not found\n' >&2
-        exit 1
-    fi
+# Resolve the compose command independently of the engine: prefer
+# podman-compose when running under podman and it is installed, then fall
+# back to docker compose / docker-compose (matches composeCmd() in magefile.go
+# and works on GitHub runners where podman is present but podman-compose is not).
+if [[ "$_ENGINE" == podman ]] && command -v podman-compose &>/dev/null; then
     _COMPOSE=(podman-compose -f compose-puppet.yml)
+elif docker compose version &>/dev/null 2>&1; then
+    _COMPOSE=(docker compose -f compose-puppet.yml)
+elif command -v docker-compose &>/dev/null; then
+    _COMPOSE=(docker-compose -f compose-puppet.yml)
 else
-    if docker compose version &>/dev/null 2>&1; then
-        _COMPOSE=(docker compose -f compose-puppet.yml)
-    elif command -v docker-compose &>/dev/null; then
-        _COMPOSE=(docker-compose -f compose-puppet.yml)
-    else
-        printf 'Error: docker found but compose unavailable\n' >&2
-        exit 1
-    fi
+    printf 'Error: no compose tool found; install podman-compose or docker compose\n' >&2
+    exit 1
 fi
 
 # ── Configuration ─────────────────────────────────────────────────────────
