@@ -23,6 +23,7 @@ services:
     command:
       - --cadir=/data
       - --autosign-config=true      # workflow scenario needs immediate signing
+      - --no-tls-required           # test-only stack; CA not reachable from outside compose network
       - -v=0                        # quiet logging; reduces I/O noise during load
     expose:
       - "8140"

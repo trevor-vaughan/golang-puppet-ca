@@ -61,6 +61,7 @@ mage build:fips   # → bin/puppet-ca-fips  (GOEXPERIMENT=boringcrypto)
 | `--tls-cert` | `""` | Server TLS certificate PEM (enables HTTPS when set with `--tls-key`) |
 | `--tls-key` | `""` | Server TLS private key PEM |
 | `--puppet-server` | `""` | Comma-separated CNs granted admin API access (mTLS only) |
+| `--no-tls-required` | `false` | Allow plain HTTP on non-loopback addresses; use only behind a trusted TLS proxy or in test environments |
 | `--daemon` | `false` | Fork to background (not recommended in containers) |
 | `--logfile` | `""` | Write JSON logs to this file instead of stderr |
 | `--verbosity` / `-v` | `0` | Verbosity: `0`=Info, `1`=Debug, `2`=Trace |
@@ -225,8 +226,7 @@ When mTLS is enabled (both `--tls-cert` and `--tls-key` set), each endpoint requ
 
 | Tier | Required client cert | Endpoints |
 |------|---------------------|-----------|
-| **Public** | None | `GET /certificate/ca`, `PUT /certificate_request/{subject}` |
-| **Any client** | Any cert signed by this CA | `GET /certificate_revocation_list/ca` |
+| **Public** | None | `GET /certificate/ca`, `GET /certificate_revocation_list/ca`, `PUT /certificate_request/{subject}` |
 | **Self or admin** | Cert CN matches path subject, OR CN is in `--puppet-server` list | `GET /certificate/{subject}`, `GET /certificate_status/{subject}`, `GET /certificate_request/{subject}` |
 | **Admin** | CN in `--puppet-server` list | All other endpoints |
 

@@ -125,6 +125,7 @@ if $DO_UP; then
         "$CA_IMAGE" \
         --cadir=/data \
         --autosign-config=false \
+        --no-tls-required \
         -v=1
 
     printf '# Waiting for CA to become ready'

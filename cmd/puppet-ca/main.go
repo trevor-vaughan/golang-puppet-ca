@@ -22,6 +22,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -34,6 +35,16 @@ import (
 	"github.com/tvaughan/puppet-ca/internal/ca"
 	"github.com/tvaughan/puppet-ca/internal/storage"
 )
+
+// isLoopback reports whether host is a loopback address (127.x.x.x, ::1, or
+// "localhost"). Plain HTTP is only safe when the server cannot be reached from
+// outside the local process.
+func isLoopback(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
+}
 
 func main() {
 	var (
@@ -48,6 +59,7 @@ func main() {
 		tlsCert       string
 		tlsKey        string
 		puppetServers string
+		noTLSRequired bool
 	)
 
 	cmd := &cobra.Command{
@@ -111,6 +123,29 @@ func main() {
 				"port", port,
 				"verbosity", verbosity,
 			)
+
+			// --- TLS enforcement ---
+			// Plain HTTP over a non-loopback interface lets any on-path host
+			// inject forged certificates. Refuse to start unless:
+			//   (a) TLS is configured (--tls-cert + --tls-key), or
+			//   (b) the bind address is loopback-only, or
+			//   (c) the operator explicitly opts out with --no-tls-required.
+			tlsConfigured := tlsCert != "" && tlsKey != ""
+			if !tlsConfigured {
+				if !isLoopback(host) && !noTLSRequired {
+					slog.Error("Refusing to start: plain HTTP on a non-loopback address is " +
+						"vulnerable to certificate injection attacks. " +
+						"Enable TLS (--tls-cert / --tls-key), " +
+						"restrict to loopback (--host 127.0.0.1), " +
+						"or explicitly opt out with --no-tls-required.")
+					os.Exit(1)
+				}
+				if noTLSRequired && !isLoopback(host) {
+					slog.Warn("TLS is not configured on a non-loopback address; " +
+						"certificate injection is possible. " +
+						"Only use --no-tls-required behind a trusted TLS proxy or in test environments.")
+				}
+			}
 
 			// --- Storage & Directories ---
 			store := storage.New(absCADir)
@@ -238,6 +273,7 @@ func main() {
 	f.StringVar(&tlsCert, "tls-cert", "", "Path to TLS server certificate PEM (enables HTTPS)")
 	f.StringVar(&tlsKey, "tls-key", "", "Path to TLS server private key PEM (enables HTTPS)")
 	f.StringVar(&puppetServers, "puppet-server", "", "Comma-separated list of puppet-server CNs allowed admin access")
+	f.BoolVar(&noTLSRequired, "no-tls-required", false, "Allow plain HTTP on non-loopback addresses (use only behind a trusted TLS proxy or in test environments)")
 	_ = cmd.MarkFlagRequired("cadir")
 
 	if err := cmd.Execute(); err != nil {
