@@ -26,6 +26,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -185,6 +186,125 @@ var _ = Describe("CA Lifecycle", func() {
 			_, err = myCA.SaveRequest("a..b", []byte("fake"))
 			Expect(err).To(HaveOccurred())
 		})
+	})
+})
+
+// --- TTL capping ---
+
+var _ = Describe("CA TTL capping", func() {
+	var (
+		tmpDir string
+		myCA   *ca.CA
+		store  *storage.StorageService
+	)
+
+	BeforeEach(func() {
+		var err error
+		tmpDir, err = os.MkdirTemp("", "puppet-ca-ttl-test")
+		Expect(err).NotTo(HaveOccurred())
+
+		store = storage.New(tmpDir)
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+
+		Expect(store.EnsureDirs()).To(Succeed())
+		Expect(os.WriteFile(store.CAKeyPath(), cachedKeyPEM, 0640)).To(Succeed())
+		Expect(os.WriteFile(store.CACertPath(), cachedCrtPEM, 0644)).To(Succeed())
+		Expect(store.UpdateCRL(cachedCrlPEM)).To(Succeed())
+		Expect(store.WriteSerial("0001")).To(Succeed())
+		Expect(os.WriteFile(store.InventoryPath(), []byte{}, 0644)).To(Succeed())
+		Expect(myCA.Init()).To(Succeed())
+	})
+
+	AfterEach(func() { os.RemoveAll(tmpDir) })
+
+	It("caps signed cert NotAfter to the CA cert NotAfter when TTL would exceed it", func() {
+		csrPEM, err := testutil.GenerateCSR("ttl-cap-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.SaveRequest("ttl-cap-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+
+		// The test CA cert expires in ~1 hour (see testutil.GenerateTestCA).
+		// Request a TTL far beyond that window.
+		certPEM, err := myCA.SignWithTTL("ttl-cap-node", 100*365*24*time.Hour)
+		Expect(err).NotTo(HaveOccurred())
+
+		block, _ := pem.Decode(certPEM)
+		Expect(block).NotTo(BeNil())
+		cert, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Leaf cert must not outlive the CA cert.
+		Expect(cert.NotAfter).To(BeTemporally("<=", myCA.CACert.NotAfter))
+	})
+
+	It("uses the requested TTL when it is shorter than the CA cert remaining lifetime", func() {
+		csrPEM, err := testutil.GenerateCSR("short-ttl-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.SaveRequest("short-ttl-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+
+		shortTTL := 10 * time.Minute
+		certPEM, err := myCA.SignWithTTL("short-ttl-node", shortTTL)
+		Expect(err).NotTo(HaveOccurred())
+
+		block, _ := pem.Decode(certPEM)
+		cert, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		// NotAfter should be approximately now + shortTTL (within a few seconds of clock skew).
+		expectedNotAfter := time.Now().Add(shortTTL)
+		Expect(cert.NotAfter).To(BeTemporally("~", expectedNotAfter, 30*time.Second))
+	})
+})
+
+// --- Tampered CSR ---
+
+var _ = Describe("CA tampered CSR rejection", func() {
+	var (
+		tmpDir string
+		myCA   *ca.CA
+		store  *storage.StorageService
+	)
+
+	BeforeEach(func() {
+		var err error
+		tmpDir, err = os.MkdirTemp("", "puppet-ca-tamper-test")
+		Expect(err).NotTo(HaveOccurred())
+
+		store = storage.New(tmpDir)
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "true"}, "puppet.test")
+
+		Expect(store.EnsureDirs()).To(Succeed())
+		Expect(os.WriteFile(store.CAKeyPath(), cachedKeyPEM, 0640)).To(Succeed())
+		Expect(os.WriteFile(store.CACertPath(), cachedCrtPEM, 0644)).To(Succeed())
+		Expect(store.UpdateCRL(cachedCrlPEM)).To(Succeed())
+		Expect(store.WriteSerial("0001")).To(Succeed())
+		Expect(os.WriteFile(store.InventoryPath(), []byte{}, 0644)).To(Succeed())
+		Expect(myCA.Init()).To(Succeed())
+	})
+
+	AfterEach(func() { os.RemoveAll(tmpDir) })
+
+	It("rejects a CSR whose signature does not match its public key", func() {
+		// Build a valid CSR, then corrupt the last byte of the DER.
+		// The RSA signature occupies the final 256 bytes; flipping one bit
+		// produces a structurally valid but cryptographically invalid CSR.
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		Expect(err).NotTo(HaveOccurred())
+
+		csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+			Subject: pkix.Name{CommonName: "tampered-node"},
+		}, key)
+		Expect(err).NotTo(HaveOccurred())
+
+		csrDER[len(csrDER)-1] ^= 0x01 // flip one bit in the signature
+
+		tamperedPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+		// With autosign=true, SaveRequest triggers Sign() immediately.
+		// Sign() calls csr.CheckSignature() and must return an error.
+		_, err = myCA.SaveRequest("tampered-node", tamperedPEM)
+		Expect(err).To(HaveOccurred(), "expected signing to fail for a tampered CSR")
 	})
 })
 

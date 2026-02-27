@@ -113,7 +113,9 @@ func lookupTier(method, path string) authTier {
 
 	switch {
 	// Public — no cert needed.
-	case method == "GET" && p == "/certificate/ca":
+	// Signed certs contain no secrets; bootstrapping nodes fetch their cert
+	// before they have a client cert, matching Puppet Server 8 behaviour.
+	case method == "GET" && strings.HasPrefix(p, "/certificate/"):
 		return tierPublic
 	case method == "GET" && strings.HasPrefix(p, "/certificate_revocation_list/"):
 		return tierPublic
@@ -121,8 +123,6 @@ func lookupTier(method, path string) authTier {
 		return tierPublic
 
 	// Self or admin.
-	case method == "GET" && strings.HasPrefix(p, "/certificate/"):
-		return tierSelfOrAdmin
 	case method == "GET" && strings.HasPrefix(p, "/certificate_status/"):
 		return tierSelfOrAdmin
 	case method == "GET" && strings.HasPrefix(p, "/certificate_request/"):

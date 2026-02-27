@@ -24,6 +24,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -229,6 +230,20 @@ esac
 				ca.AutosignConfig{Mode: "executable", FileOrPath: path},
 				csr, csrPEM)
 			Expect(err).To(HaveOccurred())
+		})
+
+		It("returns an error when the executable exceeds the timeout", func() {
+			// Script sleeps far longer than the configured timeout.
+			script := writeScript("#!/bin/sh\nsleep 30\n")
+			_, err := ca.CheckAutosign(
+				ca.AutosignConfig{
+					Mode:              "executable",
+					FileOrPath:        script,
+					ExecutableTimeout: 100 * time.Millisecond,
+				},
+				csr, csrPEM)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("timed out"))
 		})
 	})
 })

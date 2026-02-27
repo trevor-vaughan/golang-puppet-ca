@@ -1,0 +1,16 @@
+# Puppet agent (client) image for the puppet-ca integration test stack.
+#
+# Provides a minimal CentOS Stream 10 container with the OpenVox 8 agent,
+# curl, and openssl.  The entrypoint keeps the container alive so the host-side
+# test script can drive it with `$engine exec`.
+
+FROM quay.io/centos/centos:stream10
+
+RUN dnf -y install https://yum.voxpupuli.org/openvox8-release-el-10.noarch.rpm && \
+    dnf -y install openvox-agent curl openssl && \
+    dnf clean all
+
+ENV PATH=/opt/puppetlabs/puppet/bin:${PATH}
+
+# Keep the container running; the test script exec's into it.
+ENTRYPOINT ["tail", "-f", "/dev/null"]

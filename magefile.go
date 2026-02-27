@@ -46,7 +46,7 @@ import (
 // ── Namespaces ────────────────────────────────────────────────────────────────
 
 type Build mg.Namespace // build:all  build:fips
-type Test  mg.Namespace // test:unit  test:integ  test:load  test:integcompose  test:loadcompose  test:bench  test:stress
+type Test  mg.Namespace // test:unit  test:integ  test:load  test:integcompose  test:loadcompose  test:bench  test:stress  test:puppet
 type Dev   mg.Namespace // dev:check  dev:tidy    dev:clean  dev:container
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -246,6 +246,29 @@ func (Test) Stress() error {
 	_ = runCompose(nil, "-f", "compose-stress.yml", "down", "--volumes")
 
 	return nil
+}
+
+// Puppet builds the Puppet stack images (puppet-master, puppet-client) and runs
+// the full Puppet integration test suite: CA TLS, catalog application,
+// PuppetDB reporting, exported resources, and CRL revocation enforcement.
+//
+// Requires podman-compose (or docker compose) and network access to pull
+// quay.io/centos/centos:stream10, ghcr.io/openvoxproject/openvoxdb:latest,
+// and docker.io/postgres:17-alpine on first run.
+func (Test) Puppet() error {
+	mg.Deps(Build{}.All)
+	fmt.Println("Building compose images for puppet stack...")
+	if err := runCompose(nil, "-f", "compose-puppet.yml", "build"); err != nil {
+		return err
+	}
+
+	fmt.Println("Running puppet stack integration tests...")
+	err := sh.RunV("bash", "test/puppet/puppet-stack.sh", "--up")
+
+	fmt.Println("Tearing down puppet stack...")
+	_ = runCompose(nil, "-f", "compose-puppet.yml", "down", "--volumes")
+
+	return err
 }
 
 // ── dev:* ─────────────────────────────────────────────────────────────────────

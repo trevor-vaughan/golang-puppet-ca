@@ -154,6 +154,17 @@ func (c *CA) signWithDuration(subject string, ttl time.Duration) ([]byte, error)
 		validity = ttl
 	}
 
+	// Cap validity to the CA certificate's remaining lifetime.
+	// A leaf cert must never outlive the CA that signed it; if it did, the cert
+	// would appear valid after the CA cert expired, breaking chain verification.
+	caRemaining := time.Until(c.CACert.NotAfter)
+	if caRemaining <= 0 {
+		return nil, fmt.Errorf("CA certificate has expired")
+	}
+	if validity > caRemaining {
+		validity = caRemaining
+	}
+
 	// SubjectKeyIdentifier: SHA1 of the SubjectPublicKeyInfo DER (RFC 5280 §4.2.1.2).
 	pubKeyDER, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
 	if err != nil {

@@ -19,16 +19,24 @@ package ca
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/x509"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
+// defaultExecutableTimeout is the maximum time allowed for an autosign
+// executable to run.  A hung script would otherwise block the CA indefinitely.
+const defaultExecutableTimeout = 30 * time.Second
+
 type AutosignConfig struct {
-	Mode       string // "true", "file", "executable" (or "off" implicitly)
-	FileOrPath string // Path to autosign.conf or executable
+	Mode              string        // "true", "file", "executable" (or "off" implicitly)
+	FileOrPath        string        // Path to autosign.conf or executable
+	ExecutableTimeout time.Duration // 0 → defaultExecutableTimeout
 }
 
 func CheckAutosign(cfg AutosignConfig, csr *x509.CertificateRequest, csrPEM []byte) (bool, error) {
@@ -38,7 +46,7 @@ func CheckAutosign(cfg AutosignConfig, csr *x509.CertificateRequest, csrPEM []by
 	case "file":
 		return checkAutosignFile(cfg.FileOrPath, csr.Subject.CommonName)
 	case "executable":
-		return checkAutosignExecutable(cfg.FileOrPath, csr.Subject.CommonName, csrPEM)
+		return checkAutosignExecutable(cfg, csr.Subject.CommonName, csrPEM)
 	default:
 		return false, nil
 	}
@@ -75,19 +83,25 @@ func checkAutosignFile(path, commonName string) (bool, error) {
 	return false, scanner.Err()
 }
 
-func checkAutosignExecutable(path, commonName string, csrPEM []byte) (bool, error) {
-	cmd := exec.Command(path, commonName)
+func checkAutosignExecutable(cfg AutosignConfig, commonName string, csrPEM []byte) (bool, error) {
+	timeout := cfg.ExecutableTimeout
+	if timeout == 0 {
+		timeout = defaultExecutableTimeout
+	}
 
-	// Set Env
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, cfg.FileOrPath, commonName)
 	cmd.Env = os.Environ()
-	// Ensure RUBYLIB and GEM_PATH are preserved (they are in Environ, but let's be explicit if needed)
-	// Actually os.Environ() includes them.
-
 	cmd.Stdin = bytes.NewReader(csrPEM)
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return false, fmt.Errorf("autosign executable timed out after %s", timeout)
+		}
 		if _, ok := err.(*exec.ExitError); ok {
-			// Non-zero exit code means deny
+			// Non-zero exit code means deny.
 			return false, nil
 		}
 		return false, err

@@ -1,5 +1,7 @@
 # Compiled binaries
 bin/
+puppet-ca
+puppet-ca-ctl
 *.exe
 
 # Test binaries and output
@@ -22,3 +24,6 @@ Thumbs.db
 
 # Mage build cache
 .mage/
+
+# Claude Code session data
+.claude/

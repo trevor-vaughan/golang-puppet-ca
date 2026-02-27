@@ -226,8 +226,8 @@ When mTLS is enabled (both `--tls-cert` and `--tls-key` set), each endpoint requ
 
 | Tier | Required client cert | Endpoints |
 |------|---------------------|-----------|
-| **Public** | None | `GET /certificate/ca`, `GET /certificate_revocation_list/ca`, `PUT /certificate_request/{subject}` |
-| **Self or admin** | Cert CN matches path subject, OR CN is in `--puppet-server` list | `GET /certificate/{subject}`, `GET /certificate_status/{subject}`, `GET /certificate_request/{subject}` |
+| **Public** | None | `GET /certificate/ca`, `GET /certificate/{subject}`, `GET /certificate_revocation_list/ca`, `PUT /certificate_request/{subject}` |
+| **Self or admin** | Cert CN matches path subject, OR CN is in `--puppet-server` list | `GET /certificate_status/{subject}`, `GET /certificate_request/{subject}` |
 | **Admin** | CN in `--puppet-server` list | All other endpoints |
 
 In plain HTTP mode (no TLS), all endpoints are accessible without authentication.
@@ -302,10 +302,14 @@ mage test:bench
 
 # Build binary + container image, run integration + load tests (single container)
 mage test:load
+
+# Full Puppet stack: CA (TLS) + WEBrick master + OpenVoxDB + agent
+mage test:puppet
 ```
 
 `test:integCompose` and `test:loadCompose` use `compose.yml` (autosign=false, TAP-format functional tests).
 `test:bench` uses `compose-bench.yml` (autosign=true, k6 load runner).
+`test:puppet` uses `compose-puppet.yml` — a five-service stack that validates end-to-end catalog compilation, PuppetDB reporting, exported resources, and CRL revocation using a real OpenVox 8 agent and WEBrick puppet master. The CA runs with genuine TLS (a cert with CN=puppet-ca signed by the CA itself); all inter-service traffic verifies it.
 
 The k6 script (`test/load.js`) runs two concurrent scenarios:
 - **reads** — hammers GET /certificate/ca, CRL, and expirations; ramps to 200 VUs
@@ -331,6 +335,9 @@ mage test:integ
 
 # Run integration tests using the compose stack
 mage test:integCompose
+
+# Run the full Puppet stack (CA TLS + WEBrick master + OpenVoxDB + agent)
+mage test:puppet
 
 # Run k6 load tests (correctness + throughput + saturation) via compose
 mage test:bench

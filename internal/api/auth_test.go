@@ -182,6 +182,56 @@ var _ = Describe("Auth Middleware", func() {
 		})
 	})
 
+	// ── Certificate validity period enforcement ────────────────────────────────
+
+	Context("certificate validity period enforcement", func() {
+		It("returns 403 when client presents an expired certificate", func() {
+			// Issue a cert whose validity window lies entirely in the past.
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			Expect(err).NotTo(HaveOccurred())
+			template := &x509.Certificate{
+				SerialNumber: big.NewInt(time.Now().UnixNano()),
+				Subject:      pkix.Name{CommonName: "expired-node"},
+				NotBefore:    time.Now().Add(-2 * time.Hour),
+				NotAfter:     time.Now().Add(-1 * time.Hour), // already expired
+				ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			}
+			certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+			Expect(err).NotTo(HaveOccurred())
+			expiredCert, err := x509.ParseCertificate(certBytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			req := httptest.NewRequest("GET", "/certificate_status/expired-node", nil)
+			req = withClientCert(req, expiredCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+		})
+
+		It("returns 403 when client presents a not-yet-valid certificate", func() {
+			// Issue a cert whose NotBefore is in the future.
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			Expect(err).NotTo(HaveOccurred())
+			template := &x509.Certificate{
+				SerialNumber: big.NewInt(time.Now().UnixNano()),
+				Subject:      pkix.Name{CommonName: "future-node"},
+				NotBefore:    time.Now().Add(1 * time.Hour), // not yet valid
+				NotAfter:     time.Now().Add(2 * time.Hour),
+				ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			}
+			certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+			Expect(err).NotTo(HaveOccurred())
+			futureCert, err := x509.ParseCertificate(certBytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			req := httptest.NewRequest("GET", "/certificate_status/future-node", nil)
+			req = withClientCert(req, futureCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+		})
+	})
+
 	// ── Revoked client cert ────────────────────────────────────────────────────
 
 	Context("revoked client cert", func() {
@@ -290,15 +340,6 @@ var _ = Describe("Auth Middleware", func() {
 			Expect(rr.Code).To(Equal(http.StatusForbidden))
 		})
 
-		It("returns 403 for GET /certificate/{other-node}", func() {
-			clientCert := issueClientCert("node-a", caCert, caKey)
-			req := httptest.NewRequest("GET", "/certificate/node-b", nil)
-			req = withClientCert(req, clientCert)
-			rr := httptest.NewRecorder()
-			mux.ServeHTTP(rr, req)
-			Expect(rr.Code).To(Equal(http.StatusForbidden))
-		})
-
 		It("returns 403 for GET /certificate_request/{other-node}", func() {
 			clientCert := issueClientCert("node-a", caCert, caKey)
 			req := httptest.NewRequest("GET", "/certificate_request/node-b", nil)
@@ -306,6 +347,38 @@ var _ = Describe("Auth Middleware", func() {
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
 			Expect(rr.Code).To(Equal(http.StatusForbidden))
+		})
+	})
+
+	// ── GET /certificate/{subject} is public ───────────────────────────────────
+	// Signed certificates contain no secrets; Puppet Server 8 allows
+	// unauthenticated access so that bootstrapping nodes can fetch their own
+	// cert before they have a client cert to present.
+
+	Context("GET /certificate/{subject} is public", func() {
+		It("allows retrieval with no TLS connection state", func() {
+			req := httptest.NewRequest("GET", "/certificate/some-node", nil)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			// 404 because the cert doesn't exist, but not 403.
+			Expect(rr.Code).NotTo(Equal(http.StatusForbidden))
+		})
+
+		It("allows retrieval over TLS with no peer cert", func() {
+			req := httptest.NewRequest("GET", "/certificate/some-node", nil)
+			req.TLS = &tls.ConnectionState{}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).NotTo(Equal(http.StatusForbidden))
+		})
+
+		It("allows node-a to retrieve node-b's cert", func() {
+			clientCert := issueClientCert("node-a", caCert, caKey)
+			req := httptest.NewRequest("GET", "/certificate/node-b", nil)
+			req = withClientCert(req, clientCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).NotTo(Equal(http.StatusForbidden))
 		})
 	})
 

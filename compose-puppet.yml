@@ -1,0 +1,163 @@
+# Full Puppet stack integration test topology for puppet-ca.
+#
+# Services
+# --------
+#   puppet-ca      — Go CA with TLS enabled (two-phase bootstrap; see
+#                    docker/puppet/ca-entrypoint.sh).
+#   puppet-master  — OpenVox 8 WEBrick master with PuppetDB integration.
+#   postgres       — PostgreSQL 17 backend for OpenVoxDB.
+#   openvoxdb      — OpenVoxDB (PuppetDB fork); bootstraps certs from the CA.
+#   puppet-client  — OpenVox 8 agent; kept alive for `$engine exec` commands.
+#
+# Usage (from project root):
+#   mage test:puppet                   # build, run test suite, tear down
+#   podman-compose -f compose-puppet.yml up --build   # interactive
+#
+# The test suite is in test/puppet/puppet-stack.sh.
+#
+# TLS notes
+# ---------
+# The CA runs with a proper TLS cert (CN=puppet-ca, signed by the CA itself).
+# All services verify the CA's TLS cert against ca_crt.pem after the initial
+# insecure bootstrap fetch.  No service uses --no-tls-required.
+
+name: puppet-ca-puppet
+
+services:
+
+  # ── Go CA (TLS enabled) ─────────────────────────────────────────────────
+  puppet-ca:
+    build:
+      context: .
+      dockerfile: Dockerfile.run
+    image: puppet-ca-integ:latest
+    container_name: puppet-ca-puppet_puppet-ca_1
+    hostname: puppet-ca
+    # Override the default ENTRYPOINT with a two-phase bootstrap script that
+    # first generates a TLS cert for the "puppet-ca" hostname, then restarts
+    # the CA with TLS on all interfaces.
+    entrypoint: ["/bin/bash", "/etc/puppet-ca/entrypoint.sh"]
+    volumes:
+      - ./docker/puppet/ca-entrypoint.sh:/etc/puppet-ca/entrypoint.sh:ro,z
+      - ca-data:/data
+    expose:
+      - "8140"
+    # Port 8141 on the host allows the test script to reach the CA directly.
+    ports:
+      - "8141:8140"
+    healthcheck:
+      # Use -k (insecure) so the healthcheck works before any other container
+      # has downloaded the CA cert.  The TLS cert is valid — we just skip CN
+      # verification inside the container itself.
+      test: ["CMD", "curl", "-sfk", "https://localhost:8140/puppet-ca/v1/certificate/ca"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ── Puppet master (OpenVox Server / JVM) ───────────────────────────────
+  puppet-master:
+    build:
+      context: ./docker/puppet
+      dockerfile: Dockerfile
+    container_name: puppet-ca-puppet_puppet-master_1
+    hostname: puppet-master
+    environment:
+      # entrypoint.sh uses PUPPET_FQDN as the cert CN so it is predictable.
+      - PUPPET_FQDN=puppet-master
+      - PUPPET_CA_HOST=puppet-ca
+      - PUPPET_CA_PORT=8140
+      - OPENVOXDB_HOST=openvoxdb
+      - OPENVOXDB_PORT=8081
+    volumes:
+      - ./test/puppet/code/environments/production:/etc/puppetlabs/code/environments/production:ro,z
+    expose:
+      - "8140"
+    # Port 8140 on the host allows the test script to reach the master.
+    ports:
+      - "8140:8140"
+    depends_on:
+      puppet-ca:
+        # service_started (not service_healthy) so that `compose up -d` returns
+        # immediately; the entrypoint.sh bootstraps its own wait loop for the CA.
+        condition: service_started
+    healthcheck:
+      # /status/v1/simple is the Puppet Server unauthenticated health endpoint.
+      test: ["CMD-SHELL",
+             "curl -sfk https://localhost:8140/status/v1/simple | grep -q running"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  # ── PostgreSQL backend for OpenVoxDB ────────────────────────────────────
+  postgres:
+    image: docker.io/postgres:17-alpine
+    container_name: puppet-ca-puppet_postgres_1
+    hostname: postgres
+    environment:
+      POSTGRES_DB: openvoxdb
+      POSTGRES_USER: openvoxdb
+      POSTGRES_PASSWORD: openvoxdb
+    volumes:
+      - ./docker/puppet/postgres:/docker-entrypoint-initdb.d:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openvoxdb -d openvoxdb"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # ── OpenVoxDB (PuppetDB) ────────────────────────────────────────────────
+  openvoxdb:
+    image: ghcr.io/openvoxproject/openvoxdb:latest
+    container_name: puppet-ca-puppet_openvoxdb_1
+    hostname: openvoxdb
+    environment:
+      USE_OPENVOXSERVER: "true"
+      # Must match the puppet master's cert CN.
+      OPENVOXSERVER_HOSTNAME: puppet-master
+      OPENVOXSERVER_PORT: "8140"
+      CERTNAME: openvoxdb
+      # Go CA HTTPS endpoint for cert bootstrap.
+      PUPPET_CA_HOST: puppet-ca
+      PUPPET_CA_PORT: "8140"
+      OPENVOXDB_POSTGRES_HOSTNAME: postgres
+      OPENVOXDB_POSTGRES_PORT: "5432"
+      OPENVOXDB_POSTGRES_USER: openvoxdb
+      OPENVOXDB_POSTGRES_PASSWORD: openvoxdb
+      OPENVOXDB_POSTGRES_DATABASE: openvoxdb
+    volumes:
+      # Runs before ssl.sh (20-configure-ssl.sh) so that ssl.sh sees certs
+      # already present and exits immediately.
+      - ./docker/puppet/openvoxdb/bootstrap-certs.sh:/container-entrypoint.d/15-bootstrap-certs.sh:ro,z
+    depends_on:
+      puppet-master:
+        # service_started so `compose up -d` returns without waiting for the
+        # JVM/JRuby puppet-master to fully initialize (can take several minutes).
+        # bootstrap-certs.sh waits for the CA itself; openvoxdb retries internally.
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL",
+             "curl -ksS https://openvoxdb:8081/status/v1/simple | grep -q running"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ── Puppet agent (client) ───────────────────────────────────────────────
+  puppet-client:
+    build:
+      context: ./docker/puppet
+      dockerfile: Dockerfile.client
+    container_name: puppet-ca-puppet_puppet-client_1
+    hostname: client.puppet.localdomain
+    depends_on:
+      puppet-master:
+        condition: service_started
+      openvoxdb:
+        condition: service_started
+
+volumes:
+  ca-data:
