@@ -49,11 +49,6 @@ fi
 CA_HOST_URL="https://localhost:8141"
 MASTER_URL="https://puppet-master:8140"   # used from inside master container
 
-CA_CONTAINER="puppet-ca-puppet_puppet-ca_1"
-MASTER_CONTAINER="puppet-ca-puppet_puppet-master_1"
-CLIENT_CONTAINER="puppet-ca-puppet_puppet-client_1"
-OPENVOXDB_CONTAINER="puppet-ca-puppet_openvoxdb_1"
-
 WORK_DIR=$(mktemp -d /tmp/puppet-stack-integ.XXXXXX)
 RUN_ID=$(date +%s)
 
@@ -70,10 +65,13 @@ for arg in "$@"; do
 done
 
 # ── Container exec wrappers ───────────────────────────────────────────────
-exec_ca()     { "$_ENGINE" exec    "$CA_CONTAINER"       "$@"; }
-exec_master() { "$_ENGINE" exec    "$MASTER_CONTAINER"   "$@"; }
-exec_master_i() { "$_ENGINE" exec -i "$MASTER_CONTAINER" "$@"; }
-exec_client() { "$_ENGINE" exec    "$CLIENT_CONTAINER"   "$@"; }
+# Use compose exec so container name resolution works regardless of whether
+# the tool uses underscore (podman-compose/v1) or dash (docker compose v2)
+# naming conventions.  -T disables TTY allocation so these work in CI.
+exec_ca()       { "${_COMPOSE[@]}" exec -T puppet-ca     "$@"; }
+exec_master()   { "${_COMPOSE[@]}" exec -T puppet-master "$@"; }
+exec_master_i() { "${_COMPOSE[@]}" exec -T puppet-master "$@"; }
+exec_client()   { "${_COMPOSE[@]}" exec -T puppet-client "$@"; }
 
 copy_from_client() {   # src-path dest-path
     exec_client cat "$1" > "$2" 2>/dev/null
@@ -156,13 +154,6 @@ run_master_agent() {
 }
 
 # ── Stack lifecycle ───────────────────────────────────────────────────────
-_COMPOSE_CONTAINERS=(
-    "$CA_CONTAINER"
-    "$MASTER_CONTAINER"
-    "$CLIENT_CONTAINER"
-    "${OPENVOXDB_CONTAINER}"
-    "puppet-ca-puppet_postgres_1"
-)
 
 cleanup() {
     rm -rf "$WORK_DIR"
@@ -177,10 +168,10 @@ trap cleanup EXIT
 
 if $DO_UP; then
     printf '# Removing any leftover containers from previous runs...\n'
-    for _c in "${_COMPOSE_CONTAINERS[@]}"; do
-        "$_ENGINE" rm -f "$_c" 2>/dev/null || true
-    done
-    # Remove the CA data volume so each run starts with a fresh CA.
+    "${_COMPOSE[@]}" down --volumes --remove-orphans --timeout 10 2>/dev/null || true
+    # Explicitly remove the CA data volume so each run starts with a fresh CA
+    # (compose down --volumes covers named volumes declared in the file, but
+    # belt-and-suspenders for the persistent CA store).
     "$_ENGINE" volume rm puppet-ca-puppet_ca-data 2>/dev/null || true
 
     printf '# Building compose images...\n'
