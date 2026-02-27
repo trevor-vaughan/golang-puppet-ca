@@ -31,7 +31,6 @@ services:
       context: .
       dockerfile: Dockerfile.run
     image: puppet-ca-integ:latest
-    container_name: puppet-ca-puppet_puppet-ca_1
     hostname: puppet-ca
     # Override the default ENTRYPOINT with a two-phase bootstrap script that
     # first generates a TLS cert for the "puppet-ca" hostname, then restarts
@@ -60,7 +59,6 @@ services:
     build:
       context: ./docker/puppet
       dockerfile: Dockerfile
-    container_name: puppet-ca-puppet_puppet-master_1
     hostname: puppet-master
     environment:
       # entrypoint.sh uses PUPPET_FQDN as the cert CN so it is predictable.
@@ -93,7 +91,6 @@ services:
   # ── PostgreSQL backend for OpenVoxDB ────────────────────────────────────
   postgres:
     image: docker.io/postgres:17-alpine
-    container_name: puppet-ca-puppet_postgres_1
     hostname: postgres
     environment:
       POSTGRES_DB: openvoxdb
@@ -110,7 +107,6 @@ services:
   # ── OpenVoxDB (PuppetDB) ────────────────────────────────────────────────
   openvoxdb:
     image: ghcr.io/openvoxproject/openvoxdb:latest
-    container_name: puppet-ca-puppet_openvoxdb_1
     hostname: openvoxdb
     environment:
       USE_OPENVOXSERVER: "true"
@@ -151,7 +147,6 @@ services:
     build:
       context: ./docker/puppet
       dockerfile: Dockerfile.client
-    container_name: puppet-ca-puppet_puppet-client_1
     hostname: client.puppet.localdomain
     depends_on:
       puppet-master:

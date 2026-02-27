@@ -169,10 +169,6 @@ trap cleanup EXIT
 if $DO_UP; then
     printf '# Removing any leftover containers from previous runs...\n'
     "${_COMPOSE[@]}" down --volumes --remove-orphans --timeout 10 2>/dev/null || true
-    # Explicitly remove the CA data volume so each run starts with a fresh CA
-    # (compose down --volumes covers named volumes declared in the file, but
-    # belt-and-suspenders for the persistent CA store).
-    "$_ENGINE" volume rm puppet-ca-puppet_ca-data 2>/dev/null || true
 
     printf '# Building compose images...\n'
     "${_COMPOSE[@]}" build
