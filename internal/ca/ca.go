@@ -33,7 +33,7 @@ type CA struct {
 	// OCSPURLs, when non-nil, causes newly issued certs to embed an AIA extension
 	// pointing at the OCSP responder. Set before calling Init().
 	OCSPURLs    []string
-	serialIndex map[string]string    // padded uppercase hex serial → subject; protected by mu
+	serialIndex map[string]string         // padded uppercase hex serial → subject; protected by mu
 	ocspCache   map[string]ocspCacheEntry // same key; protected by mu
 	mu          sync.RWMutex
 }

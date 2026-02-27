@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,8 +47,8 @@ import (
 // ── Namespaces ────────────────────────────────────────────────────────────────
 
 type Build mg.Namespace // build:all  build:fips
-type Test  mg.Namespace // test:unit  test:integ  test:integfips  test:load  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:stress  test:puppet  test:puppetfips
-type Dev   mg.Namespace // dev:check  dev:tidy    dev:clean  dev:container
+type Test mg.Namespace  // test:unit  test:integ  test:integfips  test:load  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:stress  test:puppet  test:puppetfips
+type Dev mg.Namespace   // dev:check  dev:tidy    dev:clean  dev:container
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -310,12 +311,18 @@ func (Test) PuppetFIPS() error {
 
 // ── dev:* ─────────────────────────────────────────────────────────────────────
 
-// Check runs go fmt, go vet, and go mod tidy.
+// Check verifies formatting, runs go vet, and checks go mod tidy.
+// Unlike `go fmt`, gofmt -l prints unformatted files and exits 0 without
+// rewriting them; we treat any output as a failure so CI catches drift.
 func (Dev) Check() error {
 	mg.Deps(Dev{}.Tidy)
 	fmt.Println("Running verify...")
-	if err := sh.Run("go", "fmt", "./..."); err != nil {
+	out, err := sh.Output("gofmt", "-l", ".")
+	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(out) != "" {
+		return fmt.Errorf("these files need formatting (run 'go fmt ./...'):\n%s", out)
 	}
 	return sh.Run("go", "vet", "./...")
 }

@@ -27,7 +27,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install Mage
-        run: go install github.com/magefile/mage@latest
+        run: go install github.com/magefile/mage@v1.15.0
       - name: Check formatting, vet, and module tidy
         run: mage dev:check
 
@@ -42,7 +42,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install Mage
-        run: go install github.com/magefile/mage@latest
+        run: go install github.com/magefile/mage@v1.15.0
       - name: Run unit tests
         run: mage test:unit
 
@@ -70,7 +70,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install Mage
-        run: go install github.com/magefile/mage@latest
+        run: go install github.com/magefile/mage@v1.15.0
       - name: Run integration tests
         env:
           MAGE_TARGET: ${{ matrix.mage_target }}
@@ -98,7 +98,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install Mage
-        run: go install github.com/magefile/mage@latest
+        run: go install github.com/magefile/mage@v1.15.0
       - name: Run Puppet stack integration tests
         env:
           MAGE_TARGET: ${{ matrix.mage_target }}
@@ -126,7 +126,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install Mage
-        run: go install github.com/magefile/mage@latest
+        run: go install github.com/magefile/mage@v1.15.0
       - name: Run compose integration tests
         env:
           MAGE_TARGET: ${{ matrix.mage_target }}
