@@ -126,9 +126,18 @@ func lookupTier(method, path string) authTier {
 		// and intermediate caches must be able to fetch responses unauthenticated.
 		return tierPublic
 
-	// Self or admin.
+	// Public reads — no cert required.
+	// certificate_status and expirations expose only public-equivalent data
+	// (cert state/fingerprint/expiry, CA/CRL validity windows) that an agent
+	// can derive by downloading the cert or CRL directly.  Making them public
+	// lets bootstrapping agents and unauthenticated monitoring tools poll
+	// status and expiry without first obtaining a client certificate.
 	case method == "GET" && strings.HasPrefix(p, "/certificate_status/"):
-		return tierSelfOrAdmin
+		return tierPublic
+	case method == "GET" && p == "/expirations":
+		return tierPublic
+
+	// Self or admin reads.
 	case method == "GET" && strings.HasPrefix(p, "/certificate_request/"):
 		return tierSelfOrAdmin
 

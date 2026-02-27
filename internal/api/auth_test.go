@@ -141,8 +141,8 @@ var _ = Describe("Auth Middleware", func() {
 	// ── No client cert on protected endpoints ──────────────────────────────────
 
 	Context("no client cert presented to a protected endpoint", func() {
-		It("returns 403 for GET /certificate_status/{subject} (self-or-admin tier)", func() {
-			req := httptest.NewRequest("GET", "/certificate_status/some-node", nil)
+		It("returns 403 for GET /certificate_request/{subject} (self-or-admin tier)", func() {
+			req := httptest.NewRequest("GET", "/certificate_request/some-node", nil)
 			req.TLS = &tls.ConnectionState{}
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -201,7 +201,7 @@ var _ = Describe("Auth Middleware", func() {
 			expiredCert, err := x509.ParseCertificate(certBytes)
 			Expect(err).NotTo(HaveOccurred())
 
-			req := httptest.NewRequest("GET", "/certificate_status/expired-node", nil)
+			req := httptest.NewRequest("GET", "/certificate_request/expired-node", nil)
 			req = withClientCert(req, expiredCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -224,7 +224,7 @@ var _ = Describe("Auth Middleware", func() {
 			futureCert, err := x509.ParseCertificate(certBytes)
 			Expect(err).NotTo(HaveOccurred())
 
-			req := httptest.NewRequest("GET", "/certificate_status/future-node", nil)
+			req := httptest.NewRequest("GET", "/certificate_request/future-node", nil)
 			req = withClientCert(req, futureCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -251,7 +251,7 @@ var _ = Describe("Auth Middleware", func() {
 			// presented cert's serial is not consulted; only the CN is used to
 			// locate the revoked record on disk.
 			clientCert := issueClientCert("revoked-client", caCert, caKey)
-			req := httptest.NewRequest("GET", "/certificate_status/revoked-client", nil)
+			req := httptest.NewRequest("GET", "/certificate_request/revoked-client", nil)
 			req = withClientCert(req, clientCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -331,9 +331,9 @@ var _ = Describe("Auth Middleware", func() {
 	// ── Non-self client on self-or-admin endpoints ─────────────────────────────
 
 	Context("non-self client accessing another node's self-or-admin endpoint", func() {
-		It("returns 403 for GET /certificate_status/{other-node}", func() {
+		It("returns 403 for GET /certificate_request/{other-node}", func() {
 			clientCert := issueClientCert("node-a", caCert, caKey)
-			req := httptest.NewRequest("GET", "/certificate_status/node-b", nil)
+			req := httptest.NewRequest("GET", "/certificate_request/node-b", nil)
 			req = withClientCert(req, clientCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
@@ -533,8 +533,8 @@ var _ = Describe("Auth Middleware", func() {
 		})
 	})
 
-	Context("self cert passes own subject on self-or-admin endpoints", func() {
-		It("GET /certificate_status/{own-node} is not rejected", func() {
+	Context("public endpoint is reachable regardless of client cert", func() {
+		It("GET /certificate_status/{own-node} is not rejected (public tier)", func() {
 			clientCert := issueClientCert("my-node", caCert, caKey)
 			req := httptest.NewRequest("GET", "/certificate_status/my-node", nil)
 			req = withClientCert(req, clientCert)
