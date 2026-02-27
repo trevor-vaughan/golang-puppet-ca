@@ -447,10 +447,75 @@ assert_http 200 "GET /puppet-ca/v1/certificate_status/{signed-subject} returns 2
     "$CA_URL/puppet-ca/v1/certificate_status/${_PFX_HOST}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Group 5 — Concurrency / load tests  (opt-in via --load)
+# Group 5 — OCSP endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+printf '\n# Group 5 — OCSP endpoint\n'
+
+# Sign a fresh cert dedicated to OCSP testing.
+_OCSP_HOST="ocsp-${RUN_ID}.example.com"
+make_csr "$_OCSP_HOST" "$WORK_DIR/ocsp.csr"
+curl -s -o /dev/null \
+    -X PUT -H "Content-Type: text/plain" \
+    --data-binary @"$WORK_DIR/ocsp.csr" \
+    "$CA_URL/puppet-ca/v1/certificate_request/${_OCSP_HOST}" 2>/dev/null || true
+curl -s -o /dev/null \
+    -X PUT -H "Content-Type: application/json" \
+    -d '{"desired_state":"signed"}' \
+    "$CA_URL/puppet-ca/v1/certificate_status/${_OCSP_HOST}" 2>/dev/null || true
+curl -sf "$CA_URL/puppet-ca/v1/certificate/${_OCSP_HOST}" \
+    -o "$WORK_DIR/ocsp.crt" 2>/dev/null || true
+
+if [[ -s "$WORK_DIR/ocsp.crt" ]]; then
+    # Good — the cert is currently valid.
+    _ocsp_good=$(openssl ocsp \
+        -issuer  "$WORK_DIR/ca.pem" \
+        -cert    "$WORK_DIR/ocsp.crt" \
+        -url     "$CA_URL/ocsp" \
+        -CAfile  "$WORK_DIR/ca.pem" \
+        -no_nonce \
+        2>&1) || true
+    grep -qi "good" <<< "$_ocsp_good" \
+        && pass "OCSP: Good status for a valid signed cert" \
+        || fail "OCSP: Good status for a valid signed cert" \
+               "openssl output: $(printf '%s' "$_ocsp_good" | head -3 | tr '\n' '|')"
+
+    # Revoke it, then query again.
+    curl -s -o /dev/null \
+        -X PUT -H "Content-Type: application/json" \
+        -d '{"desired_state":"revoked"}' \
+        "$CA_URL/puppet-ca/v1/certificate_status/${_OCSP_HOST}" 2>/dev/null || true
+
+    _ocsp_rev=$(openssl ocsp \
+        -issuer  "$WORK_DIR/ca.pem" \
+        -cert    "$WORK_DIR/ocsp.crt" \
+        -url     "$CA_URL/ocsp" \
+        -CAfile  "$WORK_DIR/ca.pem" \
+        -no_nonce \
+        2>&1) || true
+    grep -qi "revoked" <<< "$_ocsp_rev" \
+        && pass "OCSP: Revoked status after revocation" \
+        || fail "OCSP: Revoked status after revocation" \
+               "openssl output: $(printf '%s' "$_ocsp_rev" | head -3 | tr '\n' '|')"
+else
+    fail "OCSP: Good status for a valid signed cert" "could not download ${_OCSP_HOST} cert"
+    fail "OCSP: Revoked status after revocation"     "could not download ${_OCSP_HOST} cert"
+fi
+
+# Malformed POST body → 400 Bad Request.
+_ocsp_bad=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X POST \
+    -H "Content-Type: application/ocsp-request" \
+    --data-binary "not der" \
+    "$CA_URL/ocsp") || true
+[ "$_ocsp_bad" = "400" ] \
+    && pass "OCSP: malformed POST body returns 400" \
+    || fail "OCSP: malformed POST body returns 400" "got HTTP $_ocsp_bad"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Group 6 — Concurrency / load tests  (opt-in via --load)
 # ═══════════════════════════════════════════════════════════════════════════════
 if $DO_LOAD; then
-    printf '\n# Group 5 — Concurrency / load tests\n'
+    printf '\n# Group 6 — Concurrency / load tests\n'
 
     # --- 5a: Concurrent CSR submissions ---
     _WRITE_N=20

@@ -60,6 +60,7 @@ func main() {
 		tlsKey        string
 		puppetServers string
 		noTLSRequired bool
+		ocspURL       string
 	)
 
 	cmd := &cobra.Command{
@@ -180,6 +181,9 @@ func main() {
 
 			// --- CA Initialisation ---
 			myCA := ca.New(store, asCfg, hostname)
+			if ocspURL != "" {
+				myCA.OCSPURLs = []string{ocspURL}
+			}
 			if err := myCA.Init(); err != nil {
 				slog.Error("Failed to initialise CA", "error", err)
 				os.Exit(1)
@@ -274,6 +278,7 @@ func main() {
 	f.StringVar(&tlsKey, "tls-key", "", "Path to TLS server private key PEM (enables HTTPS)")
 	f.StringVar(&puppetServers, "puppet-server", "", "Comma-separated list of puppet-server CNs allowed admin access")
 	f.BoolVar(&noTLSRequired, "no-tls-required", false, "Allow plain HTTP on non-loopback addresses (use only behind a trusted TLS proxy or in test environments)")
+	f.StringVar(&ocspURL, "ocsp-url", "", "OCSP responder URL to embed in issued certificates (e.g. http://puppet-ca:8140/ocsp)")
 	_ = cmd.MarkFlagRequired("cadir")
 
 	if err := cmd.Execute(); err != nil {

@@ -172,10 +172,7 @@ cleanup() {
 
     if $DO_UP && ! $DO_KEEP; then
         printf '\n# Tearing down compose stack...\n'
-        "${_COMPOSE[@]}" down --timeout 10 2>/dev/null || true
-        for _c in "${_COMPOSE_CONTAINERS[@]}"; do
-            "$_ENGINE" rm -f "$_c" 2>&1 /dev/null || true
-        done
+        "${_COMPOSE[@]}" down --volumes --timeout 10 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -356,18 +353,22 @@ _revoke_st=$(exec_master curl -s -o /dev/null -w '%{http_code}' \
 # ═════════════════════════════════════════════════════════════════════════
 printf '\n# Group 2 — Puppet master reachability\n'
 
+# Use the master's real hostname so TLS hostname verification passes.
+# --resolve routes puppet-master:8140 to 127.0.0.1 (host port mapping).
+_MASTER_HOST=(--cacert "$WORK_DIR/ca.pem" --resolve "puppet-master:8140:127.0.0.1")
+
 assert_http 200 "Master status endpoint returns 200 (unauthenticated)" \
-    --cacert "$WORK_DIR/ca.pem" \
-    "https://localhost:8140/status/v1/simple"
+    "${_MASTER_HOST[@]}" \
+    "https://puppet-master:8140/status/v1/simple"
 
 assert_contains "running" "Master status body contains 'running'" \
-    --cacert "$WORK_DIR/ca.pem" \
-    "https://localhost:8140/status/v1/simple"
+    "${_MASTER_HOST[@]}" \
+    "https://puppet-master:8140/status/v1/simple"
 
 # Catalog endpoint should require an authenticated client cert.
 assert_http 403 "Master catalog endpoint requires auth (returns 403 without cert)" \
-    --cacert "$WORK_DIR/ca.pem" \
-    "https://localhost:8140/puppet/v3/catalog/test?environment=production"
+    "${_MASTER_HOST[@]}" \
+    "https://puppet-master:8140/puppet/v3/catalog/test?environment=production"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3 — Full puppet agent end-to-end
@@ -387,9 +388,9 @@ grep -qi "Applied catalog" <<< "$AGENT_OUT" \
     && pass "Agent output contains 'Applied catalog'" \
     || fail "Agent output contains 'Applied catalog'" "last 5 lines: $(tail -5 <<< "$AGENT_OUT" | tr '\n' '|')"
 
-if grep -qiE "SSL_read|certificate revoked|Error" <<< "$AGENT_OUT"; then
+if grep -qiE "SSL_read|certificate revoked|SSL error" <<< "$AGENT_OUT"; then
     fail "Agent output contains no SSL/error messages" \
-         "found error in: $(grep -iE 'SSL_read|certificate revoked|Error' <<< "$AGENT_OUT" | head -3 | tr '\n' '|')"
+         "found error in: $(grep -iE 'SSL_read|certificate revoked|SSL error' <<< "$AGENT_OUT" | head -3 | tr '\n' '|')"
 else
     pass "Agent output contains no SSL/error messages"
 fi

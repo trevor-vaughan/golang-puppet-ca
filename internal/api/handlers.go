@@ -70,6 +70,8 @@ func (s *Server) Routes() http.Handler {
 		{"DELETE", "/certificate_request/{subject}", s.handleDeleteRequest},
 		{"GET", "/certificate/{subject}", s.handleGetCert},
 		{"GET", "/certificate_revocation_list/ca", s.handleGetCRL},
+		{"POST", "/ocsp", s.handleOCSP},
+		{"GET", "/ocsp/{request}", s.handleOCSP},
 		{"GET", "/expirations", s.handleGetExpirations},
 		{"POST", "/sign", s.handlePostSign},
 		{"POST", "/sign/all", s.handlePostSignAll},

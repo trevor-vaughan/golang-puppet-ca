@@ -30,7 +30,12 @@ type CA struct {
 	CAKey          *rsa.PrivateKey
 	AutosignConfig AutosignConfig
 	Hostname       string
-	mu             sync.RWMutex
+	// OCSPURLs, when non-nil, causes newly issued certs to embed an AIA extension
+	// pointing at the OCSP responder. Set before calling Init().
+	OCSPURLs    []string
+	serialIndex map[string]string    // padded uppercase hex serial → subject; protected by mu
+	ocspCache   map[string]ocspCacheEntry // same key; protected by mu
+	mu          sync.RWMutex
 }
 
 func New(s *storage.StorageService, autosignCfg AutosignConfig, hostname string) *CA {
@@ -38,5 +43,7 @@ func New(s *storage.StorageService, autosignCfg AutosignConfig, hostname string)
 		Storage:        s,
 		AutosignConfig: autosignCfg,
 		Hostname:       hostname,
+		serialIndex:    make(map[string]string),
+		ocspCache:      make(map[string]ocspCacheEntry),
 	}
 }

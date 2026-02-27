@@ -197,6 +197,18 @@ func (c *CA) signWithDuration(subject string, ttl time.Duration) ([]byte, error)
 		Value: nsComment,
 	})
 
+	// Authority Information Access — embed OCSP URL when configured.
+	if len(c.OCSPURLs) > 0 {
+		aiaValue, err := buildAIAExtension(c.OCSPURLs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build AIA extension for %s: %w", subject, err)
+		}
+		template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
+			Id:    OIDAIA,
+			Value: aiaValue,
+		})
+	}
+
 	// Copy all Puppet OID extensions from the CSR.
 	for _, ext := range csr.Extensions {
 		if IsPuppetOID(ext.Id) {
@@ -224,6 +236,9 @@ func (c *CA) signWithDuration(subject string, ttl time.Duration) ([]byte, error)
 	if err := c.Storage.AppendInventory(inventoryEntry); err != nil {
 		return nil, fmt.Errorf("failed to update inventory for %s: %w", subject, err)
 	}
+
+	// Update in-memory serial index for O(1) OCSP lookups.
+	c.serialIndex[serialStr] = subject
 
 	// Remove the pending CSR now that we have a signed cert.
 	if err := c.Storage.DeleteCSR(subject); err != nil {

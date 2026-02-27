@@ -92,8 +92,24 @@ func (c *CA) Revoke(subject string) error {
 		return fmt.Errorf("failed to write CRL: %w", err)
 	}
 
+	// Invalidate the cached OCSP response for this serial so the next query
+	// returns the correct Revoked status instead of a stale Good response.
+	delete(c.ocspCache, serialStr)
+
 	slog.Info("Certificate revoked", "subject", subject, "serial", serialStr)
 	return nil
+}
+
+// parseInventoryLine parses a single line of the certificate inventory file.
+// The format is: SERIAL NOT_BEFORE NOT_AFTER /SUBJECT
+// Returns (serial, subject, true) on success; ("", "", false) for blank or malformed lines.
+// The returned subject has its leading "/" stripped.
+func parseInventoryLine(line string) (serial, subject string, ok bool) {
+	parts := strings.Fields(line)
+	if len(parts) < 4 {
+		return "", "", false
+	}
+	return parts[0], strings.TrimPrefix(parts[3], "/"), true
 }
 
 // findSerialForSubject returns the most-recently issued serial for subject.
@@ -105,17 +121,10 @@ func (c *CA) findSerialForSubject(subject string) (string, error) {
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
-	target := "/" + subject
 	last := ""
 	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Fields(line)
-		if len(parts) < 4 {
-			continue
-		}
-		// Format: $SERIAL $NOT_BEFORE $NOT_AFTER /$SUBJECT
-		if parts[3] == target {
-			last = parts[0]
+		if serial, subj, ok := parseInventoryLine(scanner.Text()); ok && subj == subject {
+			last = serial
 		}
 	}
 	if err := scanner.Err(); err != nil {

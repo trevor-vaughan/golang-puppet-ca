@@ -19,6 +19,15 @@ package ca
 import "encoding/asn1"
 
 var (
+	// OIDAIA is the Authority Information Access extension (RFC 5280 §4.2.2.1).
+	OIDAIA = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
+
+	// OIDAdOCSP is the id-ad-ocsp access method OID (RFC 5280 §4.2.2.1 / RFC 6960)
+	// used in Authority Information Access extensions to point at an OCSP responder.
+	// Not to be confused with id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9), which is the
+	// extended key usage for delegated OCSP signing certificates.
+	OIDAdOCSP = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
+
 	// Puppet OID Arc: 1.3.6.1.4.1.34380.1
 	PuppetOIDArc = []int{1, 3, 6, 1, 4, 1, 34380, 1}
 

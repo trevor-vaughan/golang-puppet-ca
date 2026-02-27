@@ -121,6 +121,10 @@ func lookupTier(method, path string) authTier {
 		return tierPublic
 	case method == "PUT" && strings.HasPrefix(p, "/certificate_request/"):
 		return tierPublic
+	case strings.HasPrefix(p, "/ocsp"):
+		// OCSP is always public: clients query before they have a client cert
+		// and intermediate caches must be able to fetch responses unauthenticated.
+		return tierPublic
 
 	// Self or admin.
 	case method == "GET" && strings.HasPrefix(p, "/certificate_status/"):

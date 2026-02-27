@@ -118,13 +118,13 @@ func (Build) FIPS() error {
 	}
 
 	if err := sh.RunWith(env, "go", "build",
-		"-o", filepath.Join(binDir, "puppet-ca-fips"),
+		"-o", filepath.Join(binDir, "puppet-ca"),
 		"./cmd/puppet-ca"); err != nil {
 		return err
 	}
 
 	return sh.RunWith(env, "go", "build",
-		"-o", filepath.Join(binDir, "puppet-ca-ctl-fips"),
+		"-o", filepath.Join(binDir, "puppet-ca-ctl"),
 		"./cmd/puppet-ca-ctl")
 }
 
@@ -263,12 +263,7 @@ func (Test) Puppet() error {
 	}
 
 	fmt.Println("Running puppet stack integration tests...")
-	err := sh.RunV("bash", "test/puppet/puppet-stack.sh", "--up")
-
-	fmt.Println("Tearing down puppet stack...")
-	_ = runCompose(nil, "-f", "compose-puppet.yml", "down", "--volumes")
-
-	return err
+	return sh.RunV("bash", "test/puppet/puppet-stack.sh", "--up")
 }
 
 // ── dev:* ─────────────────────────────────────────────────────────────────────

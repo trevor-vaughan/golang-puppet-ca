@@ -44,6 +44,9 @@ func (c *CA) Init() error {
 	// Try loading existing CA first.
 	if err := c.loadCA(); err == nil {
 		slog.Info("Loaded existing CA", "cert", c.Storage.CACertPath())
+		if err := c.buildSerialIndex(); err != nil {
+			slog.Warn("Failed to build OCSP serial index", "error", err)
+		}
 		return nil
 	}
 

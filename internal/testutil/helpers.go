@@ -17,6 +17,7 @@
 package testutil
 
 import (
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
@@ -26,6 +27,8 @@ import (
 	"encoding/pem"
 	"math/big"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 )
 
 // GenerateTestCA generates a lighter-weight CA (2048-bit) for testing purposes.
@@ -86,6 +89,81 @@ func GenerateTestCA() ([]byte, []byte, []byte, error) {
 	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
 
 	return keyPEM, certPEM, crlPEM, nil
+}
+
+// BuildOCSPRequest creates a DER-encoded OCSPRequest for cert signed by issuer.
+// Uses SHA256 as the hash algorithm.
+func BuildOCSPRequest(cert, issuer *x509.Certificate) ([]byte, error) {
+	return ocsp.CreateRequest(cert, issuer, &ocsp.RequestOptions{Hash: crypto.SHA256})
+}
+
+// oidNonceTestutil is the OCSP nonce OID (RFC 8954 §2).
+var oidNonceTestutil = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 2}
+
+// BuildOCSPRequestWithNonce creates a DER-encoded OCSPRequest including a nonce
+// extension in requestExtensions. The nonce value must be 1–32 bytes (RFC 8954).
+func BuildOCSPRequestWithNonce(cert, issuer *x509.Certificate, nonce []byte) ([]byte, error) {
+	// Compute IssuerNameHash = SHA1(issuer.RawSubject)
+	issuerNameHash := sha1.Sum(issuer.RawSubject)
+
+	// Extract SubjectPublicKey bit string from SubjectPublicKeyInfo.
+	var spki struct {
+		Algorithm pkix.AlgorithmIdentifier
+		PublicKey asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(issuer.RawSubjectPublicKeyInfo, &spki); err != nil {
+		return nil, err
+	}
+	// IssuerKeyHash = SHA1(SubjectPublicKey bit string bytes)
+	issuerKeyHash := sha1.Sum(spki.PublicKey.Bytes)
+
+	// Build certID using id-sha1 (OID 1.3.14.3.2.26).
+	hashAlgID := pkix.AlgorithmIdentifier{
+		Algorithm:  asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26},
+		Parameters: asn1.RawValue{Tag: 5}, // NULL
+	}
+
+	// Build the nonce extension value: extnValue contains DER(OCTET STRING(nonce)).
+	nonceValueDER, err := asn1.Marshal(nonce)
+	if err != nil {
+		return nil, err
+	}
+	nonceExt := pkix.Extension{
+		Id:    oidNonceTestutil,
+		Value: nonceValueDER,
+	}
+
+	// Build the full OCSPRequest with requestExtensions.
+	type certIDASN1 struct {
+		HashAlgorithm pkix.AlgorithmIdentifier
+		NameHash      []byte
+		IssuerKeyHash []byte
+		SerialNumber  *big.Int
+	}
+	type requestItemASN1 struct {
+		Cert certIDASN1
+	}
+	type tbsRequestASN1 struct {
+		RequestList []requestItemASN1
+		Extensions  []pkix.Extension `asn1:"explicit,tag:2,optional"`
+	}
+	type ocspRequestASN1 struct {
+		TBSRequest tbsRequestASN1
+	}
+
+	return asn1.Marshal(ocspRequestASN1{
+		TBSRequest: tbsRequestASN1{
+			RequestList: []requestItemASN1{{
+				Cert: certIDASN1{
+					HashAlgorithm: hashAlgID,
+					NameHash:      issuerNameHash[:],
+					IssuerKeyHash: issuerKeyHash[:],
+					SerialNumber:  cert.SerialNumber,
+				},
+			}},
+			Extensions: []pkix.Extension{nonceExt},
+		},
+	})
 }
 
 // GenerateCSR generates a standard CSR for testing.

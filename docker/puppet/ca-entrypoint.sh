@@ -62,7 +62,7 @@ echo "Generating TLS cert for puppet-ca service hostname..."
     --server-url http://127.0.0.1:8140 \
     generate \
     --certname puppet-ca \
-    --dns puppet-ca \
+    --dns puppet-ca,localhost \
     --out-dir "${CA_DIR}/private"
 
 # Verify both files were written before proceeding to Phase 2.
