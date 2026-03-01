@@ -47,3 +47,10 @@ func New(s *storage.StorageService, autosignCfg AutosignConfig, hostname string)
 		ocspCache:      make(map[string]ocspCacheEntry),
 	}
 }
+
+// IsReady reports whether the CA has been fully initialized and can serve requests.
+func (c *CA) IsReady() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.CACert != nil && c.CAKey != nil
+}

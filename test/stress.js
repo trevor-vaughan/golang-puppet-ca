@@ -207,12 +207,27 @@ export function handleSummary(data) {
   const minutes    = Math.floor(durationMs / 60000);
   const seconds    = Math.round((durationMs % 60000) / 1000);
 
+  function sysBlock() {
+    const mem = __ENV.REPORT_MEM_GB ? `${__ENV.REPORT_MEM_GB} GB` : '(unknown)';
+    return [
+      '  System',
+      `    date:    ${new Date().toISOString()}`,
+      `    host:    ${__ENV.REPORT_HOST   || '(unknown)'}`,
+      `    cpus:    ${__ENV.REPORT_CPUS   || '(unknown)'}`,
+      `    memory:  ${mem}`,
+      `    kernel:  ${__ENV.REPORT_KERNEL || '(unknown)'}`,
+      `    ca url:  ${__ENV.CA_URL        || 'http://puppet-ca:8140'}`,
+    ].join('\n');
+  }
+
   const report = [
     '',
     '╔══════════════════════════════════════════════════════════╗',
     '║            puppet-ca stress test results                 ║',
     '╚══════════════════════════════════════════════════════════╝',
     `  duration: ${minutes}m ${seconds}s`,
+    '',
+    sysBlock(),
     '',
     scenarioBlock('READ  (GET /certificate/ca,  target 10→500 req/s)', 'read_saturation'),
     '',

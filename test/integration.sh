@@ -130,7 +130,7 @@ if $DO_UP; then
 
     printf '# Waiting for CA to become ready'
     for _i in $(seq 1 30); do
-        curl -sf "$CA_URL/puppet-ca/v1/certificate/ca" >/dev/null 2>&1 && break
+        curl -sf "$CA_URL/healthz/ready" >/dev/null 2>&1 && break
         printf '.'; sleep 1
     done
     printf ' ready\n'
@@ -154,6 +154,30 @@ _keygen
 # Group 1 — Endpoint smoke tests
 # ═══════════════════════════════════════════════════════════════════════════════
 printf '\n# Group 1 — Endpoint smoke tests\n'
+
+assert_http 200 "GET /healthz/live returns 200" \
+    "$CA_URL/healthz/live"
+
+assert_contains '"status":"ok"' "GET /healthz/live body has status:ok" \
+    "$CA_URL/healthz/live"
+
+assert_http 200 "GET /healthz/ready returns 200 (CA initialized)" \
+    "$CA_URL/healthz/ready"
+
+assert_contains '"status":"ok"' "GET /healthz/ready body has status:ok" \
+    "$CA_URL/healthz/ready"
+
+assert_http 200 "GET /healthz/startup returns 200 (CA initialized)" \
+    "$CA_URL/healthz/startup"
+
+assert_http 405 "POST /healthz/live returns 405" \
+    -X POST "$CA_URL/healthz/live"
+
+assert_http 405 "POST /healthz/ready returns 405" \
+    -X POST "$CA_URL/healthz/ready"
+
+assert_http 405 "POST /healthz/startup returns 405" \
+    -X POST "$CA_URL/healthz/startup"
 
 assert_http 200 "GET /certificate/ca returns 200" \
     "$CA_URL/puppet-ca/v1/certificate/ca"

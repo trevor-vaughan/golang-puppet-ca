@@ -129,6 +129,30 @@ _keygen
 # ═════════════════════════════════════════════════════════════════════════════
 printf '\n# Group 1 — Endpoint smoke tests (test-runner → puppet-ca network)\n'
 
+assert_http 200 "GET /healthz/live returns 200" \
+    "${CA_URL}/healthz/live"
+
+assert_contains '"status":"ok"' "GET /healthz/live body has status:ok" \
+    "${CA_URL}/healthz/live"
+
+assert_http 200 "GET /healthz/ready returns 200 (CA initialized)" \
+    "${CA_URL}/healthz/ready"
+
+assert_contains '"status":"ok"' "GET /healthz/ready body has status:ok" \
+    "${CA_URL}/healthz/ready"
+
+assert_http 200 "GET /healthz/startup returns 200 (CA initialized)" \
+    "${CA_URL}/healthz/startup"
+
+assert_http 405 "POST /healthz/live returns 405" \
+    -X POST "${CA_URL}/healthz/live"
+
+assert_http 405 "POST /healthz/ready returns 405" \
+    -X POST "${CA_URL}/healthz/ready"
+
+assert_http 405 "POST /healthz/startup returns 405" \
+    -X POST "${CA_URL}/healthz/startup"
+
 assert_http 200 "GET /certificate/ca returns 200 from remote host" \
     "${CA_URL}/puppet-ca/v1/certificate/ca"
 
@@ -897,7 +921,7 @@ _LOCAL_PORT=8141
 _wait_local_ca() {
     local n=20
     while [ "$n" -gt 0 ]; do
-        curl -sf "${_LOCAL_CA}/puppet-ca/v1/certificate/ca" -o /dev/null 2>/dev/null && return 0
+        curl -sf "${_LOCAL_CA}/healthz/ready" -o /dev/null 2>/dev/null && return 0
         sleep 0.5
         n=$(( n - 1 ))
     done
@@ -1091,6 +1115,12 @@ printf '\n# Group 16 — Config-driver loop (env vars, config file)\n'
 #   OCSP correctness is tested separately in Group 14 (not driver-specific).
 _driver_smoke() {
     local url="$1" label="$2"
+
+    assert_http 200 "${label} driver: GET /healthz/live returns 200" \
+        "${url}/healthz/live"
+
+    assert_http 200 "${label} driver: GET /healthz/ready returns 200" \
+        "${url}/healthz/ready"
 
     assert_http 200 "${label} driver: GET /certificate/ca returns 200" \
         "${url}/puppet-ca/v1/certificate/ca"

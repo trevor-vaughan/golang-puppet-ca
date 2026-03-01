@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,43 @@ func ensureBinDir() (string, error) {
 		return "", err
 	}
 	return binDir, nil
+}
+
+// systemInfo returns REPORT_* environment variables describing the host system
+// so they can be passed to k6 containers and included in benchmark reports.
+// Values are best-effort; any item that cannot be determined is omitted.
+func systemInfo() map[string]string {
+	info := map[string]string{}
+
+	if h, err := os.Hostname(); err == nil {
+		info["REPORT_HOST"] = h
+	}
+	info["REPORT_CPUS"] = strconv.Itoa(runtime.NumCPU())
+
+	// Memory total: /proc/meminfo on Linux, sysctl on macOS/BSD.
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.SplitN(string(data), "\n", 50) {
+			if strings.HasPrefix(line, "MemTotal:") {
+				if fields := strings.Fields(line); len(fields) >= 2 {
+					if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						info["REPORT_MEM_GB"] = fmt.Sprintf("%.1f", float64(kb)/1048576)
+					}
+				}
+				break
+			}
+		}
+	} else if out, err := exec.Command("sysctl", "-n", "hw.memsize").Output(); err == nil {
+		if n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+			info["REPORT_MEM_GB"] = fmt.Sprintf("%.1f", float64(n)/1073741824)
+		}
+	}
+
+	// Kernel/OS: uname -sr works on Linux, macOS, and BSDs.
+	if out, err := exec.Command("uname", "-sr").Output(); err == nil {
+		info["REPORT_KERNEL"] = strings.TrimSpace(string(out))
+	}
+
+	return info
 }
 
 // ── build:* ───────────────────────────────────────────────────────────────────
@@ -237,18 +275,20 @@ func (Test) LoadCompose() error {
 // grafana/k6:latest on first run.
 func (Test) Bench() error {
 	mg.Deps(Build{}.All)
+	sysEnv := systemInfo()
+
 	fmt.Println("Building compose images for benchmark...")
-	if err := runCompose(nil, "-f", "compose-bench.yml", "build"); err != nil {
+	if err := runCompose(sysEnv, "-f", "compose-bench.yml", "build"); err != nil {
 		return err
 	}
 
 	fmt.Println("Running k6 load tests...")
-	err := runCompose(nil, "-f", "compose-bench.yml", "up",
+	err := runCompose(sysEnv, "-f", "compose-bench.yml", "up",
 		"--exit-code-from", "k6",
 		"--abort-on-container-exit")
 
 	fmt.Println("Tearing down bench stack...")
-	_ = runCompose(nil, "-f", "compose-bench.yml", "down", "--volumes")
+	_ = runCompose(sysEnv, "-f", "compose-bench.yml", "down", "--volumes")
 
 	return err
 }
@@ -261,21 +301,27 @@ func (Test) Bench() error {
 // WARNING: Do not run against a shared or production server.
 func (Test) Stress() error {
 	mg.Deps(Build{}.All)
+	sysEnv := systemInfo()
+
 	fmt.Println("Building compose images for stress test...")
-	if err := runCompose(nil, "-f", "compose-stress.yml", "build"); err != nil {
+	if err := runCompose(sysEnv, "-f", "compose-stress.yml", "build"); err != nil {
 		return err
 	}
 
 	fmt.Println("Running stress test (this will push the server to its limits)...")
 	// Ignore the exit code: k6 may exit non-zero if the container runtime
 	// propagates a signal during teardown, but the test itself has no thresholds.
-	_ = runComposeWithSpinner(nil, "stress test running…",
+	// runCompose (not runComposeWithSpinner) is used here so that k6's own
+	// live progress display — enabled by tty:true in compose-stress.yml — is
+	// passed through to the terminal without being mangled by the spinner's
+	// line-by-line pipe reader.
+	_ = runCompose(sysEnv,
 		"-f", "compose-stress.yml", "up",
 		"--exit-code-from", "k6",
 		"--abort-on-container-exit")
 
 	fmt.Println("Tearing down stress stack...")
-	_ = runCompose(nil, "-f", "compose-stress.yml", "down", "--volumes")
+	_ = runCompose(sysEnv, "-f", "compose-stress.yml", "down", "--volumes")
 
 	return nil
 }

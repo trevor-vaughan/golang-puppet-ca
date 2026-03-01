@@ -25,13 +25,13 @@ services:
       - --cadir=/data
       - --autosign-config=true   # write scenario uses /generate (no CSR needed)
       - --no-tls-required        # test-only stack; CA not reachable from outside compose network
-      - --logfile=/dev/null      # discard all server logs; k6 progress lines are the status bar
+      - -v=0                     # INFO level: per-cert ops are DEBUG; only WARN/ERROR visible under load
     expose:
       - "8140"
     volumes:
       - ca-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8140/puppet-ca/v1/certificate/ca"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8140/healthz/ready"]
       interval: 3s
       timeout: 5s
       retries: 20
@@ -40,12 +40,18 @@ services:
   # ── k6 stress runner ──────────────────────────────────────────────────────
   k6:
     image: grafana/k6:latest
+    tty: true       # allocate a PTY so k6 uses its live updating progress display
     command:
       - run
-      - --quiet                        # suppress per-second metric dumps (non-TTY noise)
       - --env
       - CA_URL=http://puppet-ca:8140
       - /test/stress.js
+    environment:
+      # Passed in by `mage test:stress` via systemInfo(); used in the final report.
+      - REPORT_HOST
+      - REPORT_CPUS
+      - REPORT_MEM_GB
+      - REPORT_KERNEL
     volumes:
       - ./test:/test:ro,z
     depends_on:

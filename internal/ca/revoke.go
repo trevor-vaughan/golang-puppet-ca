@@ -96,7 +96,7 @@ func (c *CA) Revoke(subject string) error {
 	// returns the correct Revoked status instead of a stale Good response.
 	delete(c.ocspCache, serialStr)
 
-	slog.Info("Certificate revoked", "subject", subject, "serial", serialStr)
+	slog.Debug("Certificate revoked", "subject", subject, "serial", serialStr)
 	return nil
 }
 

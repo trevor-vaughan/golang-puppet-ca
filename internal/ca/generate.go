@@ -88,7 +88,7 @@ func (c *CA) Generate(subject string, dnsAltNames []string) (*GenerateResult, er
 		return nil, fmt.Errorf("failed to save private key for %s: %w", subject, err)
 	}
 
-	slog.Info("Certificate generated", "subject", subject)
+	slog.Debug("Certificate generated", "subject", subject)
 	return &GenerateResult{
 		PrivateKeyPEM:  keyPEM,
 		CertificatePEM: certPEM,

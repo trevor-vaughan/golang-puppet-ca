@@ -56,7 +56,7 @@ func (c *CA) evictRevoked(subject string) error {
 	if !c.IsRevoked(subject) {
 		return fmt.Errorf("certificate already exists for %s: %w", subject, ErrCertExists)
 	}
-	slog.Info("Removing revoked certificate", "subject", subject)
+	slog.Debug("Removing revoked certificate", "subject", subject)
 	if err := c.Storage.DeleteCert(subject); err != nil {
 		slog.Warn("Could not remove revoked certificate", "subject", subject, "error", err)
 	}
@@ -245,7 +245,7 @@ func (c *CA) signWithDuration(subject string, ttl time.Duration) ([]byte, error)
 		slog.Warn("Could not delete CSR after signing", "subject", subject, "error", err)
 	}
 
-	slog.Info("Certificate signed", "subject", subject, "serial", serialStr)
+	slog.Debug("Certificate signed", "subject", subject, "serial", serialStr)
 	return certPEM, nil
 }
 
@@ -285,7 +285,7 @@ func (c *CA) Clean(subject string) error {
 		}
 	}
 
-	slog.Info("Certificate cleaned", "subject", subject)
+	slog.Debug("Certificate cleaned", "subject", subject)
 	return nil
 }
 

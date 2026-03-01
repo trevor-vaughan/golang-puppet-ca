@@ -30,7 +30,7 @@ services:
     volumes:
       - ca-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8140/puppet-ca/v1/certificate/ca"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8140/healthz/ready"]
       interval: 3s
       timeout: 5s
       retries: 20
@@ -39,11 +39,18 @@ services:
   # ── k6 load runner ────────────────────────────────────────────────────────
   k6:
     image: grafana/k6:latest
+    tty: true       # allocate a PTY so k6 uses its live updating progress display
     command:
       - run
       - --env
       - CA_URL=http://puppet-ca:8140
       - /test/load.js
+    environment:
+      # Passed in by `mage test:bench` via systemInfo(); used in the final report.
+      - REPORT_HOST
+      - REPORT_CPUS
+      - REPORT_MEM_GB
+      - REPORT_KERNEL
     volumes:
       # Mount the test directory read-only; :z relabels for SELinux (RHEL/CentOS).
       - ./test:/test:ro,z

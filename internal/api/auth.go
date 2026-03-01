@@ -112,6 +112,10 @@ func lookupTier(method, path string) authTier {
 	p := strings.TrimPrefix(path, "/puppet-ca/v1")
 
 	switch {
+	// Health check probes — always public; orchestrators poll without client certs.
+	case method == "GET" && strings.HasPrefix(p, "/healthz/"):
+		return tierPublic
+
 	// Public — no cert needed.
 	// Signed certs contain no secrets; bootstrapping nodes fetch their cert
 	// before they have a client cert, matching Puppet Server 8 behaviour.

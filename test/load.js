@@ -105,6 +105,81 @@ export function readScenario() {
 // The DELETE at the end ensures the next iteration of the same VU can recycle
 // the slot without hitting 409.
 
+// ── End-of-run summary ────────────────────────────────────────────────────────
+// Produces a focused report with system context, threshold verdicts, and key
+// latency percentiles per scenario.
+
+export function handleSummary(data) {
+  const m = data.metrics;
+
+  function fmtMs(v)   { return v == null ? 'n/a' : `${v.toFixed(1)} ms`; }
+  function fmtRate(v) { return v == null ? 'n/a' : `${(v * 100).toFixed(2)}%`; }
+  function fmtInt(v)  { return v == null ? '0'   : String(Math.round(v)); }
+
+  // Returns 'PASS' / 'FAIL' / 'n/a' for a named metric's thresholds.
+  function threshVerdict(name) {
+    const metric = m[name];
+    if (!metric || !metric.thresholds) return 'n/a';
+    const ok = Object.values(metric.thresholds).every(t => t.ok);
+    return ok ? 'PASS' : 'FAIL';
+  }
+
+  function scenarioBlock(label, tag) {
+    const dur  = m[`http_req_duration{scenario:${tag}}`] || {};
+    const reqs = m[`http_reqs{scenario:${tag}}`]         || {};
+    const fail = m[`http_req_failed{scenario:${tag}}`]   || {};
+    const dv   = dur.values  || {};
+    const rv   = reqs.values || {};
+    const fv   = fail.values || {};
+    return [
+      `  ${label}`,
+      `    requests: ${fmtInt(rv.count)}  (${fmtRate(fv.rate)} failed)`,
+      `    p(95):    ${fmtMs(dv['p(95)'])}`,
+      `    p(99):    ${fmtMs(dv['p(99)'])}`,
+      `    max:      ${fmtMs(dv.max)}`,
+    ].join('\n');
+  }
+
+  function sysBlock() {
+    const mem = __ENV.REPORT_MEM_GB ? `${__ENV.REPORT_MEM_GB} GB` : '(unknown)';
+    return [
+      '  System',
+      `    date:    ${new Date().toISOString()}`,
+      `    host:    ${__ENV.REPORT_HOST   || '(unknown)'}`,
+      `    cpus:    ${__ENV.REPORT_CPUS   || '(unknown)'}`,
+      `    memory:  ${mem}`,
+      `    kernel:  ${__ENV.REPORT_KERNEL || '(unknown)'}`,
+      `    ca url:  ${__ENV.CA_URL        || 'http://puppet-ca:8140'}`,
+    ].join('\n');
+  }
+
+  const ms  = data.state.testRunDurationMs;
+  const min = Math.floor(ms / 60000);
+  const sec = Math.round((ms % 60000) / 1000);
+
+  const report = [
+    '',
+    '╔══════════════════════════════════════════════════════════╗',
+    '║           puppet-ca benchmark test results               ║',
+    '╚══════════════════════════════════════════════════════════╝',
+    `  duration: ${min}m ${sec}s`,
+    '',
+    sysBlock(),
+    '',
+    '  Thresholds',
+    `    error rate      (<1%):    ${threshVerdict('errors')}`,
+    `    reads p(95)     (<500ms): ${threshVerdict('http_req_duration{scenario:reads}')}`,
+    `    workflow p(95)  (<5s):    ${threshVerdict('http_req_duration{scenario:workflow}')}`,
+    '',
+    scenarioBlock('READ  (GET /certificate/ca + /crl + /expirations)', 'reads'),
+    '',
+    scenarioBlock('WRITE (POST /generate → status → cert → DELETE)', 'workflow'),
+    '',
+  ].join('\n');
+
+  return { stdout: report };
+}
+
 export function workflowScenario() {
   // Subject must match ^[a-z0-9._-]+$ (puppet-ca validation rule).
   const subject = `bench-vu${__VU}-i${__ITER}.puppet.test`;

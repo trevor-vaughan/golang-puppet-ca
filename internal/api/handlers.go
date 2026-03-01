@@ -85,6 +85,12 @@ func (s *Server) Routes() http.Handler {
 		}
 	}
 
+	// Health check endpoints are registered only at bare paths (no /puppet-ca/v1
+	// prefix) since they are infrastructure probes, not Puppet CA protocol paths.
+	mux.HandleFunc("GET /healthz/live", s.handleLive)
+	mux.HandleFunc("GET /healthz/ready", s.handleReady)
+	mux.HandleFunc("GET /healthz/startup", s.handleStartup)
+
 	return newAuthMiddleware(s.AuthConfig, s.CA, mux)
 }
 
