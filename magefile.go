@@ -136,6 +136,8 @@ func (Build) FIPS() error {
 func (Test) Unit() error {
 	fmt.Println("Running unit tests...")
 	return sh.RunV("go", "test", "-v",
+		"./cmd/puppet-ca/...",
+		"./cmd/puppet-ca-ctl/...",
 		"./internal/api/...",
 		"./internal/ca/...",
 		"./internal/storage/...",

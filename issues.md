@@ -1,3 +1,4 @@
+- [x] Config file + environment variable support (#3) — both binaries now accept `--config <file>`, `PUPPET_CA_*` / `PUPPET_CA_CTL_*` env vars, and auto-detect `/etc/puppet-ca/config.yaml` / `/etc/puppet-ca/ctl.yaml`; precedence: CLI flag > env var > config file > built-in default
 - [x] Verbosity is not working (not enough debug) — fixed: use `-v 1` for Debug, `-v 2` for Trace; slog.Debug added throughout CA operations
 - [x] app immediately dies when running in a container — fixed: server now runs in foreground by default; daemon mode requires explicit `--daemon` flag
 - [x] File naming used SHA256 hashes instead of `<subject>.pem` — broke Puppet compatibility and tests

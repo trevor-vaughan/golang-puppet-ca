@@ -53,7 +53,8 @@ mage build:fips   # → bin/puppet-ca-fips  (GOEXPERIMENT=boringcrypto)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cadir` | *(required)* | CA storage directory (keys, certs, CSRs, CRL) |
+| `--config` | `""` | Path to YAML config file (auto-detected at `/etc/puppet-ca/config.yaml`) |
+| `--cadir` | `""` | CA storage directory (keys, certs, CSRs, CRL) — required via flag, env, or config |
 | `--host` | `0.0.0.0` | Listen address |
 | `--port` | `8140` | Listen port |
 | `--hostname` | `puppet` | CN suffix for a bootstrapped CA (`Puppet CA: <hostname>`) |
@@ -65,6 +66,57 @@ mage build:fips   # → bin/puppet-ca-fips  (GOEXPERIMENT=boringcrypto)
 | `--daemon` | `false` | Fork to background (not recommended in containers) |
 | `--logfile` | `""` | Write JSON logs to this file instead of stderr |
 | `--verbosity` / `-v` | `0` | Verbosity: `0`=Info, `1`=Debug, `2`=Trace |
+
+### Configuration
+
+All flags can be set via a YAML config file or environment variables. Precedence
+(highest → lowest): **CLI flag** → **environment variable** → **config file** → **built-in default**.
+
+The config file is located by checking, in order:
+1. `--config /path/to/config.yaml` (explicit flag)
+2. `PUPPET_CA_CONFIG` environment variable
+3. `/etc/puppet-ca/config.yaml` (auto-detected if the file exists)
+
+**Example `/etc/puppet-ca/config.yaml`:**
+
+```yaml
+cadir: /etc/puppetlabs/puppet/ssl/ca
+host: 0.0.0.0
+port: 8140
+hostname: puppet.example.com
+tls_cert: /etc/puppetlabs/puppet/ssl/ca/ca_crt.pem
+tls_key:  /etc/puppetlabs/puppet/ssl/ca/ca_key.pem
+puppet_server: puppet.example.com
+no_tls_required: false
+autosign_config: ""
+logfile: ""
+verbosity: 0
+ocsp_url: ""
+```
+
+**Environment variables:**
+
+| Flag | Environment variable |
+|------|---------------------|
+| `--cadir` | `PUPPET_CA_CADIR` |
+| `--autosign-config` | `PUPPET_CA_AUTOSIGN_CONFIG` |
+| `--host` | `PUPPET_CA_HOST` |
+| `--port` | `PUPPET_CA_PORT` |
+| `--hostname` | `PUPPET_CA_HOSTNAME` |
+| `--verbosity` | `PUPPET_CA_VERBOSITY` |
+| `--logfile` | `PUPPET_CA_LOGFILE` |
+| `--tls-cert` | `PUPPET_CA_TLS_CERT` |
+| `--tls-key` | `PUPPET_CA_TLS_KEY` |
+| `--puppet-server` | `PUPPET_CA_PUPPET_SERVER` |
+| `--no-tls-required` | `PUPPET_CA_NO_TLS_REQUIRED` |
+| `--ocsp-url` | `PUPPET_CA_OCSP_URL` |
+
+> **Note:** `--daemon` is intentionally excluded from config file and environment
+> variable support because `PUPPET_CA_DAEMON` is used internally as the daemon fork
+> signal.
+
+Boolean env vars accept any value accepted by `strconv.ParseBool`: `1`, `t`, `true`,
+`yes`, `on` (case-insensitive) to enable; `0`, `f`, `false`, `no`, `off` to disable.
 
 ### Quick start (plain HTTP, auto-bootstrap CA)
 
@@ -239,6 +291,7 @@ In plain HTTP mode (no TLS), all endpoints are accessible without authentication
 ### Global flags
 
 ```
+--config       ""                       Path to YAML config file (auto-detected at /etc/puppet-ca/ctl.yaml)
 --server-url   https://localhost:8140   puppet-ca server URL
 --ca-cert      ""                       CA cert PEM for TLS verification (omit to skip verify)
 --client-cert  ""                       Client certificate PEM for mTLS
@@ -247,6 +300,36 @@ In plain HTTP mode (no TLS), all endpoints are accessible without authentication
 ```
 
 Global flags may be placed before or after the subcommand name.
+
+### Configuration
+
+All global flags can be set via a YAML config file or environment variables. Precedence
+(highest → lowest): **CLI flag** → **environment variable** → **config file** → **built-in default**.
+
+The config file is located by checking, in order:
+1. `--config /path/to/ctl.yaml` (explicit flag)
+2. `PUPPET_CA_CTL_CONFIG` environment variable
+3. `/etc/puppet-ca/ctl.yaml` (auto-detected if the file exists)
+
+**Example `/etc/puppet-ca/ctl.yaml`:**
+
+```yaml
+server_url:  https://puppet-ca.example.com:8140
+ca_cert:     /etc/puppetlabs/puppet/ssl/ca/ca_crt.pem
+client_cert: /etc/puppetlabs/puppet/ssl/certs/puppet-master.pem
+client_key:  /etc/puppetlabs/puppet/ssl/private_keys/puppet-master.pem
+verbose:     false
+```
+
+**Environment variables:**
+
+| Flag | Environment variable |
+|------|---------------------|
+| `--server-url` | `PUPPET_CA_CTL_SERVER_URL` |
+| `--ca-cert` | `PUPPET_CA_CTL_CA_CERT` |
+| `--client-cert` | `PUPPET_CA_CTL_CLIENT_CERT` |
+| `--client-key` | `PUPPET_CA_CTL_CLIENT_KEY` |
+| `--verbose` | `PUPPET_CA_CTL_VERBOSE` |
 
 ### Subcommands
 

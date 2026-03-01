@@ -41,7 +41,7 @@ import (
 	"github.com/tvaughan/puppet-ca/internal/storage"
 )
 
-// ---------- global state (set by persistent flags) ----------
+// ---------- global state (set by persistent flags / config) ----------
 
 var (
 	globalServerURL  string
@@ -49,6 +49,7 @@ var (
 	globalClientCert string
 	globalClientKey  string
 	globalVerbose    bool
+	globalConfigFile string
 )
 
 // ---------- HTTP client ----------
@@ -460,14 +461,47 @@ func main() {
 
 Global flags must be specified before the subcommand.`,
 		SilenceUsage: true,
-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			resolved := resolveConfigFile(globalConfigFile, "PUPPET_CA_CTL_CONFIG", "/etc/puppet-ca/ctl.yaml")
+			cfg, err := loadCtlConfig(resolved)
+			if err != nil {
+				return err
+			}
+
+			// Apply explicitly-set CLI flags (highest precedence).
+			pf := cmd.Root().PersistentFlags()
+			if pf.Changed("server-url") {
+				cfg.ServerURL = globalServerURL
+			}
+			if pf.Changed("ca-cert") {
+				cfg.CACert = globalCACert
+			}
+			if pf.Changed("client-cert") {
+				cfg.ClientCert = globalClientCert
+			}
+			if pf.Changed("client-key") {
+				cfg.ClientKey = globalClientKey
+			}
+			if pf.Changed("verbose") {
+				cfg.Verbose = globalVerbose
+			}
+
+			// Assign resolved values back to globals used by subcommands.
+			globalServerURL = cfg.ServerURL
+			globalCACert = cfg.CACert
+			globalClientCert = cfg.ClientCert
+			globalClientKey = cfg.ClientKey
+			globalVerbose = cfg.Verbose
+
 			if globalVerbose {
 				slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 			}
+			return nil
 		},
 	}
 
 	pf := rootCmd.PersistentFlags()
+	pf.StringVar(&globalConfigFile, "config", "", "Path to YAML config file (default: /etc/puppet-ca/ctl.yaml if it exists)")
 	pf.StringVar(&globalServerURL, "server-url", "https://localhost:8140", "puppet-ca server URL")
 	pf.StringVar(&globalCACert, "ca-cert", "", "Path to CA cert PEM for TLS verification (omit to skip verify)")
 	pf.StringVar(&globalClientCert, "client-cert", "", "Path to client certificate PEM for mTLS")

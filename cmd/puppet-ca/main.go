@@ -61,6 +61,7 @@ func main() {
 		puppetServers string
 		noTLSRequired bool
 		ocspURL       string
+		configFile    string
 	)
 
 	cmd := &cobra.Command{
@@ -68,12 +69,64 @@ func main() {
 		Short:        "Puppet-compatible certificate authority server",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			absCADir, err := filepath.Abs(caDir)
+			// --- Config loading (file → env → CLI flags) ---
+			resolved := resolveConfigFile(configFile, "PUPPET_CA_CONFIG", "/etc/puppet-ca/config.yaml")
+			cfg, err := loadServerConfig(resolved)
+			if err != nil {
+				return err
+			}
+
+			// Apply explicitly-set CLI flags (highest precedence).
+			if cmd.Flags().Changed("cadir") {
+				cfg.CADir = caDir
+			}
+			if cmd.Flags().Changed("autosign-config") {
+				cfg.AutosignConfig = autosignVal
+			}
+			if cmd.Flags().Changed("host") {
+				cfg.Host = host
+			}
+			if cmd.Flags().Changed("port") {
+				cfg.Port = port
+			}
+			if cmd.Flags().Changed("hostname") {
+				cfg.Hostname = hostname
+			}
+			if cmd.Flags().Changed("verbosity") {
+				cfg.Verbosity = verbosity
+			}
+			if cmd.Flags().Changed("logfile") {
+				cfg.LogFile = logFile
+			}
+			if cmd.Flags().Changed("tls-cert") {
+				cfg.TLSCert = tlsCert
+			}
+			if cmd.Flags().Changed("tls-key") {
+				cfg.TLSKey = tlsKey
+			}
+			if cmd.Flags().Changed("puppet-server") {
+				cfg.PuppetServer = puppetServers
+			}
+			if cmd.Flags().Changed("no-tls-required") {
+				cfg.NoTLSRequired = noTLSRequired
+			}
+			if cmd.Flags().Changed("ocsp-url") {
+				cfg.OCSPUrl = ocspURL
+			}
+
+			// --- Validation ---
+			if cfg.CADir == "" {
+				return fmt.Errorf("--cadir is required (or set PUPPET_CA_CADIR / cadir in config file)")
+			}
+
+			absCADir, err := filepath.Abs(cfg.CADir)
 			if err != nil {
 				return fmt.Errorf("resolving --cadir: %w", err)
 			}
 
 			// Daemonise only when explicitly requested AND we aren't already the daemon child.
+			// Note: --daemon is intentionally excluded from config file / env var support
+			// because PUPPET_CA_DAEMON is used internally as the fork signal.
 			if daemon && os.Getenv("PUPPET_CA_DAEMON") != "1" {
 				exe, err := os.Executable()
 				if err != nil {
@@ -93,7 +146,7 @@ func main() {
 
 			// --- Logging setup ---
 			var logLevel slog.Level
-			switch verbosity {
+			switch cfg.Verbosity {
 			case 0:
 				logLevel = slog.LevelInfo
 			case 1:
@@ -105,10 +158,10 @@ func main() {
 			opts := &slog.HandlerOptions{Level: logLevel}
 			var logHandler slog.Handler
 
-			if logFile != "" {
-				f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+			if cfg.LogFile != "" {
+				f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
 				if err != nil {
-					return fmt.Errorf("failed to open log file %s: %w", logFile, err)
+					return fmt.Errorf("failed to open log file %s: %w", cfg.LogFile, err)
 				}
 				logHandler = slog.NewJSONHandler(f, opts)
 			} else {
@@ -120,9 +173,9 @@ func main() {
 
 			slog.Info("Starting Puppet CA",
 				"cadir", absCADir,
-				"host", host,
-				"port", port,
-				"verbosity", verbosity,
+				"host", cfg.Host,
+				"port", cfg.Port,
+				"verbosity", cfg.Verbosity,
 			)
 
 			// --- TLS enforcement ---
@@ -131,9 +184,9 @@ func main() {
 			//   (a) TLS is configured (--tls-cert + --tls-key), or
 			//   (b) the bind address is loopback-only, or
 			//   (c) the operator explicitly opts out with --no-tls-required.
-			tlsConfigured := tlsCert != "" && tlsKey != ""
+			tlsConfigured := cfg.TLSCert != "" && cfg.TLSKey != ""
 			if !tlsConfigured {
-				if !isLoopback(host) && !noTLSRequired {
+				if !isLoopback(cfg.Host) && !cfg.NoTLSRequired {
 					slog.Error("Refusing to start: plain HTTP on a non-loopback address is " +
 						"vulnerable to certificate injection attacks. " +
 						"Enable TLS (--tls-cert / --tls-key), " +
@@ -141,7 +194,7 @@ func main() {
 						"or explicitly opt out with --no-tls-required.")
 					os.Exit(1)
 				}
-				if noTLSRequired && !isLoopback(host) {
+				if cfg.NoTLSRequired && !isLoopback(cfg.Host) {
 					slog.Warn("TLS is not configured on a non-loopback address; " +
 						"certificate injection is possible. " +
 						"Only use --no-tls-required behind a trusted TLS proxy or in test environments.")
@@ -157,15 +210,15 @@ func main() {
 
 			// --- Autosign ---
 			asCfg := ca.AutosignConfig{Mode: "off"}
-			switch autosignVal {
+			switch cfg.AutosignConfig {
 			case "", "false":
 				// leave as off
 			case "true":
 				asCfg.Mode = "true"
 			default:
-				info, err := os.Stat(autosignVal)
+				info, err := os.Stat(cfg.AutosignConfig)
 				if err != nil {
-					slog.Error("Autosign config invalid", "path", autosignVal, "error", err)
+					slog.Error("Autosign config invalid", "path", cfg.AutosignConfig, "error", err)
 					os.Exit(1)
 				}
 				if info.Mode().IsRegular() {
@@ -174,15 +227,15 @@ func main() {
 					} else {
 						asCfg.Mode = "file"
 					}
-					asCfg.FileOrPath = autosignVal
+					asCfg.FileOrPath = cfg.AutosignConfig
 				}
 			}
 			slog.Debug("Autosign config", "mode", asCfg.Mode, "path", asCfg.FileOrPath)
 
 			// --- CA Initialisation ---
-			myCA := ca.New(store, asCfg, hostname)
-			if ocspURL != "" {
-				myCA.OCSPURLs = []string{ocspURL}
+			myCA := ca.New(store, asCfg, cfg.Hostname)
+			if cfg.OCSPUrl != "" {
+				myCA.OCSPURLs = []string{cfg.OCSPUrl}
 			}
 			if err := myCA.Init(); err != nil {
 				slog.Error("Failed to initialise CA", "error", err)
@@ -193,10 +246,10 @@ func main() {
 			srv := api.New(myCA)
 
 			// Wire mTLS auth middleware when TLS is configured.
-			if tlsCert != "" && tlsKey != "" {
+			if cfg.TLSCert != "" && cfg.TLSKey != "" {
 				allowList := map[string]bool{}
-				if puppetServers != "" {
-					for _, cn := range strings.Split(puppetServers, ",") {
+				if cfg.PuppetServer != "" {
+					for _, cn := range strings.Split(cfg.PuppetServer, ",") {
 						cn = strings.TrimSpace(cn)
 						if cn != "" {
 							allowList[cn] = true
@@ -209,7 +262,7 @@ func main() {
 				}
 			}
 
-			addr := fmt.Sprintf("%s:%d", host, port)
+			addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 			slog.Info("Listening", "address", addr)
 
 			server := &http.Server{
@@ -222,10 +275,10 @@ func main() {
 				MaxHeaderBytes:    1 << 20,
 			}
 
-			if tlsCert != "" && tlsKey != "" {
-				serverCert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+			if cfg.TLSCert != "" && cfg.TLSKey != "" {
+				serverCert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 				if err != nil {
-					slog.Error("Failed to load TLS cert/key", "cert", tlsCert, "key", tlsKey, "error", err)
+					slog.Error("Failed to load TLS cert/key", "cert", cfg.TLSCert, "key", cfg.TLSKey, "error", err)
 					os.Exit(1)
 				}
 
@@ -249,7 +302,7 @@ func main() {
 					MinVersion:   tls.VersionTLS12,
 				}
 
-				slog.Info("TLS enabled", "cert", tlsCert)
+				slog.Info("TLS enabled", "cert", cfg.TLSCert)
 				if err := server.ListenAndServeTLS("", ""); err != nil {
 					slog.Error("Server failed", "error", err)
 					os.Exit(1)
@@ -266,7 +319,8 @@ func main() {
 	}
 
 	f := cmd.Flags()
-	f.StringVar(&caDir, "cadir", "", "Directory for CA storage (required)")
+	f.StringVar(&configFile, "config", "", "Path to YAML config file (default: /etc/puppet-ca/config.yaml if it exists)")
+	f.StringVar(&caDir, "cadir", "", "Directory for CA storage (or set PUPPET_CA_CADIR)")
 	f.StringVar(&autosignVal, "autosign-config", "", "Autosign configuration: 'true', 'false', or path to file/executable")
 	f.StringVar(&host, "host", "0.0.0.0", "Address to listen on")
 	f.IntVar(&port, "port", 8140, "Port to listen on")
@@ -279,7 +333,6 @@ func main() {
 	f.StringVar(&puppetServers, "puppet-server", "", "Comma-separated list of puppet-server CNs allowed admin access")
 	f.BoolVar(&noTLSRequired, "no-tls-required", false, "Allow plain HTTP on non-loopback addresses (use only behind a trusted TLS proxy or in test environments)")
 	f.StringVar(&ocspURL, "ocsp-url", "", "OCSP responder URL to embed in issued certificates (e.g. http://puppet-ca:8140/ocsp)")
-	_ = cmd.MarkFlagRequired("cadir")
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)

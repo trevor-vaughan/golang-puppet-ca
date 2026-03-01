@@ -820,12 +820,75 @@ if [ "$DO_LOAD" = "true" ]; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Group 14 — Autosign modes (true, file glob, executable plugin)
+# Group 14 — OCSP endpoint
+# ═════════════════════════════════════════════════════════════════════════════
+printf '\n# Group 14 — OCSP endpoint\n'
+
+# Sign a fresh cert dedicated to OCSP testing.  The shared CA runs with
+# autosign=false, so we submit a CSR then sign it via puppet-ca-ctl.
+_OCSP_HOST="ocsp-${RUN_ID}.example.com"
+make_csr "$_OCSP_HOST" "$WORK_DIR/ocsp.csr"
+
+curl -s -o /dev/null \
+    -X PUT -H "Content-Type: text/plain" \
+    --data-binary @"$WORK_DIR/ocsp.csr" \
+    "${CA_URL}/puppet-ca/v1/certificate_request/${_OCSP_HOST}" 2>/dev/null || true
+
+$CTL sign --certname "$_OCSP_HOST" >/dev/null 2>&1 || true
+
+curl -sf "${CA_URL}/puppet-ca/v1/certificate/${_OCSP_HOST}" \
+    -o "$WORK_DIR/ocsp.crt" 2>/dev/null || true
+
+if [[ -s "$WORK_DIR/ocsp.crt" ]]; then
+    # Good — the cert is currently valid.
+    _ocsp_good=$(openssl ocsp \
+        -issuer  "$WORK_DIR/ca.pem" \
+        -cert    "$WORK_DIR/ocsp.crt" \
+        -url     "${CA_URL}/ocsp" \
+        -CAfile  "$WORK_DIR/ca.pem" \
+        -no_nonce \
+        2>&1) || true
+    grep -qi "good" <<< "$_ocsp_good" \
+        && pass "OCSP: Good status for a valid signed cert" \
+        || fail "OCSP: Good status for a valid signed cert" \
+               "openssl output: $(printf '%s' "$_ocsp_good" | head -3 | tr '\n' '|')"
+
+    # Revoke it, then query again — response must now say revoked.
+    $CTL revoke --certname "$_OCSP_HOST" >/dev/null 2>&1 || true
+
+    _ocsp_rev=$(openssl ocsp \
+        -issuer  "$WORK_DIR/ca.pem" \
+        -cert    "$WORK_DIR/ocsp.crt" \
+        -url     "${CA_URL}/ocsp" \
+        -CAfile  "$WORK_DIR/ca.pem" \
+        -no_nonce \
+        2>&1) || true
+    grep -qi "revoked" <<< "$_ocsp_rev" \
+        && pass "OCSP: Revoked status after revocation" \
+        || fail "OCSP: Revoked status after revocation" \
+               "openssl output: $(printf '%s' "$_ocsp_rev" | head -3 | tr '\n' '|')"
+else
+    fail "OCSP: Good status for a valid signed cert" "could not download ${_OCSP_HOST} cert"
+    fail "OCSP: Revoked status after revocation"     "could not download ${_OCSP_HOST} cert"
+fi
+
+# Malformed POST body → 400 Bad Request.
+_ocsp_bad=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X POST \
+    -H "Content-Type: application/ocsp-request" \
+    --data-binary "not der" \
+    "${CA_URL}/ocsp") || true
+[ "$_ocsp_bad" = "400" ] \
+    && pass "OCSP: malformed POST body returns 400" \
+    || fail "OCSP: malformed POST body returns 400" "got HTTP $_ocsp_bad"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Group 15 — Autosign modes (true, file glob, executable plugin)
 #   Starts short-lived local puppet-ca instances on port 8141 inside this
 #   container.  The shared puppet-ca service (port 8140) is untouched.
 #   Each sub-test boots a fresh CA, exercises one autosign config, then stops.
 # ═════════════════════════════════════════════════════════════════════════════
-printf '\n# Group 14 — Autosign modes (true, file, executable)\n'
+printf '\n# Group 15 — Autosign modes (true, file, executable)\n'
 
 _LOCAL_CA="http://127.0.0.1:8141"
 _LOCAL_PORT=8141
@@ -841,7 +904,7 @@ _wait_local_ca() {
     return 1
 }
 
-# ── 14a: autosign=true ────────────────────────────────────────────────────────
+# ── 15a: autosign=true ────────────────────────────────────────────────────────
 _AS_DIR_A=$(mktemp -d)
 puppet-ca --cadir="$_AS_DIR_A" \
     --autosign-config=true \
@@ -879,7 +942,7 @@ kill "$_as_pid_a" 2>/dev/null || true
 wait "$_as_pid_a" 2>/dev/null || true
 rm -rf "$_AS_DIR_A"
 
-# ── 14b: autosign=file (glob patterns) ───────────────────────────────────────
+# ── 15b: autosign=file (glob patterns) ───────────────────────────────────────
 _AS_DIR_B=$(mktemp -d)
 _AS_CONF_B="$WORK_DIR/autosign.conf"
 printf '# autosign pattern file\n*.allowed.example.com\n' > "$_AS_CONF_B"
@@ -928,7 +991,7 @@ kill "$_as_pid_b" 2>/dev/null || true
 wait "$_as_pid_b" 2>/dev/null || true
 rm -rf "$_AS_DIR_B"
 
-# ── 14c: autosign=executable (custom plugin) ──────────────────────────────────
+# ── 15c: autosign=executable (custom plugin) ──────────────────────────────────
 # The plugin:
 #   argv[1] = certname (Subject CN) — used for allow/deny decision
 #   stdin   = raw CSR PEM bytes     — validated to confirm the server sends it
@@ -1003,6 +1066,114 @@ fi
 kill "$_as_pid_c" 2>/dev/null || true
 wait "$_as_pid_c" 2>/dev/null || true
 rm -rf "$_AS_DIR_C"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Group 16 — Config-driver loop
+#
+#   The same smoke-test function is run twice — once per config driver
+#   (env vars, config file) — against a freshly started local CA instance on
+#   port 8141.  Mirrors the group 15 pattern: start → test → stop.
+#
+#   CLI-flag configuration is already proven by Groups 1–13, which all run
+#   against the shared CA started with explicit CLI flags.
+#
+#   Also tests the puppet-ca-ctl env-var and config-file drivers against the
+#   already-running shared CA service.
+# ═════════════════════════════════════════════════════════════════════════════
+printf '\n# Group 16 — Config-driver loop (env vars, config file)\n'
+
+# _LOCAL_CA and _LOCAL_PORT are defined in group 15 above.
+
+# _driver_smoke URL LABEL
+#   Runs a representative set of API smoke tests against a freshly started CA.
+#   Checks: health, CRL reachability, CSR submit → autosign → status, cert
+#   download + verify.  autosign=true is assumed for all driver setups.
+#   OCSP correctness is tested separately in Group 14 (not driver-specific).
+_driver_smoke() {
+    local url="$1" label="$2"
+
+    assert_http 200 "${label} driver: GET /certificate/ca returns 200" \
+        "${url}/puppet-ca/v1/certificate/ca"
+
+    assert_http 200 "${label} driver: GET /certificate_revocation_list/ca returns 200" \
+        "${url}/puppet-ca/v1/certificate_revocation_list/ca"
+
+    local host="drv-${label}-${RUN_ID}.example.com"
+    make_csr "$host" "$WORK_DIR/drv_${label}.csr"
+
+    curl -s -o /dev/null \
+        -X PUT -H "Content-Type: text/plain" \
+        --data-binary @"$WORK_DIR/drv_${label}.csr" \
+        "${url}/puppet-ca/v1/certificate_request/${host}" 2>/dev/null || true
+
+    local st
+    st=$(curl -s "${url}/puppet-ca/v1/certificate_status/${host}" 2>/dev/null) || true
+    assert_json_field "$st" '"state":"signed"' \
+        "${label} driver: autosign=true takes effect (cert auto-signed)"
+
+    curl -sf "${url}/puppet-ca/v1/certificate/${host}" \
+        -o "$WORK_DIR/drv_${label}.crt" 2>/dev/null || true
+    openssl verify \
+        -CAfile <(curl -sf "${url}/puppet-ca/v1/certificate/ca" 2>/dev/null) \
+        "$WORK_DIR/drv_${label}.crt" >/dev/null 2>&1 \
+        && pass "${label} driver: signed cert verifies against CA" \
+        || fail "${label} driver: signed cert verifies against CA"
+}
+
+# ── Driver 1: environment variables ───────────────────────────────────────────
+_DRV_DIR_2=$(mktemp -d)
+PUPPET_CA_CADIR="$_DRV_DIR_2" \
+PUPPET_CA_HOST=127.0.0.1 \
+PUPPET_CA_PORT="$_LOCAL_PORT" \
+PUPPET_CA_AUTOSIGN_CONFIG=true \
+PUPPET_CA_NO_TLS_REQUIRED=1 \
+    puppet-ca >/dev/null 2>&1 &
+_drv_pid_2=$!
+
+if _wait_local_ca; then
+    pass "env-var driver: CA started with no CLI flags"
+    _driver_smoke "$_LOCAL_CA" "env"
+else
+    fail "env-var driver: CA started with no CLI flags" "timed out waiting for health"
+fi
+kill "$_drv_pid_2" 2>/dev/null || true
+wait "$_drv_pid_2" 2>/dev/null || true
+rm -rf "$_DRV_DIR_2"
+
+# ── Driver 2: config file ──────────────────────────────────────────────────────
+_DRV_DIR_3=$(mktemp -d)
+_DRV_CFG="$WORK_DIR/ca_config.yaml"
+cat > "$_DRV_CFG" << CFGEOF
+cadir: ${_DRV_DIR_3}
+host: 127.0.0.1
+port: ${_LOCAL_PORT}
+autosign_config: "true"
+no_tls_required: true
+CFGEOF
+
+puppet-ca --config="$_DRV_CFG" >/dev/null 2>&1 &
+_drv_pid_3=$!
+
+if _wait_local_ca; then
+    pass "config-file driver: CA started with --config only"
+    _driver_smoke "$_LOCAL_CA" "config"
+else
+    fail "config-file driver: CA started with --config only" "timed out waiting for health"
+fi
+kill "$_drv_pid_3" 2>/dev/null || true
+wait "$_drv_pid_3" 2>/dev/null || true
+rm -rf "$_DRV_DIR_3"
+
+# ── puppet-ca-ctl drivers (shared CA service at $CA_URL) ──────────────────────
+PUPPET_CA_CTL_SERVER_URL="${CA_URL}" puppet-ca-ctl list >/dev/null 2>&1 \
+    && pass "puppet-ca-ctl env-var driver: PUPPET_CA_CTL_SERVER_URL accepted" \
+    || fail "puppet-ca-ctl env-var driver: PUPPET_CA_CTL_SERVER_URL accepted"
+
+_CTL_CFG="$WORK_DIR/ctl.yaml"
+printf 'server_url: "%s"\n' "${CA_URL}" > "$_CTL_CFG"
+puppet-ca-ctl --config="$_CTL_CFG" list >/dev/null 2>&1 \
+    && pass "puppet-ca-ctl config-file driver: --config flag accepted" \
+    || fail "puppet-ca-ctl config-file driver: --config flag accepted"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Results
