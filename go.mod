@@ -24,7 +24,7 @@ require (
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
 	github.com/uptrace/bun/driver/pgdriver v1.2.18
 	github.com/uptrace/bun/driver/sqliteshim v1.2.18
-	go.etcd.io/etcd/client/v3 v3.7.0
+	go.etcd.io/etcd/client/v3 v3.7.1
 	go.etcd.io/etcd/server/v3 v3.7.0
 	go.yaml.in/yaml/v3 v3.0.4
 	golang.org/x/crypto v0.54.0
@@ -125,8 +125,8 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/gopher-lua v1.1.2 // indirect
 	go.etcd.io/bbolt v1.5.0 // indirect
-	go.etcd.io/etcd/api/v3 v3.7.0 // indirect
-	go.etcd.io/etcd/client/pkg/v3 v3.7.0 // indirect
+	go.etcd.io/etcd/api/v3 v3.7.1 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.7.1 // indirect
 	go.etcd.io/etcd/pkg/v3 v3.7.0 // indirect
 	go.etcd.io/raft/v3 v3.7.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
