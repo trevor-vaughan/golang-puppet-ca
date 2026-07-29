@@ -193,8 +193,8 @@ serves the same one and an ephemeral `cadir` loses nothing.
 You can publish it to an Ingress with a [`serving_cert`/`serving_key` export
 target](kubernetes-export.md#serving-certificate-and-key). Note what the second
 half of that costs: **the exported key is written to the Secret in plaintext**,
-decrypted first if `tls_self_provision_encrypt_key` is set, because a TLS
-consumer cannot use an encrypted PEM. Export `serving_cert` alone unless
+even when `tls_self_provision_encrypt_key` is set, because a TLS consumer
+cannot use an encrypted PEM. Export `serving_cert` alone unless
 something needs the key, and keep it in a Secret separate from your trust
 bundle. See
 [configuration](configuration.md#self-provisioned-serving-certificate) for

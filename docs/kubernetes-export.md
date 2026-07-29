@@ -136,11 +136,11 @@ Two rules apply to `serving_key`, both about blast radius:
   every workload that reads it. Two targets cost nothing. The serving
   *certificate* is public and may share a target with anything.
 
-**The exported key is always plaintext.** When
-`tls_self_provision_encrypt_key` is set the exporter decrypts before
-publishing, because a `kubernetes.io/tls` Secret holding an encrypted PEM is
-useless to every consumer of one — it would look correct and fail at the first
-handshake. That is a deliberate downgrade: the key is then plaintext in etcd.
+**The exported key is always plaintext**, even when
+`tls_self_provision_encrypt_key` is set — the exporter publishes the key the
+listener is already using, which the CA decrypted when it loaded it. A
+`kubernetes.io/tls` Secret holding an encrypted PEM is useless to every
+consumer of one: it would look correct and fail at the first handshake. That is a deliberate downgrade: the key is then plaintext in etcd.
 The server logs a warning at startup whenever a `serving_key` target is
 configured. Restrict who can read that Secret.
 

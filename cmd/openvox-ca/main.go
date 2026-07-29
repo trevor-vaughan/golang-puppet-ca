@@ -792,7 +792,7 @@ func newRootCmd() *cobra.Command {
 					// for encryption at rest and is nonetheless publishing the
 					// key in the clear to etcd.
 					slog.Warn("A kubernetes_export target publishes the serving private key. " +
-						"It is written to the Secret in plaintext, decrypted first if " +
+						"It is written to the Secret in plaintext even when " +
 						"tls_self_provision_encrypt_key is set, because TLS consumers cannot use " +
 						"an encrypted key. Restrict who can read that Secret.")
 				}
