@@ -34,7 +34,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -84,6 +83,46 @@ func setupLogger(cfg *serverConfig) (*os.File, error) {
 // command via config.StorageConfig.ToBackendSpec.
 func buildBackendSpec(cfg *serverConfig, absCADir string) (storage.BackendSpec, error) {
 	return cfg.StorageConfig.ToBackendSpec(absCADir)
+}
+
+// buildAuthConfig assembles the API's authorisation configuration: the admin CN
+// allow list drawn from puppet_server and puppet_server_file, and the flags
+// governing pp_cli_auth and public status.
+//
+// Extracted from the startup path so that what the middleware is configured
+// with is separable from when it is installed. Those are different decisions —
+// the caller decides whether to authorise at all, this decides how — and having
+// them in one inline block is what made it easy to add a TLS mode that silently
+// skipped the first.
+func buildAuthConfig(cfg *serverConfig, myCA *ca.CA) (*api.AuthConfig, error) {
+	allowList := map[string]bool{}
+	for _, cn := range splitAndTrim(cfg.PuppetServer, ",") {
+		allowList[cn] = true
+	}
+	fileCNs, err := loadPuppetServerFile(cfg.PuppetServerFile)
+	if err != nil {
+		return nil, err
+	}
+	for _, cn := range fileCNs {
+		allowList[cn] = true
+	}
+
+	if !cfg.NoPpCliAuth {
+		// SECURITY: Inform the operator that pp_cli_auth OID grants admin access.
+		// Any certificate carrying this extension with value "true" will be treated
+		// as an admin. Use --no-pp-cli-auth to restrict admin access to the CN allow list only.
+		// NIST 800-53: AC-6 (Least Privilege)
+		slog.Info("pp_cli_auth extension is enabled as an admin credential (default). " +
+			"Any certificate carrying pp_cli_auth=true will have admin access. " +
+			"Use --no-pp-cli-auth to disable this and require explicit CN allow list.")
+	}
+
+	return &api.AuthConfig{
+		CACert:            myCA.CACert,
+		AllowList:         allowList,
+		NoPpCliAuth:       cfg.NoPpCliAuth,
+		AllowPublicStatus: cfg.AllowPublicStatus,
+	}, nil
 }
 
 // applyCAConfig applies the common CA configuration fields from serverConfig
@@ -409,7 +448,7 @@ func newRootCmd() *cobra.Command {
 			//   (b) the bind address is loopback-only, or
 			//   (c) the operator explicitly opts out with --no-tls-required.
 			// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity), SC-23 (Session Authenticity)
-			tlsConfigured := cfg.TLSCert != "" && cfg.TLSKey != ""
+			tlsConfigured := cfg.tlsEnabled()
 			if !tlsConfigured {
 				if !isLoopback(cfg.Host) && !cfg.NoTLSRequired {
 					return errors.New("refusing to start: plain HTTP on a non-loopback address is vulnerable to certificate injection; enable TLS (--tls-cert/--tls-key), restrict to loopback (--host 127.0.0.1), or set --no-tls-required")
@@ -559,37 +598,15 @@ func newRootCmd() *cobra.Command {
 			srv.PlainHTTP = !tlsConfigured && !isLoopback(cfg.Host) && !cfg.NoTLSRequired
 			srv.PuppetDateTimeFormat = cfg.PuppetDateTimeFormat
 
-			// Wire mTLS auth middleware when TLS is configured.
-			if cfg.TLSCert != "" && cfg.TLSKey != "" {
-				allowList := map[string]bool{}
-				for _, cn := range strings.Split(cfg.PuppetServer, ",") {
-					cn = strings.TrimSpace(cn)
-					if cn != "" {
-						allowList[cn] = true
-					}
-				}
-				fileCNs, err := loadPuppetServerFile(cfg.PuppetServerFile)
+			// Wire mTLS auth middleware when TLS is configured. Leaving
+			// srv.AuthConfig nil disables the authorisation middleware for every
+			// route, so this branch and cfg.tlsEnabled() must never disagree.
+			if tlsConfigured {
+				authCfg, err := buildAuthConfig(cfg, myCA)
 				if err != nil {
 					return err
 				}
-				for _, cn := range fileCNs {
-					allowList[cn] = true
-				}
-				srv.AuthConfig = &api.AuthConfig{
-					CACert:            myCA.CACert,
-					AllowList:         allowList,
-					NoPpCliAuth:       cfg.NoPpCliAuth,
-					AllowPublicStatus: cfg.AllowPublicStatus,
-				}
-				if !cfg.NoPpCliAuth {
-					// SECURITY: Inform the operator that pp_cli_auth OID grants admin access.
-					// Any certificate carrying this extension with value "true" will be treated
-					// as an admin. Use --no-pp-cli-auth to restrict admin access to the CN allow list only.
-					// NIST 800-53: AC-6 (Least Privilege)
-					slog.Info("pp_cli_auth extension is enabled as an admin credential (default). " +
-						"Any certificate carrying pp_cli_auth=true will have admin access. " +
-						"Use --no-pp-cli-auth to disable this and require explicit CN allow list.")
-				}
+				srv.AuthConfig = authCfg
 			}
 
 			addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
@@ -633,7 +650,7 @@ func newRootCmd() *cobra.Command {
 				}()
 			}
 
-			if cfg.TLSCert != "" && cfg.TLSKey != "" {
+			if tlsConfigured {
 				serverCert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 				if err != nil {
 					return fmt.Errorf("failed to load TLS cert/key (cert %s, key %s): %w", cfg.TLSCert, cfg.TLSKey, err)
@@ -731,7 +748,7 @@ func newRootCmd() *cobra.Command {
 			}()
 
 			var serveErr error
-			if cfg.TLSCert != "" && cfg.TLSKey != "" {
+			if tlsConfigured {
 				serveErr = server.ListenAndServeTLS("", "")
 			} else {
 				serveErr = server.ListenAndServe()

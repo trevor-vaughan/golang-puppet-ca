@@ -184,6 +184,23 @@ func (c *serverConfig) shutdownDrain() time.Duration {
 	return defaultShutdownDrain
 }
 
+// tlsEnabled reports whether the API listener will speak TLS.
+//
+// This exists as one predicate because it used to be five copies of
+// `cfg.TLSCert != "" && cfg.TLSKey != ""` scattered through the startup path,
+// each driving something different: refusing plain HTTP off loopback, setting
+// Server.PlainHTTP, installing the authorisation middleware, building
+// tls.Config, and choosing ListenAndServeTLS over ListenAndServe.
+//
+// The cost of missing one is not uniform. The third gates srv.AuthConfig, and a
+// nil AuthConfig disables the authorisation middleware outright — so a listener
+// would come up on TLS with every endpoint unauthenticated. Collapsing the five
+// into one predicate makes that class of omission unrepresentable, which
+// matters as soon as there is more than one way to enable TLS.
+func (c *serverConfig) tlsEnabled() bool {
+	return c.TLSCert != "" && c.TLSKey != ""
+}
+
 // defaultCRLRefreshInterval is how often the background job checks whether the
 // CRL needs re-signing when the operator has not configured an interval. One
 // hour is frequent enough to act well within the default refresh window (a
