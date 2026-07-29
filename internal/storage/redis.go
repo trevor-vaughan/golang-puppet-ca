@@ -145,6 +145,10 @@ var redisLayout = map[string]string{
 	KeyInventory:     "inventory:data",
 	KeyInventoryHMAC: "inventory:hmac",
 	KeyHMACKey:       "private:hmac_key",
+
+	KeyServingCert:       "serving:cert",
+	KeyServingKey:        "private:serving_key",
+	KeyServingSuperseded: "serving:superseded",
 }
 
 // appendLuaScript atomically appends data to an existing blob, preserving

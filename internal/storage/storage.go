@@ -528,6 +528,56 @@ func (s *StorageService) SaveCAPubKey(ctx context.Context, data []byte) error {
 	return s.backend.Put(ctx, KeyCAPubKey, data, BlobPublic)
 }
 
+// --- Serving certificate (tls_self_provision) ---
+//
+// The certificate the API listener presents, and its private key. Held as
+// dedicated blobs rather than per-subject material so that administrative
+// operations on the CA's own hostname cannot delete what the listener is using.
+//
+// The key is BlobPrivate, exactly as the CA key already is. An operator running
+// a SQL backend without tls_self_provision_encrypt_key stores this key in their
+// database in plaintext — the same posture ca_key has by default, since
+// encrypt_ca_key is also off unless enabled. It is one blob over, not a new
+// class of exposure.
+
+func (s *StorageService) GetServingCert(ctx context.Context) ([]byte, error) {
+	s.fileMu.RLock()
+	defer s.fileMu.RUnlock()
+	return s.backend.Get(ctx, KeyServingCert)
+}
+
+func (s *StorageService) SaveServingCert(ctx context.Context, pemData []byte) error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	return s.backend.Put(ctx, KeyServingCert, pemData, BlobPublic)
+}
+
+func (s *StorageService) GetServingKey(ctx context.Context) ([]byte, error) {
+	s.fileMu.RLock()
+	defer s.fileMu.RUnlock()
+	return s.backend.Get(ctx, KeyServingKey)
+}
+
+func (s *StorageService) SaveServingKey(ctx context.Context, pemData []byte) error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	return s.backend.Put(ctx, KeyServingKey, pemData, BlobPrivate)
+}
+
+// GetServingSuperseded returns the pending-revocation list, wrapping
+// fs.ErrNotExist when none has been written.
+func (s *StorageService) GetServingSuperseded(ctx context.Context) ([]byte, error) {
+	s.fileMu.RLock()
+	defer s.fileMu.RUnlock()
+	return s.backend.Get(ctx, KeyServingSuperseded)
+}
+
+func (s *StorageService) SaveServingSuperseded(ctx context.Context, data []byte) error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	return s.backend.Put(ctx, KeyServingSuperseded, data, BlobPrivate)
+}
+
 // --- CSR / Cert per subject ---
 
 func (s *StorageService) SaveCSR(ctx context.Context, subject string, pemData []byte) error {
