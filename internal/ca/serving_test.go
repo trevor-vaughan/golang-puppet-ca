@@ -289,3 +289,148 @@ var _ = Describe("Serving certificate", func() {
 		})
 	})
 })
+
+var _ = Describe("Superseded serving certificates", func() {
+	const subject = "puppet.example.com"
+
+	var (
+		ctx   context.Context
+		store *storage.StorageService
+		myCA  *ca.CA
+		cfg   ca.ServingConfig
+	)
+
+	// reissue forces a mint by putting any stored certificate inside the
+	// renewal window, and returns the certificate it replaced.
+	reissue := func() *x509.Certificate {
+		GinkgoHelper()
+		before, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		widened := cfg
+		widened.RenewBefore = 100 * 365 * 24 * time.Hour
+		after, err := myCA.EnsureServingCert(ctx, widened)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(after.Issued).To(BeTrue())
+		Expect(after.Leaf.SerialNumber).NotTo(Equal(before.Leaf.SerialNumber))
+		return before.Leaf
+	}
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		cfg = ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour}
+	})
+
+	It("does not revoke the replaced certificate before its delay elapses", func() {
+		// The swap is per-process: a sibling replica may still be serving the
+		// old certificate, and revoking immediately breaks every client doing
+		// revocation checking.
+		old := reissue()
+		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeFalse())
+	})
+
+	It("revokes the replaced certificate once the delay has elapsed", func() {
+		// revoke_at is stamped at mint time, so a tiny delay there is what
+		// makes the entry due — the reconcile argument only says whether
+		// revocation is enabled at all.
+		cfg.RevokeAfter = time.Nanosecond
+		old := reissue()
+
+		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue())
+	})
+
+	It("leaves the live certificate valid when revoking its predecessor", func() {
+		// The trap this guards: CA.Revoke resolves subject to the *current*
+		// certificate, so revoking by subject here would revoke the one being
+		// served. The sweep must revoke the recorded serial and nothing else.
+		cfg.RevokeAfter = time.Nanosecond
+		old := reissue()
+		live, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+
+		oldRevoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oldRevoked).To(BeTrue())
+
+		liveRevoked, err := myCA.IsRevokedSerial(ctx, live.Leaf.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(liveRevoked).To(BeFalse(), "the certificate being served must stay valid")
+	})
+
+	It("prunes the list, so a second pass revokes nothing new", func() {
+		cfg.RevokeAfter = time.Nanosecond
+		reissue()
+		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+
+		stored, err := store.GetServingSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(stored)).To(Equal("[]"))
+	})
+
+	It("discards the list without revoking when the delay is switched off", func() {
+		// Otherwise an entry recorded under a non-zero delay would sit there
+		// indefinitely and fire much later if the delay were re-enabled.
+		old := reissue()
+		Expect(myCA.ReconcileSuperseded(ctx, 0)).To(Succeed())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeFalse())
+
+		stored, err := store.GetServingSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(stored)).To(Equal("[]"))
+	})
+
+	It("records nothing when revocation is disabled at mint time", func() {
+		cfg.RevokeAfter = 0
+		reissue()
+
+		_, err := store.GetServingSuperseded(ctx)
+		Expect(err).To(HaveOccurred(), "nothing should have been written")
+	})
+
+	It("is completed by another replica, since the list is shared", func() {
+		// The minting replica may die before the delay elapses; any replica
+		// must be able to finish the job.
+		cfg.RevokeAfter = time.Nanosecond
+		old := reissue()
+
+		other := ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		other.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(other.Init(ctx)).To(Succeed())
+		Expect(other.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+
+		// Asserted through the replica that did the work: each process holds
+		// its own in-memory CRL cache, and myCA has not refreshed since.
+		revoked, err := other.IsRevokedSerial(ctx, old.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue())
+	})
+
+	It("is a no-op with nothing pending", func() {
+		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+	})
+
+	It("survives an unparseable list rather than refusing to serve", func() {
+		// Worst case is a superseded certificate staying valid until it
+		// expires; failing closed would take the listener down instead.
+		Expect(store.SaveServingSuperseded(ctx, []byte("{not json"))).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+	})
+})
