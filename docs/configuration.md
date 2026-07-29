@@ -69,7 +69,7 @@ tls_self_provision: false
 tls_self_provision_names: []          # extra DNS SANs beyond hostname
 tls_self_provision_renew_before_sec: 0   # 0 = one third of the leaf validity
 tls_self_provision_encrypt_key: false    # requires an explicit passphrase source
-tls_self_provision_revoke_after_sec: 0   # 0 = never revoke a superseded certificate
+tls_self_provision_revoke_after_sec: -1   # -1/unset = built-in default (24h); 0 = never revoke
 maintenance_interval_sec: 0           # shared maintenance loop; 0 = built-in default (1h)
 puppet_server: puppet.example.com
 puppet_server_file: ""
@@ -278,8 +278,14 @@ replacement. The exposure is one maintenance interval.
 
 When a certificate is replaced the old one stays valid until it expires, which
 leaves a second usable credential in circulation.
-`tls_self_provision_revoke_after_sec` revokes it after a delay; `0` (the
-default) never does.
+`tls_self_provision_revoke_after_sec` revokes it after a delay. It has three
+states, matching `csr_rate_limit`: unset (`-1`) takes the built-in default of
+**24 hours**, `0` never revokes, and a positive value is used as given.
+
+The default is 24 hours rather than "never" because a second valid serving
+credential in circulation is the worse outcome, and it matches this project's
+existing posture — `revoke_on_auto_renew` is already `true` so that only the
+newest serial for a subject stays valid.
 
 The delay is not optional padding. The certificate swap is per-process, so a
 sibling replica may still be serving the old certificate; revoking immediately
@@ -287,6 +293,13 @@ breaks every client that checks revocation. A replica picks up the replacement
 within one maintenance interval, so the value must be at least **twice**
 `maintenance_interval_sec` — two hours at the defaults — and the server refuses
 to start otherwise.
+
+Only a value you set explicitly is checked against that floor. Left unset, the
+delay is the built-in 24 hours *or* the floor, whichever is longer — so raising
+`maintenance_interval_sec` past 12 hours lengthens the default rather than
+refusing to start over a value you never chose. A delay you did configure is
+never silently lengthened, because that would misrepresent how long a
+superseded credential stays valid.
 
 That bound assumes maintenance passes succeed. A replica whose passes keep
 failing will go on serving a superseded certificate while a healthy replica's
