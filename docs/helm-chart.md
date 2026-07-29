@@ -183,13 +183,20 @@ The chart refuses two combinations that the server also refuses:
   `hostname` by default, so this is easy to hit; without it the certificate
   carries the fallback subject `puppet`, which no agent validates.
 - `config.tls_self_provision` together with `tls.existingSecret` or
-  `config.tls_cert`/`tls_key`. One route supplies the certificate in memory, the
-  other from disk.
+  `config.tls_cert`/`tls_key`. Both routes end at the same holder, so there is no
+  meaningful "both" — one supplies the certificate from the CA, the other from a
+  mounted file, and the server refuses to guess which you meant.
 
 The certificate lives in the storage backend, not in `cadir`, so every replica
-serves the same one and an ephemeral `cadir` loses nothing. Publish it to an
-Ingress with a [`serving_cert`/`serving_key` export
-target](kubernetes-export.md#serving-certificate-and-key), and see
+serves the same one and an ephemeral `cadir` loses nothing.
+
+You can publish it to an Ingress with a [`serving_cert`/`serving_key` export
+target](kubernetes-export.md#serving-certificate-and-key). Note what the second
+half of that costs: **the exported key is written to the Secret in plaintext**,
+decrypted first if `tls_self_provision_encrypt_key` is set, because a TLS
+consumer cannot use an encrypted PEM. Export `serving_cert` alone unless
+something needs the key, and keep it in a Secret separate from your trust
+bundle. See
 [configuration](configuration.md#self-provisioned-serving-certificate) for
 renewal, revocation of superseded certificates, and the
 filesystem/SQLite caveat.

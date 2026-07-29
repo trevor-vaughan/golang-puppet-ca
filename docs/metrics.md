@@ -181,13 +181,16 @@ configured target (cardinality is bounded by the configuration).
 | `puppetca_k8s_export_last_success_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last successful apply for each target. |
 | `puppetca_k8s_export_last_error_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last failed apply for each target. |
 
-> Exports are event-driven (startup and CRL updates) and can be days apart on a
-> quiet CA, so alert by comparing `last_error` against `last_success` (the
-> mixin's `PuppetCAKubernetesExportFailing` does this) rather than with rate
-> windows or staleness thresholds, which misbehave between sparse attempts. A
-> cycle that fails before any target is applied — the cert/CRL cannot be read
-> from storage — touches none of these series, but storage failures already
-> trip `PuppetCAScrapeFailing` via `puppetca_collector_scrape_success`.
+> Exports are event-driven (startup, CRL updates and serving-certificate
+> rotations) and can be days apart on a quiet CA, so alert by comparing
+> `last_error` against `last_success` (the mixin's
+> `PuppetCAKubernetesExportFailing` does this) rather than with rate windows or
+> staleness thresholds, which misbehave between sparse attempts.
+>
+> A material that cannot be read from storage fails only the targets that
+> requested it, and each of those records an error here — so the alert fires on
+> exactly the targets that went stale. A failed cycle is also retried on a
+> bounded interval rather than waiting for the next wake-up.
 
 ## Example queries
 

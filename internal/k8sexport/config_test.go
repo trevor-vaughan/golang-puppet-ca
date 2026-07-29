@@ -85,13 +85,13 @@ var _ = Describe("Config", func() {
 					FieldManager: "my-mgr",
 					Targets: []k8sexport.Target{{
 						Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust"}, Cert: true,
-						CertKey: "tls.crt", Type: "kubernetes.io/tls",
+						CertKey: "tls.crt", Type: "Opaque",
 					}},
 				}
 				Expect(cfg.Validate()).To(Succeed())
 				Expect(cfg.FieldManager).To(Equal("my-mgr"))
 				Expect(cfg.Targets[0].CertKey).To(Equal("tls.crt"))
-				Expect(cfg.Targets[0].Type).To(Equal("kubernetes.io/tls"))
+				Expect(cfg.Targets[0].Type).To(Equal("Opaque"))
 			})
 		})
 
@@ -113,7 +113,41 @@ var _ = Describe("Config", func() {
 				Entry("serving_key with cert", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true, Cert: true}, "cannot be combined with cert or crl"),
 				Entry("serving_key with crl", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true, CRL: true}, "cannot be combined with cert or crl"),
 				Entry("serving key colliding with cert key", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Cert: true, ServingCert: true, CertKey: "tls.crt"}, "must differ"),
+				// The API server requires both tls.crt and tls.key in a
+				// kubernetes.io/tls Secret, so half a pair is accepted here and
+				// then rejected on every apply for the life of the deployment.
+				Entry("kubernetes.io/tls with only the certificate", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Type: "kubernetes.io/tls", ServingCert: true}, "requires both serving_cert and serving_key"),
+				Entry("kubernetes.io/tls with only the key", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Type: "kubernetes.io/tls", ServingKey: true}, "requires both serving_cert and serving_key"),
 			)
+
+			It("accepts kubernetes.io/tls with the whole pair", func() {
+				cfg := &k8sexport.Config{Targets: []k8sexport.Target{{
+					Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving"},
+					Type: "kubernetes.io/tls", ServingCert: true, ServingKey: true,
+				}}}
+				Expect(cfg.Validate()).To(Succeed())
+			})
+
+			It("rejects two targets naming the same object", func() {
+				// They do not merge: each apply sends the full field set this
+				// manager owns, so the second replaces the first's data every
+				// cycle and the two flap against each other. Easy to reach from
+				// the "use two targets" advice for keeping the key out of a
+				// widely-read Secret — which means two different Secrets.
+				cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, Cert: true},
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, ServingKey: true},
+				}}
+				Expect(cfg.Validate()).To(MatchError(ContainSubstring("overwrite each other")))
+			})
+
+			It("allows the same name in different namespaces", func() {
+				cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, Cert: true},
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns2"}, Cert: true},
+				}}
+				Expect(cfg.Validate()).To(Succeed())
+			})
 		})
 
 		Context("with serving material", func() {

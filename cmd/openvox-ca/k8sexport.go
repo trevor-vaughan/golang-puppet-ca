@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
@@ -34,38 +35,82 @@ import (
 //
 // Both signals are needed. A serving-certificate rotation does not touch the
 // CRL, so waiting only on CRLUpdated would leave a rotated certificate
-// unexported until the next revocation — potentially months.
+// unexported until something else moved the CRL. How long that is depends on
+// configuration and is worth stating accurately rather than dramatically: with
+// the default tls_self_provision_revoke_after_sec, the rotation itself produces
+// a CRL update roughly a day later, so the fallback is ~24 hours. With
+// revocation disabled it is the CRL refresh interval — about 20 days on a
+// low-churn CA. Neither is "months", which is what the design said and what an
+// earlier version of this comment repeated.
 //
 // It runs in the frontend process, reading the cert/CRL through the storage
 // service. Export failures are logged and swallowed: the export is auxiliary
-// and must never take down the CA. A subsequent CRL update — or a restart —
-// retries. It returns when ctx is cancelled (i.e. on shutdown).
+// and must never take down the CA. A failed cycle is retried on a bounded
+// backoff rather than waiting for the next wake-up, because the wake-ups are
+// edge-triggered: without a retry, a target that failed once stays stale until
+// something unrelated moves the CRL. It returns when ctx is cancelled.
 func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter) {
 	slog.Info("Starting Kubernetes export job")
 
-	exportK8sOnce(ctx, exporter)
+	retry := time.NewTimer(exportRetryInterval)
+	defer retry.Stop()
+	if !exportK8sOnce(ctx, exporter) {
+		retry.Reset(exportRetryInterval)
+	} else {
+		stopTimer(retry)
+	}
 
 	for {
+		var reason string
 		select {
 		case <-ctx.Done():
 			slog.Debug("Kubernetes export job stopping")
 			return
 		case <-c.CRLUpdated():
-			slog.Debug("CRL updated, re-exporting to Kubernetes")
-			exportK8sOnce(ctx, exporter)
+			reason = "CRL updated"
 		case <-c.ServingCertUpdated():
-			slog.Debug("Serving certificate rotated, re-exporting to Kubernetes")
-			exportK8sOnce(ctx, exporter)
+			reason = "serving certificate rotated"
+		case <-retry.C:
+			reason = "retrying a failed export"
+		}
+
+		slog.Debug("Re-exporting to Kubernetes", "reason", reason)
+		stopTimer(retry)
+		if !exportK8sOnce(ctx, exporter) {
+			// Both wake-ups are edge-triggered, so without this a target that
+			// failed once stays stale until something unrelated moves the CRL.
+			// A fixed interval rather than a backoff: the failures this sees are
+			// API-server or RBAC problems that an operator fixes, the work is
+			// one apply per target, and a predictable retry is easier to reason
+			// about against the alert's own debounce.
+			retry.Reset(exportRetryInterval)
 		}
 	}
 }
 
-// exportK8sOnce runs a single reconcile, logging the outcome. Per-target errors
-// are already logged by ExportAll; here we log only that the cycle had failures.
-func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) {
+// exportRetryInterval is how long to wait before retrying a cycle that had
+// failures. Comfortably inside the alert's 15-minute debounce, so a transient
+// failure is corrected before it pages.
+const exportRetryInterval = 2 * time.Minute
+
+// stopTimer drains t so a later Reset cannot fire immediately on a stale value.
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+// exportK8sOnce runs a single reconcile, logging the outcome and reporting
+// whether it fully succeeded. Per-target errors are already logged by ExportAll;
+// here we log only that the cycle had failures.
+func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) bool {
 	if err := exporter.ExportAll(ctx); err != nil {
 		slog.Warn("Kubernetes export cycle completed with errors", "error", err)
-		return
+		return false
 	}
 	slog.Debug("Kubernetes export cycle complete")
+	return true
 }

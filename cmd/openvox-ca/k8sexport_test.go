@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
 )
 
@@ -78,5 +79,55 @@ var _ = Describe("runK8sExporter", func() {
 		cancel()
 		Eventually(done).WithTimeout(2*time.Second).Should(BeClosed(),
 			"runK8sExporter did not return after context cancellation")
+	})
+})
+
+var _ = Describe("runK8sExporter serving-certificate wake-up", func() {
+	It("re-exports when the serving certificate rotates, with no CRL change", func() {
+		// The reason the loop selects on two channels. A rotation does not touch
+		// the CRL, so with only the CRL case the rotated certificate would sit
+		// unexported until something else moved it — ~24 hours with the default
+		// revoke-after, ~20 days with revocation disabled. Deleting the
+		// ServingCertUpdated case from the select leaves every other spec green.
+		c, store := newRefresherTestCA()
+		c.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+
+		client := fake.NewClientset()
+		var applies atomic.Int32
+		client.PrependReactor("patch", "secrets",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				applies.Add(1)
+				return false, nil, nil
+			})
+
+		cfg := k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, CRL: true,
+		}}}
+		Expect(cfg.Validate()).To(Succeed())
+		exporter := k8sexport.New(client, cfg, store, "", nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			runK8sExporter(ctx, c, exporter)
+			close(done)
+		}()
+
+		Eventually(applies.Load).WithTimeout(2 * time.Second).Should(BeNumerically(">=", 1))
+		startupCount := applies.Load()
+
+		// Issue a serving certificate. That fires ServingCertUpdated and
+		// nothing else; the CRL is untouched.
+		servingCfg := ca.ServingConfig{Subject: "puppet.example.com"}
+		_, err := c.EnsureServingCert(ctx, servingCfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(applies.Load).WithTimeout(2*time.Second).
+			Should(BeNumerically(">", startupCount),
+				"a serving-certificate rotation did not wake the export loop")
+
+		cancel()
+		Eventually(done).WithTimeout(2 * time.Second).Should(BeClosed())
 	})
 })

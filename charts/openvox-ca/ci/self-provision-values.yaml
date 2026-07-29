@@ -1,5 +1,12 @@
-# The CA issues and renews its own serving certificate, publishing it to a
-# kubernetes.io/tls Secret for an ingress to terminate against.
+# The CA issues and renews its own serving certificate, and publishes it to a
+# kubernetes.io/tls Secret for other workloads to consume.
+#
+# Note what the ingress below does *not* do: it passes TLS through rather than
+# terminating it. openvox-ca authorises on the client certificate an agent
+# presents, and an ingress that terminated TLS would strip it — every agent
+# would arrive unauthenticated. So the CA terminates, using the certificate it
+# issued itself, and the exported Secret is for anything else that needs the
+# certificate rather than for the ingress.
 #
 # This is the deployment self-provisioning exists for: the CA key lives in
 # OpenBao Transit, so cert-manager cannot act as a CA issuer for it, and
@@ -42,9 +49,12 @@ extraEnv:
         name: openvox-ca-db
         key: dsn
 
-# Two targets, not one: a Secret carrying ca.crt is mounted widely across the
-# cluster, and the chart's own validation refuses to let it acquire a tls.key
-# entry alongside. The serving certificate is public and may share either.
+# Two targets, not one, with different names: a Secret carrying ca.crt is
+# mounted widely across the cluster, and the server refuses at startup to let it
+# acquire a tls.key entry alongside — this is kubernetes_export config
+# validation, not a chart rule, so it applies however you deploy. Two targets
+# naming the same Secret are refused as well, since each apply would replace the
+# other's data. The serving certificate is public and may share either.
 kubernetesExport:
   enabled: true
   targets:

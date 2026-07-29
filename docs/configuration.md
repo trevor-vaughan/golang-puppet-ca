@@ -408,6 +408,14 @@ auto-generated passphrase is written into `cadir`, so with an ephemeral `cadir`
 each replica would encrypt under a different one and none could read the shared
 key after a restart.
 
+> **A `serving_key` export target undoes this.** A TLS consumer cannot use an
+> encrypted PEM, so the export decrypts the key and writes it to the Secret in
+> plaintext. Encryption at rest then protects the copy in your storage backend
+> and not the copy in etcd. Under `ca_key_provider: openbao` that exported key
+> is the only CA-chained private key in the cluster. Export `serving_cert`
+> alone unless something genuinely needs the key, and restrict who can read
+> that Secret — see [Kubernetes export](kubernetes-export.md).
+
 With encryption off and a SQL backend, the serving private key is stored in your
 database in plaintext.
 

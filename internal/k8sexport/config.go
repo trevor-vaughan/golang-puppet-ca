@@ -46,6 +46,10 @@ const (
 	// not override them. They follow common Kubernetes trust-bundle conventions.
 	defaultCertKey = "ca.crt"
 	defaultCRLKey  = "ca.crl"
+	// secretTypeTLS is the Kubernetes Secret type whose contract requires both
+	// tls.crt and tls.key. G101: a well-known API constant, not a credential.
+	secretTypeTLS = "kubernetes.io/tls" //nolint:gosec // G101: Kubernetes Secret type name
+
 	// defaultServingCertKey / defaultServingKeyKey follow the kubernetes.io/tls
 	// convention instead, because that is what an Ingress or Gateway reading
 	// the Secret expects to find.
@@ -135,10 +139,27 @@ func (c *Config) Validate() error {
 	if c.FieldManager == "" {
 		c.FieldManager = defaultFieldManager
 	}
+	seen := map[string]int{}
 	for i := range c.Targets {
 		if err := c.Targets[i].validate(); err != nil {
 			return fmt.Errorf("kubernetes_export target %d: %w", i, err)
 		}
+
+		// Two targets naming the same object do not merge: each apply sends the
+		// full set of fields this field manager owns, so the second overwrites
+		// the first's data every cycle and the pair flap against each other. It
+		// is an easy mistake to make from the "use two targets" advice for
+		// keeping the private key out of a widely-read Secret — that advice
+		// means two *different* Secrets.
+		t := &c.Targets[i]
+		id := t.Kind + "/" + t.Metadata.Namespace + "/" + t.Metadata.Name
+		if first, dup := seen[id]; dup {
+			return fmt.Errorf("kubernetes_export targets %d and %d both name %s %q in namespace %q: "+
+				"each apply replaces the other's data, so they would overwrite each other on every "+
+				"export. Merge them into one target, or give them different names",
+				first, i, t.Kind, t.Metadata.Name, t.Metadata.Namespace)
+		}
+		seen[id] = i
 	}
 	return nil
 }
@@ -179,7 +200,18 @@ func (t *Target) validate() error {
 	if t.ServingKey && (t.Cert || t.CRL) {
 		return fmt.Errorf("serving_key cannot be combined with cert or crl in one target: " +
 			"a Secret carrying public trust material is mounted far more widely than " +
-			"one carrying a private key. Use two targets")
+			"one carrying a private key. Use two targets, with different names")
+	}
+
+	// type: kubernetes.io/tls is validated by the API server, which requires
+	// both tls.crt and tls.key to be present. Half a pair is accepted here and
+	// then rejected on every apply for the life of the deployment, which shows
+	// up as a permanently failing export rather than as the configuration error
+	// it is.
+	if strings.EqualFold(t.Type, secretTypeTLS) && (!t.ServingCert || !t.ServingKey) {
+		return fmt.Errorf("type %s requires both serving_cert and serving_key: "+
+			"the API server rejects a %s Secret that is missing tls.crt or tls.key, so this "+
+			"would fail on every export", secretTypeTLS, secretTypeTLS)
 	}
 
 	if t.Cert && t.CertKey == "" {

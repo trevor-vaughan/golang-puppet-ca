@@ -1,18 +1,23 @@
 # Kubernetes export
 
-openvox-ca can optionally publish the **CA certificate** and/or the **CRL** into
-one or more Kubernetes **Secrets** and **ConfigMaps**, so that other workloads in
-the cluster can mount them directly (e.g. as a trust bundle or for CRL
-distribution) instead of fetching them over the HTTP API or sharing a storage
-volume.
+openvox-ca can optionally publish the **CA certificate**, the **CRL**, and the
+**serving certificate it issued for itself** into one or more Kubernetes
+**Secrets** and **ConfigMaps**, so that other workloads in the cluster can mount
+them directly (e.g. as a trust bundle, for CRL distribution, or for an Ingress
+to terminate TLS) instead of fetching them over the HTTP API or sharing a
+storage volume.
 
 - Any number of targets, each a Secret **or** a ConfigMap.
-- Each target may carry the **CA cert**, the **CRL**, or **both** (PEM only for now).
+- Each target may carry the **CA cert**, the **CRL**, the **serving
+  certificate**, the **serving key**, or a combination (PEM only for now). The
+  serving material requires `tls_self_provision`.
 - The data keys, name, namespace, labels, annotations, and a Secret's `type`
   field are all configurable.
-- CRL-bearing targets are **re-exported whenever the CRL changes** (revoke,
-  reissue, background refresh, expired-cert cleanup). All targets are also
-  reconciled **once at startup**.
+- Targets are re-exported whenever the material they carry changes: **the CRL**
+  (revoke, reissue, background refresh, expired-cert cleanup) or **a serving
+  certificate rotation**. All targets are also reconciled **once at startup**,
+  and a cycle with failures is retried on a bounded interval.
+- A material that cannot be read fails only the targets that asked for it.
 
 The feature is **disabled by default**; it activates only when at least one
 target is configured.

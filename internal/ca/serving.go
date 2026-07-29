@@ -1005,6 +1005,12 @@ func (c *CA) ServingCertPEM(ctx context.Context) ([]byte, error) {
 // It is therefore a deliberate downgrade: the key is plaintext in etcd once
 // exported. Nothing calls this unless an operator has explicitly configured a
 // serving_key export target, and the server warns at startup when they have.
+//
+// It also defeats tls_self_provision_encrypt_key, and that is worth stating on
+// this side too rather than only where the export is configured: an operator
+// who turns encryption on is protecting the copy in the storage backend, and a
+// serving_key target puts an unencrypted copy in etcd regardless. The
+// encryption-at-rest documentation carries the same warning.
 func (c *CA) ServingKeyPEM(ctx context.Context) ([]byte, error) {
 	keyPEM, err := c.Storage.GetServingKey(ctx)
 	if err != nil {

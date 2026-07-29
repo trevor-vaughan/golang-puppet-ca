@@ -275,8 +275,9 @@
           {
             alert: 'PuppetCAKubernetesExportFailing',
             // The most recent apply attempt for a target failed. Exports are
-            // event-driven (startup and CRL updates) and can be days apart on
-            // a quiet CA, so this compares last-error/last-success timestamps
+            // event-driven (startup, CRL updates and serving-certificate
+            // rotations) and can be days apart on a quiet CA, so this compares
+            // last-error/last-success timestamps
             // — a state that persists until a retry succeeds — rather than a
             // rate window, which would silently resolve between attempts. The
             // 'unless' arm catches a target that has never succeeded at all.

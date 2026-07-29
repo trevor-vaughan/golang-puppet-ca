@@ -21,6 +21,22 @@ $ helm install openvox-ca \
     --set tls.existingSecret=openvox-ca-server-tls
 ```
 
+There are two routes to a serving certificate. The one above mounts a Secret you
+supply. The other lets the CA issue and renew its own, which is the route to use
+when nothing else can issue it — with the CA key in OpenBao, cert-manager cannot
+act as a CA issuer:
+
+```console
+$ helm install openvox-ca \
+    oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
+    --version 0.9.0 \
+    --namespace puppet --create-namespace \
+    --set config.tls_self_provision=true \
+    --set config.hostname=openvox-ca.puppet.svc.cluster.local
+```
+
+The two are mutually exclusive, and the chart refuses the combination.
+
 A narrative guide — TLS termination, storage backends, ingress and Gateway API,
 monitoring, Kubernetes export — is in
 [docs/helm-chart.md](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md). This file is the values
@@ -144,7 +160,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `kubernetesExport.enabled` | `false` | Publish the CA cert and/or CRL into Secrets and ConfigMaps |
+| `kubernetesExport.enabled` | `false` | Publish the CA cert, CRL and/or the self-provisioned serving certificate and key into Secrets and ConfigMaps |
 | `kubernetesExport.fieldManager` | `""` | Server-side apply field manager |
 | `kubernetesExport.targets` | `[]` | Passed through to `kubernetes_export.targets` |
 | `kubernetesExport.rbac.create` | `true` | Create the `create`/`patch` Role and binding |
