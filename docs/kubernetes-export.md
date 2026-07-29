@@ -84,10 +84,64 @@ kubernetes_export:
 | `metadata.labels` | both | — | Merged with the mandatory `managed-by` label |
 | `metadata.annotations` | both | — | Applied verbatim |
 | `cert` | both | `false` | Include the CA certificate |
-| `crl` | both | `false` | Include the CRL (at least one of `cert`/`crl` must be true) |
+| `crl` | both | `false` | Include the CRL |
+| `serving_cert` | both | `false` | Include the self-provisioned serving certificate |
+| `serving_key` | Secret | `false` | Include the serving private key (see below) |
 | `cert_key` | both | `ca.crt` | Data key for the cert |
-| `crl_key` | both | `ca.crl` | Data key for the CRL (must differ from `cert_key`) |
+| `crl_key` | both | `ca.crl` | Data key for the CRL |
+| `serving_cert_key` | both | `tls.crt` | Data key for the serving certificate |
+| `serving_key_key` | Secret | `tls.key` | Data key for the serving key |
 | `type` | Secret | unmanaged | Secret `type` field; unset means the exporter does not own it (see below); rejected on ConfigMaps |
+
+At least one material must be selected, and no two may share a data key.
+
+### Serving certificate and key
+
+With [`tls_self_provision`](configuration.md#self-provisioned-serving-certificate)
+the CA issues its own serving certificate. Exporting it produces a
+`kubernetes.io/tls` Secret an Ingress or Gateway can terminate against — which
+is why these two default to `tls.crt` and `tls.key` rather than the
+trust-bundle convention the other materials use.
+
+```yaml
+kubernetes_export:
+  targets:
+    # Public trust material: mounted widely, read by many workloads.
+    - kind: Secret
+      metadata:
+        name: openvox-ca-trust
+      cert: true
+      crl: true
+    # The serving pair, on its own.
+    - kind: Secret
+      metadata:
+        name: openvox-ca-serving
+      type: kubernetes.io/tls
+      serving_cert: true
+      serving_key: true
+```
+
+Two rules apply to `serving_key`, both about blast radius:
+
+- **It is rejected on a ConfigMap.** Those are not encrypted at rest and are
+  readable by anything that can `get` them.
+- **It cannot share a target with `cert` or `crl`.** A Secret holding `ca.crt`
+  is public trust material and gets mounted across the cluster; letting it
+  quietly acquire a `tls.key` entry would extend the serving key's reach to
+  every workload that reads it. Two targets cost nothing. The serving
+  *certificate* is public and may share a target with anything.
+
+**The exported key is always plaintext.** When
+`tls_self_provision_encrypt_key` is set the exporter decrypts before
+publishing, because a `kubernetes.io/tls` Secret holding an encrypted PEM is
+useless to every consumer of one — it would look correct and fail at the first
+handshake. That is a deliberate downgrade: the key is then plaintext in etcd.
+The server logs a warning at startup whenever a `serving_key` target is
+configured. Restrict who can read that Secret.
+
+A rotated serving certificate is re-exported immediately: the exporter wakes on
+certificate rotation as well as on CRL updates, so a Secret never lags behind
+the certificate the CA is actually serving.
 
 ### Secret type
 
