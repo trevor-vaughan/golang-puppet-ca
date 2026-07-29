@@ -497,3 +497,104 @@ var _ = Describe("Superseded serving certificates", func() {
 func revokeCfg(subject string, revokeAfter time.Duration) ca.ServingConfig {
 	return ca.ServingConfig{Subject: subject, RevokeAfter: revokeAfter}
 }
+
+var _ = Describe("Serving certificate reuse reasons", func() {
+	const subject = "puppet.example.com"
+
+	var (
+		ctx   context.Context
+		store *storage.StorageService
+		myCA  *ca.CA
+		cfg   ca.ServingConfig
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		cfg = ca.ServingConfig{Subject: subject}
+	})
+
+	reasonFor := func() (string, string) {
+		GinkgoHelper()
+		return myCA.ServingReuseReasonForTest(ctx, cfg)
+	}
+
+	It("is empty when the stored certificate is usable", func() {
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		code, detail := reasonFor()
+		Expect(code).To(BeEmpty())
+		Expect(detail).To(BeEmpty())
+	})
+
+	It("reports a stable code with no detail when nothing is stored", func() {
+		code, detail := reasonFor()
+		Expect(code).To(Equal("no-stored-certificate"))
+		Expect(detail).To(BeEmpty())
+	})
+
+	It("withholds the error text when the stored key cannot be read", func() {
+		// SECURITY: this reason is logged at Info on every reissue. The error
+		// comes from the storage backend, and a SQL driver's connection error
+		// can carry the DSN — which carries a password. The code says what
+		// happened; the detail stays empty.
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Expect(store.SaveServingKey(ctx, []byte("not a key\n"))).To(Succeed())
+
+		code, detail := reasonFor()
+		Expect(code).To(Equal("key-unusable"))
+		Expect(detail).To(BeEmpty())
+	})
+
+	It("withholds the passphrase file path when the key cannot be decrypted", func() {
+		// The path is not a secret, but it reaches this string through
+		// resolvePassphrase's error and has no business in a routine rotation
+		// log line. This is the flow CodeQL traced.
+		myCA.KeyPassphrase = ca.KeyPassphraseConfig{PassphraseFile: passphraseFile("hunter2")}
+		cfg.EncryptKey = true
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		secret := passphraseFile("different")
+		myCA.KeyPassphrase = ca.KeyPassphraseConfig{PassphraseFile: secret}
+
+		code, detail := reasonFor()
+		Expect(code).To(Equal("key-unusable"))
+		Expect(detail).To(BeEmpty())
+		Expect(detail).NotTo(ContainSubstring(secret), "the configured path must not reach the log")
+	})
+
+	It("carries only operator-supplied detail for a missing name", func() {
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		cfg.ExtraNames = []string{"ingress.example.com"}
+
+		code, detail := reasonFor()
+		Expect(code).To(Equal("missing-configured-name"))
+		Expect(detail).To(Equal("ingress.example.com"))
+	})
+
+	It("carries only clock arithmetic as detail in the renewal window", func() {
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Derived from the certificate actually issued: a window at or beyond
+		// the lifetime is clamped, so it would not put this inside the window.
+		lifetime := issued.Leaf.NotAfter.Sub(issued.Leaf.NotBefore)
+		cfg.RenewBefore = lifetime - time.Hour
+
+		code, detail := reasonFor()
+		Expect(code).To(Equal("within-renewal-window"))
+		Expect(detail).To(HaveSuffix("remaining"))
+	})
+
+	It("reports revocation with no detail", func() {
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Expect(myCA.Revoke(ctx, subject)).To(Succeed())
+
+		code, detail := reasonFor()
+		Expect(code).To(Equal("certificate-revoked"))
+		Expect(detail).To(BeEmpty())
+	})
+})
