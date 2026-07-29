@@ -167,6 +167,11 @@ type CA struct {
 	// replica notices its replacement within one interval. Alert on this.
 	servingRenewalFailures atomic.Uint64
 
+	// servingRevocationFailures counts maintenance passes that could not
+	// reconcile the superseded serving-certificate list. Surfaced as
+	// puppetca_serving_cert_revocation_failures_total.
+	servingRevocationFailures atomic.Uint64
+
 	// crlNotify carries a coalesced signal each time the CRL is re-signed (see
 	// signCRLLocked). It is buffered to depth 1 and written non-blockingly, so a
 	// burst of revocations collapses to a single pending notification and an
@@ -217,6 +222,25 @@ func (c *CA) IncServingRenewalFailures() {
 // puppetca_serving_cert_renewal_failures_total.
 func (c *CA) ServingRenewalFailureCount() uint64 {
 	return c.servingRenewalFailures.Load()
+}
+
+// IncServingRevocationFailures records a maintenance pass that could not
+// reconcile the superseded-certificate list.
+//
+// Counted separately from crlUpdateFailures because the failures this path hits
+// first are not CRL amendments at all — a lock timeout, or a storage error on
+// the pending list — and because it is the counter that bounds how long a
+// superseded serving certificate stays valid. A replica whose sweep fails every
+// hour keeps that credential live indefinitely.
+func (c *CA) IncServingRevocationFailures() {
+	c.servingRevocationFailures.Add(1)
+}
+
+// ServingRevocationFailureCount returns how many maintenance passes failed to
+// revoke superseded serving certificates. Surfaced as
+// puppetca_serving_cert_revocation_failures_total.
+func (c *CA) ServingRevocationFailureCount() uint64 {
+	return c.servingRevocationFailures.Load()
 }
 
 // CRLUpdated returns a channel that receives a value each time the CRL is

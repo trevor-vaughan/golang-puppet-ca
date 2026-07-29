@@ -43,6 +43,10 @@ import (
 const (
 	// certValidity is the lifetime issued to CA and leaf certificates.
 	certValidity = 5 * 365 * 24 * time.Hour
+	// DefaultCertValidity is certValidity, exported so configuration validation
+	// can reason about the lifetime a certificate will actually get without
+	// duplicating the constant.
+	DefaultCertValidity = certValidity
 	// CRLValidity is the default validity window written into every CRL.
 	CRLValidity = 30 * 24 * time.Hour
 )
@@ -300,10 +304,6 @@ func (c *CA) signWithDuration(ctx context.Context, subject string, ttl time.Dura
 	return certPEM, nil
 }
 
-// subjectAltNames carries the full set of Subject Alternative Name entries
-// copied onto an issued leaf certificate. Bundling them keeps issueLeafLocked's
-// signature manageable and ensures every SAN type is threaded through together,
-// rather than DNS names alone.
 // extKeyUsageOrDefault resolves issueLeafLocked's variadic eku override to the
 // list that goes in the certificate. No override means the long-standing
 // serverAuth + clientAuth pair.
@@ -313,6 +313,11 @@ func extKeyUsageOrDefault(eku []x509.ExtKeyUsage) []x509.ExtKeyUsage {
 	}
 	return eku
 }
+
+// subjectAltNames carries the full set of Subject Alternative Name entries
+// copied onto an issued leaf certificate. Bundling them keeps issueLeafLocked's
+// signature manageable and ensures every SAN type is threaded through together,
+// rather than DNS names alone.
 
 type subjectAltNames struct {
 	DNSNames       []string

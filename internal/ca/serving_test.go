@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -68,6 +69,30 @@ var _ = Describe("Serving certificate", func() {
 			Expect(got.Leaf.Subject.CommonName).To(Equal(subject))
 			Expect(got.Leaf.DNSNames).To(ContainElement(subject))
 			Expect(got.Leaf.CheckSignatureFrom(myCA.CACert)).To(Succeed())
+		})
+
+		It("leaves ordinary issuance at serverAuth + clientAuth", func() {
+			// The other arm of the same override. This changeset turned a
+			// hard-coded literal into a variadic parameter with a defaulting
+			// helper; the override arm is pinned by the spec below, and without
+			// this one, dropping clientAuth from the default would leave the
+			// suite green and break agent authentication across the fleet.
+			res, err := myCA.Generate(ctx, "agent1.example.com", nil)
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(res.CertificatePEM)
+			Expect(block).NotTo(BeNil())
+			leaf, err := x509.ParseCertificate(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(leaf.ExtKeyUsage).To(Equal([]x509.ExtKeyUsage{
+				x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth,
+			}))
+		})
+
+		It("rejects a subject that is not a valid certificate name", func() {
+			bad := cfg
+			bad.Subject = "../etc/passwd"
+			_, err := myCA.EnsureServingCert(ctx, bad)
+			Expect(err).To(MatchError(ContainSubstring("serving certificate subject")))
 		})
 
 		It("issues serverAuth only, never clientAuth", func() {
@@ -130,13 +155,39 @@ var _ = Describe("Serving certificate", func() {
 			first, err := myCA.EnsureServingCert(ctx, cfg)
 			Expect(err).NotTo(HaveOccurred())
 
-			// A renew-before longer than the whole lifetime puts any certificate
-			// inside the window, without waiting or faking a clock.
-			cfg.RenewBefore = 100 * 365 * 24 * time.Hour
+			// Adding a name the stored certificate does not cover forces a
+			// reissue without waiting or faking a clock. A renew-before longer
+			// than the lifetime would not: servingRenewBefore clamps it, because
+			// a window at or beyond the lifetime makes every certificate
+			// immediately due and the CA would reissue forever.
+			cfg.ExtraNames = []string{"alt.example.com"}
 			second, err := myCA.EnsureServingCert(ctx, cfg)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(second.Issued).To(BeTrue())
 			Expect(second.Leaf.SerialNumber).NotTo(Equal(first.Leaf.SerialNumber))
+		})
+
+		It("does not reissue on every pass when the renewal window exceeds the lifetime", func() {
+			// The loop this guards against: issueLeafLocked caps every
+			// certificate at the CA certificate's *remaining* life, so a window
+			// that was comfortably inside the configured lifetime becomes larger
+			// than the real one as the CA certificate ages. Every fresh
+			// certificate is then immediately due, and each pass signs one,
+			// appends to the inventory, and schedules a revocation that grows
+			// and re-signs the CRL.
+			cfg.RenewBefore = 100 * 365 * 24 * time.Hour
+
+			first, err := myCA.EnsureServingCert(ctx, cfg)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(first.Issued).To(BeTrue())
+
+			for i := 0; i < 3; i++ {
+				again, err := myCA.EnsureServingCert(ctx, cfg)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(again.Issued).To(BeFalse(), "pass %d reissued a certificate that is not due", i+2)
+				Expect(again.Leaf.SerialNumber).To(Equal(first.Leaf.SerialNumber))
+			}
+			Expect(myCA.ServingCertIssued()).To(Equal(uint64(1)))
 		})
 
 		It("reissues when the stored certificate has been revoked", func() {
@@ -302,13 +353,19 @@ var _ = Describe("Superseded serving certificates", func() {
 
 	// reissue forces a mint by putting any stored certificate inside the
 	// renewal window, and returns the certificate it replaced.
+	reissueCount := 0
 	reissue := func() *x509.Certificate {
 		GinkgoHelper()
 		before, err := myCA.EnsureServingCert(ctx, cfg)
 		Expect(err).NotTo(HaveOccurred())
 
+		// A name the stored certificate does not cover forces the reissue; see
+		// the note in "reissues once inside the renewal window" for why an
+		// over-large renew-before does not.
 		widened := cfg
-		widened.RenewBefore = 100 * 365 * 24 * time.Hour
+		widened.ExtraNames = append(append([]string{}, cfg.ExtraNames...),
+			fmt.Sprintf("alt%d.example.com", reissueCount))
+		reissueCount++
 		after, err := myCA.EnsureServingCert(ctx, widened)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(after.Issued).To(BeTrue())
@@ -331,7 +388,7 @@ var _ = Describe("Superseded serving certificates", func() {
 		// old certificate, and revoking immediately breaks every client doing
 		// revocation checking.
 		old := reissue()
-		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 
 		revoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
@@ -345,7 +402,7 @@ var _ = Describe("Superseded serving certificates", func() {
 		cfg.RevokeAfter = time.Nanosecond
 		old := reissue()
 
-		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 
 		revoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
@@ -361,7 +418,7 @@ var _ = Describe("Superseded serving certificates", func() {
 		live, err := myCA.EnsureServingCert(ctx, cfg)
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 
 		oldRevoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
@@ -375,7 +432,7 @@ var _ = Describe("Superseded serving certificates", func() {
 	It("prunes the list, so a second pass revokes nothing new", func() {
 		cfg.RevokeAfter = time.Nanosecond
 		reissue()
-		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 
 		stored, err := store.GetServingSuperseded(ctx)
 		Expect(err).NotTo(HaveOccurred())
@@ -386,7 +443,7 @@ var _ = Describe("Superseded serving certificates", func() {
 		// Otherwise an entry recorded under a non-zero delay would sit there
 		// indefinitely and fire much later if the delay were re-enabled.
 		old := reissue()
-		Expect(myCA.ReconcileSuperseded(ctx, 0)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, 0))).To(Succeed())
 
 		revoked, err := myCA.IsRevokedSerial(ctx, old.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
@@ -414,7 +471,7 @@ var _ = Describe("Superseded serving certificates", func() {
 		other := ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
 		other.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 		Expect(other.Init(ctx)).To(Succeed())
-		Expect(other.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(other.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 
 		// Asserted through the replica that did the work: each process holds
 		// its own in-memory CRL cache, and myCA has not refreshed since.
@@ -424,13 +481,19 @@ var _ = Describe("Superseded serving certificates", func() {
 	})
 
 	It("is a no-op with nothing pending", func() {
-		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 	})
 
 	It("survives an unparseable list rather than refusing to serve", func() {
 		// Worst case is a superseded certificate staying valid until it
 		// expires; failing closed would take the listener down instead.
 		Expect(store.SaveServingSuperseded(ctx, []byte("{not json"))).To(Succeed())
-		Expect(myCA.ReconcileSuperseded(ctx, time.Hour)).To(Succeed())
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 	})
 })
+
+// revokeCfg is the minimal ServingConfig ReconcileSuperseded needs: the subject
+// names the lock it serialises on, the delay decides what is due.
+func revokeCfg(subject string, revokeAfter time.Duration) ca.ServingConfig {
+	return ca.ServingConfig{Subject: subject, RevokeAfter: revokeAfter}
+}

@@ -71,8 +71,9 @@ type Collector struct {
 
 	crlUpdateFailures *prometheus.Desc
 
-	servingCertIssued      *prometheus.Desc
-	servingRenewalFailures *prometheus.Desc
+	servingCertIssued         *prometheus.Desc
+	servingRenewalFailures    *prometheus.Desc
+	servingRevocationFailures *prometheus.Desc
 
 	caInfo      *prometheus.Desc
 	caNotBefore *prometheus.Desc
@@ -127,6 +128,12 @@ func NewCollector(c *ca.CA) *Collector {
 				"certificate stays in place and the next cycle retries, so alert on a persistent rise: "+
 				"it is invisible until the certificate expires, and it breaks the bound that "+
 				"tls_self_provision_revoke_after_sec relies on.",
+			nil, nil),
+		servingRevocationFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "serving_cert", "revocation_failures_total"),
+			"Total maintenance passes that failed to revoke superseded serving certificates. "+
+				"The list is left intact and the next cycle retries, so alert on a persistent rise: "+
+				"a superseded certificate stays a valid credential until the sweep succeeds.",
 			nil, nil),
 		caInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "ca_certificate", "info"),
@@ -189,6 +196,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.crlUpdateFailures
 	ch <- c.servingCertIssued
 	ch <- c.servingRenewalFailures
+	ch <- c.servingRevocationFailures
 	ch <- c.caInfo
 	ch <- c.caNotBefore
 	ch <- c.caNotAfter
@@ -226,6 +234,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		float64(c.ca.ServingCertIssued()))
 	ch <- prometheus.MustNewConstMetric(c.servingRenewalFailures, prometheus.CounterValue,
 		float64(c.ca.ServingRenewalFailureCount()))
+	ch <- prometheus.MustNewConstMetric(c.servingRevocationFailures, prometheus.CounterValue,
+		float64(c.ca.ServingRevocationFailureCount()))
 
 	if err != nil {
 		slog.Warn("Prometheus CA metrics scrape failed", "error", err)

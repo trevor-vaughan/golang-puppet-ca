@@ -305,6 +305,28 @@ failing will go on serving a superseded certificate while a healthy replica's
 clock runs down and revokes it, which is the other reason to alert on
 `puppetca_serving_cert_renewal_failures_total`.
 
+### Turning it off
+
+Clearing `tls_self_provision` stops the CA renewing the certificate, but it does
+**not** remove what is already there: `serving_cert` and `serving_key` stay in
+the backend, and the key is plaintext unless
+`tls_self_provision_encrypt_key` was set. That is a valid CA-signed credential
+for the CA's own hostname, so when migrating to an externally supplied
+certificate:
+
+1. Revoke it — `openvox-ca-ctl revoke --certname <hostname>` — so the credential
+   is dead even though the blobs remain.
+2. Switch to `tls_cert`/`tls_key` and restart.
+
+There is no command to delete the stored blobs; remove them with your backend's
+own tooling if you want them gone.
+
+Related: rotating `ca_key_passphrase_file` across a rolling update leaves
+replicas briefly unable to decrypt each other's stored key, so each reissues its
+own until every replica is on the new passphrase. That churn is harmless — the
+reuse predicate treats an undecryptable key as "mint again" rather than failing
+— but it does mean a burst of issuance and superseded entries.
+
 ### Encryption at rest
 
 `tls_self_provision_encrypt_key: true` encrypts the stored serving key the same
@@ -315,9 +337,15 @@ each replica would encrypt under a different one and none could read the shared
 key after a restart.
 
 With encryption off and a SQL backend, the serving private key is stored in your
-database in plaintext. That is the same posture `ca_key` has by default, since
-`encrypt_ca_key` is also off unless enabled — it is one blob over, not a new
-class of exposure. See [CA key security](ca-key-security.md).
+database in plaintext.
+
+If your CA key is already a backend blob — the default — that is the posture
+`ca_key` has by default and this is one blob over. **If you hold the CA key at a
+provider (`ca_key_provider: openbao`), behind an external signer, or pinned with
+`ca_key_file`, your backend holds no private key today and this changes that.**
+`ca_key_file` pins only the CA key; there is no serving-key equivalent, so
+`tls_self_provision_encrypt_key` is the protection available. See
+[CA key security](ca-key-security.md).
 
 ### Sharing a backend between replicas
 

@@ -41,6 +41,16 @@
     crlUpdateWindow: '1h',
     crlUpdateFor: '15m',
 
+    // --- Self-provisioned serving certificate ---
+    // The CA could not renew the certificate its own listener presents. The
+    // exposure bound behind tls_self_provision_revoke_after_sec assumes renewals
+    // succeed, so a replica failing this quietly is how a superseded certificate
+    // stays valid past its intended window — and how the live one eventually
+    // expires. Like the CRL counter, this resets on restart, so the alert looks
+    // at increase() over a window.
+    servingRenewalWindow: '1h',
+    servingRenewalFor: '15m',
+
     // --- Kubernetes export ---
     // A target alerts while its most recent apply attempt failed (last-error
     // newer than last-success). Exports are event-driven and can be days apart

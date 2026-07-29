@@ -135,6 +135,8 @@ etcd_tls_key_file:  /etc/puppet-ca/etcd-client-key.pem
   [CA key encryption at rest](ca-key-security.md) (`encrypt_ca_key: true`), or
   pin the key to a local file with `ca_key_file` (see
   [CA cert/key as local files](#ca-certkey-as-local-files)).
+
+  > **`tls_self_provision` adds a second private key.** The serving key is stored the same way, and `ca_key_file` does **not** pin it — only `tls_self_provision_encrypt_key` protects it at rest. If you hold the CA key at a provider or in a local file, this is the only private key in the backend. See [CA key security](ca-key-security.md).
 - **`openvox-ca-ctl setup` / `import` work on the local filesystem only.** To
   import a CA into an etcd-backed cluster, run them against a scratch directory
   first, then point `openvox-ca` at a cadir containing the output.
@@ -250,6 +252,8 @@ redis_tls_key_file:  /etc/puppet-ca/redis-client-key.pem
 - **The CA private key lives in Redis by default.** Restrict ACLs, enable
   `encrypt_ca_key`, or pin the key to a local file with `ca_key_file` (see
   [CA cert/key as local files](#ca-certkey-as-local-files)).
+
+  > **`tls_self_provision` adds a second private key.** The serving key is stored the same way, and `ca_key_file` does **not** pin it — only `tls_self_provision_encrypt_key` protects it at rest. If you hold the CA key at a provider or in a local file, this is the only private key in the backend. See [CA key security](ca-key-security.md).
 - **`openvox-ca-ctl setup` / `import` work on the local filesystem only.**
   Bootstrap/import against a scratch directory, then point `openvox-ca` at a
   cadir containing the output.
@@ -291,7 +295,10 @@ than failing under contention.
 **Operational notes.** The database file *is* the CA — back it up (with its WAL
 sidecar) the way you would a cadir tree. The CA private key lives in the
 database by default; enable `encrypt_ca_key` or pin it to a local file with
-`ca_key_file`. `openvox-ca-ctl setup` / `import` work on the local filesystem
+`ca_key_file`.
+
+> **`tls_self_provision` adds a second private key.** The serving key is stored the same way, and `ca_key_file` does **not** pin it — only `tls_self_provision_encrypt_key` protects it at rest. If you hold the CA key at a provider or in a local file, this is the only private key in the backend. See [CA key security](ca-key-security.md).
+ `openvox-ca-ctl setup` / `import` work on the local filesystem
 only; bootstrap against a scratch directory, then point a SQLite-backed
 `openvox-ca` at a fresh database.
 
@@ -326,7 +333,11 @@ TLS is driven either by the DSN (`sslmode=require`, etc.) or by the
 
 **Operational notes.** Back the database up with your normal PostgreSQL tooling.
 The CA private key lives in the database by default; enable `encrypt_ca_key` or
-pin it to a local file with `ca_key_file`. Grant the configured role rights to
+pin it to a local file with `ca_key_file`.
+
+> **`tls_self_provision` adds a second private key.** The serving key is stored the same way, and `ca_key_file` does **not** pin it — only `tls_self_provision_encrypt_key` protects it at rest. If you hold the CA key at a provider or in a local file, this is the only private key in the backend. See [CA key security](ca-key-security.md).
+
+Grant the configured role rights to
 create tables on first run (or pre-create the schema and grant DML).
 `openvox-ca-ctl setup` / `import` work on the local filesystem only.
 
@@ -360,6 +371,9 @@ form (`user:pass@tcp(host:3306)/dbname`).
 
 **Operational notes.** The CA private key lives in the database by default;
 enable `encrypt_ca_key` or pin it to a local file with `ca_key_file`.
+
+> **`tls_self_provision` adds a second private key.** The serving key is stored the same way, and `ca_key_file` does **not** pin it — only `tls_self_provision_encrypt_key` protects it at rest. If you hold the CA key at a provider or in a local file, this is the only private key in the backend. See [CA key security](ca-key-security.md).
+
 `openvox-ca-ctl setup` / `import` work on the local filesystem only.
 
 ### SQL environment variables
@@ -435,6 +449,9 @@ ca_key_file:  /etc/puppet-ca/secrets/ca_key.pem
 - Existing protections still apply: `encrypt_ca_key` encrypts the key PEM
   before writing, and `ca_key_passphrase_file` overrides the auto-generated
   passphrase file.
+- **This override covers the CA cert and key only.** The
+  `tls_self_provision` serving key has no local-file equivalent and stays in the
+  backend; use `tls_self_provision_encrypt_key` to protect it there.
 
 This override also works with the filesystem backend, e.g. to pull the CA
 key out of the cadir tree and onto a separately-mounted volume.

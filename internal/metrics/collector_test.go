@@ -138,6 +138,22 @@ var _ = Describe("Collector", func() {
 		crlUpdateFailures := g.findByLabels("puppetca_crl_update_failures_total", nil)
 		Expect(crlUpdateFailures).NotTo(BeNil())
 		Expect(counterValue(crlUpdateFailures)).To(Equal(0.0))
+
+		// The serving-certificate counters are exported unconditionally too, so
+		// a dashboard or alert can select them whether or not the feature is on.
+		// Pinned by name: the mixin's PuppetCAServingCertRenewalFailing selects
+		// the second one, and a rename would silently stop it firing.
+		servingIssued := g.findByLabels("puppetca_serving_cert_issued_total", nil)
+		Expect(servingIssued).NotTo(BeNil())
+		Expect(counterValue(servingIssued)).To(Equal(0.0))
+
+		servingRenewalFailures := g.findByLabels("puppetca_serving_cert_renewal_failures_total", nil)
+		Expect(servingRenewalFailures).NotTo(BeNil())
+		Expect(counterValue(servingRenewalFailures)).To(Equal(0.0))
+
+		servingRevocationFailures := g.findByLabels("puppetca_serving_cert_revocation_failures_total", nil)
+		Expect(servingRevocationFailures).NotTo(BeNil())
+		Expect(counterValue(servingRevocationFailures)).To(Equal(0.0))
 	})
 
 	It("reports per-leaf metrics with issuance state", func() {
