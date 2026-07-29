@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"os"
 	"path/filepath"
 
@@ -107,5 +108,119 @@ var _ = Describe("buildAuthConfig", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(authCfg.NoPpCliAuth).To(BeTrue())
 		Expect(authCfg.AllowPublicStatus).To(BeTrue())
+	})
+})
+
+var _ = Describe("serverConfig.validateTLS", func() {
+	var cfg *serverConfig
+
+	BeforeEach(func() {
+		cfg = &serverConfig{TLSSelfProvision: true, Hostname: "puppet.example.com"}
+	})
+
+	It("accepts a minimal self-provision configuration", func() {
+		Expect(cfg.validateTLS()).To(Succeed())
+	})
+
+	It("is a no-op when self-provision is off", func() {
+		// Everything below is scoped to self-provision; the file route keeps
+		// its long-standing behaviour of accepting whatever it is given.
+		Expect((&serverConfig{TLSCert: "c.pem"}).validateTLS()).To(Succeed())
+	})
+
+	It("rejects self-provision alongside tls_cert", func() {
+		// A silent precedence rule would leave the operator serving material
+		// they did not think was in play.
+		cfg.TLSCert = "c.pem"
+		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("cannot be combined")))
+	})
+
+	It("rejects self-provision alongside tls_key", func() {
+		cfg.TLSKey = "k.pem"
+		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("cannot be combined")))
+	})
+
+	It("requires a hostname", func() {
+		// Without it bootstrapCA's "puppet" fallback would produce a
+		// certificate no client validates — a handshake failure presenting as
+		// anything but the configuration error it is.
+		cfg.Hostname = ""
+		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("requires hostname")))
+	})
+
+	Describe("encrypted serving key", func() {
+		It("refuses the auto-generated passphrase", func() {
+			// It is written into cadir, so with an ephemeral cadir each replica
+			// would encrypt under a different passphrase and none could read
+			// the shared blob after a restart.
+			cfg.TLSSelfProvisionEncryptKey = true
+			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("requires an explicit passphrase")))
+		})
+
+		It("accepts an explicit passphrase file", func() {
+			cfg.TLSSelfProvisionEncryptKey = true
+			cfg.CAKeyPassphraseFile = "/etc/puppet-ca/passphrase"
+			Expect(cfg.validateTLS()).To(Succeed())
+		})
+
+		It("accepts a passphrase from the environment", func() {
+			cfg.TLSSelfProvisionEncryptKey = true
+			GinkgoT().Setenv("PUPPET_CA_KEY_PASSPHRASE", "hunter2")
+			Expect(cfg.validateTLS()).To(Succeed())
+		})
+	})
+
+	Describe("revocation delay", func() {
+		It("accepts 0, which never revokes", func() {
+			cfg.TLSSelfProvisionRevokeAfterSec = 0
+			Expect(cfg.validateTLS()).To(Succeed())
+		})
+
+		It("rejects a delay under twice the maintenance interval", func() {
+			// A sibling replica notices a replacement within one maintenance
+			// interval; revoking sooner breaks exactly what the delay exists to
+			// protect. With the default hour, two hours is the floor.
+			cfg.TLSSelfProvisionRevokeAfterSec = 3600
+			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("at least twice")))
+		})
+
+		It("accepts exactly twice the maintenance interval", func() {
+			cfg.TLSSelfProvisionRevokeAfterSec = 7200
+			Expect(cfg.validateTLS()).To(Succeed())
+		})
+
+		It("scales the floor with a configured maintenance interval", func() {
+			cfg.MaintenanceIntervalSec = 300
+			cfg.TLSSelfProvisionRevokeAfterSec = 900
+			Expect(cfg.validateTLS()).To(Succeed())
+
+			cfg.TLSSelfProvisionRevokeAfterSec = 500
+			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("at least twice")))
+		})
+	})
+})
+
+var _ = Describe("servingCertHolder", func() {
+	It("errors rather than returning nil when nothing is installed", func() {
+		// nil, nil makes crypto/tls report a confusing internal error to the
+		// client instead of naming the problem.
+		_, err := (&servingCertHolder{}).GetCertificate(nil)
+		Expect(err).To(MatchError(ContainSubstring("no serving certificate")))
+	})
+
+	It("returns the installed certificate, and the replacement after a swap", func() {
+		holder := &servingCertHolder{}
+		first := &tls.Certificate{Certificate: [][]byte{{1}}}
+		second := &tls.Certificate{Certificate: [][]byte{{2}}}
+
+		holder.Set(first)
+		got, err := holder.GetCertificate(nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(BeIdenticalTo(first))
+
+		holder.Set(second)
+		got, err = holder.GetCertificate(nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(BeIdenticalTo(second))
 	})
 })

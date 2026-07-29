@@ -223,6 +223,8 @@ func newRootCmd() *cobra.Command {
 		logFile                 string
 		tlsCert                 string
 		tlsKey                  string
+		tlsSelfProvision        bool
+		tlsSelfProvisionNames   []string
 		puppetServers           string
 		puppetServerFile        string
 		noPpCliAuth             bool
@@ -299,6 +301,12 @@ func newRootCmd() *cobra.Command {
 			}
 			if cmd.Flags().Changed("tls-key") {
 				cfg.TLSKey = tlsKey
+			}
+			if cmd.Flags().Changed("tls-self-provision") {
+				cfg.TLSSelfProvision = tlsSelfProvision
+			}
+			if cmd.Flags().Changed("tls-self-provision-names") {
+				cfg.TLSSelfProvisionNames = tlsSelfProvisionNames
 			}
 			if cmd.Flags().Changed("puppet-server") {
 				cfg.PuppetServer = puppetServers
@@ -444,14 +452,18 @@ func newRootCmd() *cobra.Command {
 			// SECURITY: TLS enforcement: plain HTTP over a non-loopback
 			// interface lets any on-path host inject forged certificates.
 			// Refuse to start unless:
-			//   (a) TLS is configured (--tls-cert + --tls-key), or
+			//   (a) TLS is configured (--tls-cert + --tls-key, or
+			//       tls_self_provision), or
 			//   (b) the bind address is loopback-only, or
 			//   (c) the operator explicitly opts out with --no-tls-required.
 			// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity), SC-23 (Session Authenticity)
+			if err := cfg.validateTLS(); err != nil {
+				return err
+			}
 			tlsConfigured := cfg.tlsEnabled()
 			if !tlsConfigured {
 				if !isLoopback(cfg.Host) && !cfg.NoTLSRequired {
-					return errors.New("refusing to start: plain HTTP on a non-loopback address is vulnerable to certificate injection; enable TLS (--tls-cert/--tls-key), restrict to loopback (--host 127.0.0.1), or set --no-tls-required")
+					return errors.New("refusing to start: plain HTTP on a non-loopback address is vulnerable to certificate injection; enable TLS (--tls-cert/--tls-key), let the CA issue its own certificate (--tls-self-provision), restrict to loopback (--host 127.0.0.1), or set --no-tls-required")
 				}
 				if cfg.NoTLSRequired && !isLoopback(cfg.Host) {
 					slog.Warn("TLS is not configured on a non-loopback address; " +
@@ -618,6 +630,12 @@ func newRootCmd() *cobra.Command {
 			// request metrics. When enabled, the API handler is instrumented so
 			// puppetca_http_* counts requests to the Puppet API, while /metrics is
 			// served on a separate listener (see metricsServer below).
+			// Tasks for the shared maintenance loop. Collected as the features
+			// that need them are wired up, and the loop is started below only if
+			// something registered. Each task is gated by its own feature, never
+			// by another's — see runMaintenance.
+			var maintenanceTasks []maintenanceTask
+
 			handler := srv.Routes()
 			var exporter *metrics.Exporter
 			if cfg.MetricsListen != "" {
@@ -651,9 +669,25 @@ func newRootCmd() *cobra.Command {
 			}
 
 			if tlsConfigured {
-				serverCert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
-				if err != nil {
-					return fmt.Errorf("failed to load TLS cert/key (cert %s, key %s): %w", cfg.TLSCert, cfg.TLSKey, err)
+				// The serving certificate comes either from disk or from the CA
+				// itself. Both routes end at the same holder, so GetCertificate
+				// is the only path the TLS stack ever takes and self-provisioned
+				// rotation needs no special case in the handshake.
+				servingCerts := &servingCertHolder{}
+				if cfg.TLSSelfProvision {
+					// Fatal on failure: a server with no serving certificate
+					// cannot serve, and failing fast beats a listener that never
+					// opens. On the maintenance cycle the same failure is not
+					// fatal, because there is a certificate already in place.
+					if err := ensureServingCert(ctx, myCA, cfg, servingCerts); err != nil {
+						return err
+					}
+				} else {
+					serverCert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+					if err != nil {
+						return fmt.Errorf("failed to load TLS cert/key (cert %s, key %s): %w", cfg.TLSCert, cfg.TLSKey, err)
+					}
+					servingCerts.Set(&serverCert)
 				}
 
 				caCertPEM, err := myCA.Storage.GetCACert(ctx)
@@ -674,14 +708,23 @@ func newRootCmd() *cobra.Command {
 				// per-tier. MinVersion TLS 1.2 blocks legacy protocol downgrades.
 				// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity),
 				//              SC-23 (Session Authenticity), IA-3 (Device Identification)
+				//
+				// GetCertificate rather than Certificates: it is consulted per
+				// handshake, so a renewed serving certificate takes effect on the
+				// next connection with no restart.
 				server.TLSConfig = &tls.Config{
-					Certificates: []tls.Certificate{serverCert},
-					ClientCAs:    caPool,
-					ClientAuth:   tls.RequestClientCert,
-					MinVersion:   tls.VersionTLS12,
+					GetCertificate: servingCerts.GetCertificate,
+					ClientCAs:      caPool,
+					ClientAuth:     tls.RequestClientCert,
+					MinVersion:     tls.VersionTLS12,
 				}
 
-				slog.Info("TLS enabled", "cert", cfg.TLSCert)
+				if cfg.TLSSelfProvision {
+					slog.Info("TLS enabled", "certificate", "self-provisioned", "subject", cfg.Hostname)
+					maintenanceTasks = append(maintenanceTasks, servingRenewalTask(myCA, cfg, servingCerts))
+				} else {
+					slog.Info("TLS enabled", "cert", cfg.TLSCert)
+				}
 			}
 
 			// Background CRL refresh: keeps the CRL's NextUpdate from lapsing on a
@@ -695,6 +738,11 @@ func newRootCmd() *cobra.Command {
 				go runCRLRefresher(ctx, myCA, cfg.crlRefreshInterval(), refreshBefore)
 			} else {
 				slog.Info("CRL auto-refresh disabled by configuration")
+			}
+
+			// Shared maintenance loop. Bound to ctx so it stops on shutdown.
+			if len(maintenanceTasks) > 0 {
+				go runMaintenance(ctx, cfg.maintenanceInterval(), maintenanceTasks)
 			}
 
 			// Background expired-certificate cleanup (opt-in): prunes certs that
@@ -773,6 +821,10 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&logFile, "logfile", "", "Log to file instead of stderr (implies daemon log destination)")
 	f.StringVar(&tlsCert, "tls-cert", "", "Path to TLS server certificate PEM (enables HTTPS)")
 	f.StringVar(&tlsKey, "tls-key", "", "Path to TLS server private key PEM (enables HTTPS)")
+	f.BoolVar(&tlsSelfProvision, "tls-self-provision", false,
+		"Let the CA issue and renew its own serving certificate (enables HTTPS; requires --hostname, excludes --tls-cert/--tls-key)")
+	f.StringSliceVar(&tlsSelfProvisionNames, "tls-self-provision-names", nil,
+		"Extra DNS names for the self-provisioned serving certificate, beyond --hostname")
 	f.StringVar(&puppetServers, "puppet-server", "", "Comma-separated list of puppet-server CNs allowed admin access")
 	f.StringVar(&puppetServerFile, "puppet-server-file", "", "Path to a file of puppet-server CNs allowed admin access (one per line; # comments and blank lines ignored)")
 	f.BoolVar(&noPpCliAuth, "no-pp-cli-auth", false, "Disable pp_cli_auth extension as an admin credential; require CN allow list only")

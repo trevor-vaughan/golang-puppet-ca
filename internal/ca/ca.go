@@ -149,6 +149,24 @@ type CA struct {
 	// metrics exporter (puppetca_crl_update_failures_total) for alerting.
 	crlUpdateFailures atomic.Uint64
 
+	// servingCertIssued counts serving certificates this process has minted.
+	// Exposed as puppetca_serving_cert_issued_total, and it is a rate rather
+	// than a total that matters: two replicas can disagree about which CA
+	// certificate is current — one restarted after a re-issue, one not — and
+	// each will then mint over the other's work on every pass. That shows up
+	// here as sustained churn, where inferring it from certificate serials
+	// would mean noticing an inventory growing for no reason.
+	servingCertIssued atomic.Uint64
+
+	// servingRenewalFailures counts maintenance passes that could not renew the
+	// serving certificate. The existing certificate stays in place and the next
+	// cycle retries, so a single failure is harmless — but a persistently
+	// failing pass is invisible until the certificate expires, and it also
+	// breaks the assumption behind tls_self_provision_revoke_after_sec, which
+	// bounds a superseded certificate's exposure on the belief that every
+	// replica notices its replacement within one interval. Alert on this.
+	ServingRenewalFailures atomic.Uint64
+
 	// crlNotify carries a coalesced signal each time the CRL is re-signed (see
 	// signCRLLocked). It is buffered to depth 1 and written non-blockingly, so a
 	// burst of revocations collapses to a single pending notification and an
@@ -177,6 +195,21 @@ func New(s *storage.StorageService, autosignCfg AutosignConfig, hostname string)
 // it as puppetca_crl_update_failures_total.
 func (c *CA) CRLUpdateFailures() uint64 {
 	return c.crlUpdateFailures.Load()
+}
+
+// ServingCertIssued returns how many serving certificates this process has
+// minted. Surfaced as puppetca_serving_cert_issued_total; a sustained rate
+// rather than a one-off increment indicates replicas disagreeing about which CA
+// certificate is current, which a fleet restart resolves.
+func (c *CA) ServingCertIssued() uint64 {
+	return c.servingCertIssued.Load()
+}
+
+// ServingRenewalFailureCount returns how many maintenance passes failed to
+// renew the serving certificate. Surfaced as
+// puppetca_serving_cert_renewal_failures_total.
+func (c *CA) ServingRenewalFailureCount() uint64 {
+	return c.ServingRenewalFailures.Load()
 }
 
 // CRLUpdated returns a channel that receives a value each time the CRL is
