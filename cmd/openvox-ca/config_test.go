@@ -530,7 +530,7 @@ kubernetes_export:
 		Expect(err).NotTo(HaveOccurred(), "unexpected error")
 
 		Expect(cfg.KubernetesExport.Enabled()).To(BeTrue())
-		Expect(cfg.KubernetesExport.Validate()).To(MatchError(ContainSubstring("at least one of cert or crl")))
+		Expect(cfg.KubernetesExport.Validate()).To(MatchError(ContainSubstring("at least one of cert, crl, serving_cert or serving_key")))
 	})
 })
 

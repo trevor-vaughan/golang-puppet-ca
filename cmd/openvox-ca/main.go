@@ -777,11 +777,26 @@ func newRootCmd() *cobra.Command {
 				if exporter != nil {
 					k8sMetrics = k8sexport.NewMetrics(exporter.Registry())
 				}
+				if cfg.KubernetesExport.WantsServingKey() {
+					// SECURITY: the exported key is always plaintext, because a
+					// kubernetes.io/tls Secret holding an encrypted PEM is
+					// useless to every consumer of one. Say so plainly: with
+					// tls_self_provision_encrypt_key on, the operator has asked
+					// for encryption at rest and is nonetheless publishing the
+					// key in the clear to etcd.
+					slog.Warn("A kubernetes_export target publishes the serving private key. " +
+						"It is written to the Secret in plaintext, decrypted first if " +
+						"tls_self_provision_encrypt_key is set, because TLS consumers cannot use " +
+						"an encrypted key. Restrict who can read that Secret.")
+				}
 				k8sExporter, err := k8sexport.NewInCluster(cfg.KubernetesExport, store, k8sMetrics)
 				if err != nil {
 					slog.Error("Kubernetes export disabled: failed to initialise client", "error", err)
 				} else {
-					go runK8sExporter(ctx, myCA, k8sExporter)
+					// The CA, not the storage service, supplies serving
+					// material: the key has to be decrypted before publication
+					// and only the CA holds the passphrase.
+					go runK8sExporter(ctx, myCA, k8sExporter.WithServingSource(myCA))
 				}
 			}
 

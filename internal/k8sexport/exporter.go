@@ -45,14 +45,33 @@ type MaterialSource interface {
 	GetCRL(ctx context.Context) ([]byte, error)
 }
 
+// ServingSource additionally provides the self-provisioned serving certificate
+// and its private key. It is separate from MaterialSource because the key must
+// be handed over *decrypted* — a kubernetes.io/tls Secret holding an encrypted
+// PEM is useless to every consumer of one — and only the CA can decrypt it.
+// The storage service satisfies MaterialSource alone, so a deployment that
+// exports no serving material needs no extra wiring.
+type ServingSource interface {
+	ServingCertPEM(ctx context.Context) ([]byte, error)
+	ServingKeyPEM(ctx context.Context) ([]byte, error)
+}
+
 // Exporter reconciles the configured Secret/ConfigMap targets with the current
 // CA certificate and CRL using server-side apply.
 type Exporter struct {
 	client    kubernetes.Interface
 	cfg       Config
 	src       MaterialSource
-	defaultNS string   // resolved pod namespace; used for targets without one
-	metrics   *Metrics // may be nil (metrics disabled)
+	serving   ServingSource // nil unless serving material is exported
+	defaultNS string        // resolved pod namespace; used for targets without one
+	metrics   *Metrics      // may be nil (metrics disabled)
+}
+
+// WithServingSource attaches the source for serving certificate and key
+// material. Required when any target sets serving_cert or serving_key.
+func (e *Exporter) WithServingSource(s ServingSource) *Exporter {
+	e.serving = s
+	return e
 }
 
 // New constructs an Exporter from an existing clientset. cfg must already have
@@ -127,17 +146,21 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 // not mean editing every signature between here and the apply, and so that a
 // caller cannot transpose two of them.
 type materials struct {
-	cert []byte
-	crl  []byte
+	cert        []byte
+	crl         []byte
+	servingCert []byte
+	servingKey  []byte
 }
 
 // fetchMaterials reads each material only if some target requires it.
 func (e *Exporter) fetchMaterials(ctx context.Context) (materials, error) {
 	var m materials
-	var wantCert, wantCRL bool
+	var wantCert, wantCRL, wantServingCert, wantServingKey bool
 	for i := range e.cfg.Targets {
 		wantCert = wantCert || e.cfg.Targets[i].Cert
 		wantCRL = wantCRL || e.cfg.Targets[i].CRL
+		wantServingCert = wantServingCert || e.cfg.Targets[i].ServingCert
+		wantServingKey = wantServingKey || e.cfg.Targets[i].ServingKey
 	}
 	if wantCert {
 		certPEM, err := e.src.GetCACert(ctx)
@@ -152,6 +175,26 @@ func (e *Exporter) fetchMaterials(ctx context.Context) (materials, error) {
 			return materials{}, fmt.Errorf("reading CRL for export: %w", err)
 		}
 		m.crl = crlPEM
+	}
+	if wantServingCert || wantServingKey {
+		if e.serving == nil {
+			return materials{}, fmt.Errorf("a target requests serving material but no serving source is configured; " +
+				"serving_cert and serving_key require tls_self_provision")
+		}
+	}
+	if wantServingCert {
+		certPEM, err := e.serving.ServingCertPEM(ctx)
+		if err != nil {
+			return materials{}, fmt.Errorf("reading serving certificate for export: %w", err)
+		}
+		m.servingCert = certPEM
+	}
+	if wantServingKey {
+		keyPEM, err := e.serving.ServingKeyPEM(ctx)
+		if err != nil {
+			return materials{}, fmt.Errorf("reading serving key for export: %w", err)
+		}
+		m.servingKey = keyPEM
 	}
 	return m, nil
 }
@@ -181,6 +224,12 @@ func (e *Exporter) applyTarget(ctx context.Context, t *Target, m materials) erro
 	}
 	if t.CRL && len(m.crl) == 0 {
 		return fmt.Errorf("refusing to export an empty CRL")
+	}
+	if t.ServingCert && len(m.servingCert) == 0 {
+		return fmt.Errorf("refusing to export an empty serving certificate")
+	}
+	if t.ServingKey && len(m.servingKey) == 0 {
+		return fmt.Errorf("refusing to export an empty serving key")
 	}
 	opts := metav1.ApplyOptions{FieldManager: e.cfg.FieldManager, Force: true}
 

@@ -507,6 +507,16 @@ func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig, carr
 	}
 
 	c.servingCertIssued.Add(1)
+
+	// Wake any consumer that republishes the certificate — notably the
+	// Kubernetes exporter, which otherwise reconciles only on CRL updates and
+	// would leave a rotated certificate stale for months. Non-blocking, so an
+	// absent consumer never stalls issuance.
+	select {
+	case c.servingNotify <- struct{}{}:
+	default:
+	}
+
 	return &ServingCertificate{CertPEM: certPEM, KeyPEM: keyPEM, Leaf: leaf, Key: key, Issued: true}, nil
 }
 
@@ -975,4 +985,46 @@ func (c *CA) servingSerialMatches(ctx context.Context, serial string) bool {
 		return false
 	}
 	return serialHexStr(leaf.SerialNumber) == serialHexStr(want)
+}
+
+// ServingCertPEM returns the stored serving certificate, for publication.
+func (c *CA) ServingCertPEM(ctx context.Context) ([]byte, error) {
+	return c.Storage.GetServingCert(ctx)
+}
+
+// ServingKeyPEM returns the stored serving private key in **plaintext** PEM,
+// decrypting it when tls_self_provision_encrypt_key wrote it encrypted.
+//
+// The decryption is deliberate and is the point of this method existing
+// separately from Storage.GetServingKey. A kubernetes.io/tls Secret holding an
+// encrypted PEM is useless to every consumer of one — an Ingress controller or
+// Gateway reads tls.key and expects a key it can use — so publishing the
+// ciphertext would produce a Secret that looks correct and silently fails at
+// the first handshake.
+//
+// It is therefore a deliberate downgrade: the key is plaintext in etcd once
+// exported. Nothing calls this unless an operator has explicitly configured a
+// serving_key export target, and the server warns at startup when they have.
+func (c *CA) ServingKeyPEM(ctx context.Context) ([]byte, error) {
+	keyPEM, err := c.Storage.GetServingKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, fmt.Errorf("the stored serving key is not PEM-encoded")
+	}
+	if !isEncryptedPEM(block) {
+		return keyPEM, nil
+	}
+
+	key, err := c.parseServingKey(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("decrypting the serving key for export: %w", err)
+	}
+	plainPEM, err := marshalPrivateKeyPEM(key)
+	if err != nil {
+		return nil, fmt.Errorf("re-encoding the serving key for export: %w", err)
+	}
+	return plainPEM, nil
 }

@@ -106,10 +106,49 @@ var _ = Describe("Config", func() {
 				Entry("missing kind", k8sexport.Target{Metadata: k8sexport.Metadata{Name: "x"}, CRL: true}, "kind is required"),
 				Entry("invalid kind", k8sexport.Target{Kind: "Deployment", Metadata: k8sexport.Metadata{Name: "x"}, CRL: true}, "invalid kind"),
 				Entry("missing name", k8sexport.Target{Kind: "Secret", CRL: true}, "metadata.name is required"),
-				Entry("neither cert nor crl", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}}, "at least one of cert or crl"),
+				Entry("neither cert nor crl", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}}, "at least one of cert, crl, serving_cert or serving_key"),
 				Entry("type on ConfigMap", k8sexport.Target{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "x"}, CRL: true, Type: "Opaque"}, "type is only valid for Secret"),
 				Entry("colliding keys", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Cert: true, CRL: true, CertKey: "ca.pem", CRLKey: "ca.pem"}, "must differ"),
+				Entry("serving_key in a ConfigMap", k8sexport.Target{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true}, "only valid for Secret targets"),
+				Entry("serving_key with cert", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true, Cert: true}, "cannot be combined with cert or crl"),
+				Entry("serving_key with crl", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true, CRL: true}, "cannot be combined with cert or crl"),
+				Entry("serving key colliding with cert key", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Cert: true, ServingCert: true, CertKey: "tls.crt"}, "must differ"),
 			)
+		})
+
+		Context("with serving material", func() {
+			It("defaults to the kubernetes.io/tls data keys", func() {
+				// Not the trust-bundle convention: an Ingress or Gateway reading
+				// this Secret expects tls.crt and tls.key.
+				cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving"}, ServingCert: true, ServingKey: true},
+				}}
+				Expect(cfg.Validate()).To(Succeed())
+				Expect(cfg.Targets[0].ServingCertKey).To(Equal("tls.crt"))
+				Expect(cfg.Targets[0].ServingKeyKey).To(Equal("tls.key"))
+			})
+
+			It("allows the serving certificate alongside public trust material", func() {
+				// Only the private key is separated; the certificate is public.
+				cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Cert: true, ServingCert: true},
+				}}
+				Expect(cfg.Validate()).To(Succeed())
+			})
+
+			It("reports whether any target wants the private key", func() {
+				withKey := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true},
+				}}
+				Expect(withKey.Validate()).To(Succeed())
+				Expect(withKey.WantsServingKey()).To(BeTrue())
+
+				withoutKey := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingCert: true},
+				}}
+				Expect(withoutKey.Validate()).To(Succeed())
+				Expect(withoutKey.WantsServingKey()).To(BeFalse())
+			})
 		})
 
 		It("reports the offending target index", func() {

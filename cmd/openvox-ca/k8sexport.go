@@ -25,11 +25,16 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
 )
 
-// runK8sExporter publishes the CA certificate and CRL into the configured
-// Kubernetes Secrets/ConfigMaps. It exports once at startup (reconciling state
-// after restarts, config changes, or a CA import) and then re-exports whenever
-// the CRL is updated (revoke, reissue, background refresh, or expired-cert
-// cleanup), so CRL-bearing objects stay current.
+// runK8sExporter publishes the CA certificate, CRL and serving material into
+// the configured Kubernetes Secrets/ConfigMaps. It exports once at startup
+// (reconciling state after restarts, config changes, or a CA import) and then
+// re-exports on either wake-up signal: a CRL update (revoke, reissue,
+// background refresh, or expired-cert cleanup), or a serving-certificate
+// rotation.
+//
+// Both signals are needed. A serving-certificate rotation does not touch the
+// CRL, so waiting only on CRLUpdated would leave a rotated certificate
+// unexported until the next revocation — potentially months.
 //
 // It runs in the frontend process, reading the cert/CRL through the storage
 // service. Export failures are logged and swallowed: the export is auxiliary
@@ -47,6 +52,9 @@ func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter)
 			return
 		case <-c.CRLUpdated():
 			slog.Debug("CRL updated, re-exporting to Kubernetes")
+			exportK8sOnce(ctx, exporter)
+		case <-c.ServingCertUpdated():
+			slog.Debug("Serving certificate rotated, re-exporting to Kubernetes")
 			exportK8sOnce(ctx, exporter)
 		}
 	}

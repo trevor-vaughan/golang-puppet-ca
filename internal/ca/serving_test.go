@@ -22,6 +22,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -1257,5 +1258,121 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 		code, detail := reasonFor()
 		Expect(code).To(Equal("certificate-revoked"))
 		Expect(detail).To(BeEmpty())
+	})
+})
+
+var _ = Describe("Serving material for export", func() {
+	const subject = "puppet.example.com"
+
+	var (
+		ctx   context.Context
+		store *storage.StorageService
+		myCA  *ca.CA
+		cfg   ca.ServingConfig
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		cfg = ca.ServingConfig{Subject: subject}
+	})
+
+	It("returns the certificate as stored", func() {
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		got, err := myCA.ServingCertPEM(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal(issued.CertPEM))
+	})
+
+	It("returns an unencrypted key unchanged", func() {
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		got, err := myCA.ServingKeyPEM(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal(issued.KeyPEM))
+	})
+
+	It("decrypts an encrypted key before handing it over", func() {
+		// A kubernetes.io/tls Secret holding an encrypted PEM is useless to
+		// every consumer of one: it would look like a working Secret and fail
+		// at the first handshake. This is a deliberate downgrade, warned about
+		// at startup.
+		myCA.KeyPassphrase = ca.KeyPassphraseConfig{PassphraseFile: passphraseFile("hunter2")}
+		cfg.EncryptKey = true
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		stored, err := store.GetServingKey(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		storedBlock, _ := pem.Decode(stored)
+		Expect(storedBlock.Type).To(Equal("ENCRYPTED PRIVATE KEY"))
+
+		got, err := myCA.ServingKeyPEM(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(got)
+		Expect(block).NotTo(BeNil())
+		Expect(block.Type).NotTo(Equal("ENCRYPTED PRIVATE KEY"))
+
+		// And the exported pair is one a TLS consumer can actually load, which
+		// is the property that matters: an Ingress reading tls.crt/tls.key
+		// does exactly this.
+		certPEM, err := myCA.ServingCertPEM(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(tls.X509KeyPair(certPEM, got)).Error().NotTo(HaveOccurred())
+	})
+
+	It("fails rather than exporting a key it cannot decrypt", func() {
+		myCA.KeyPassphrase = ca.KeyPassphraseConfig{PassphraseFile: passphraseFile("hunter2")}
+		cfg.EncryptKey = true
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		myCA.KeyPassphrase = ca.KeyPassphraseConfig{PassphraseFile: passphraseFile("wrong")}
+		_, err := myCA.ServingKeyPEM(ctx)
+		Expect(err).To(MatchError(ContainSubstring("decrypting the serving key")))
+	})
+})
+
+var _ = Describe("ServingCertUpdated", func() {
+	It("signals a consumer when a certificate is issued, and not when one is reused", func() {
+		// The Kubernetes exporter reconciles on CRL updates, which a serving
+		// rotation does not fire; without this an exported certificate would
+		// sit stale until the next revocation.
+		ctx := context.Background()
+		store := storage.New(GinkgoT().TempDir())
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		cfg := ca.ServingConfig{Subject: "puppet.example.com"}
+
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Eventually(myCA.ServingCertUpdated()).Should(Receive())
+
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Consistently(myCA.ServingCertUpdated()).ShouldNot(Receive(), "a reuse is not a rotation")
+	})
+
+	It("never blocks issuance when nobody is listening", func() {
+		// Buffered to depth 1 and written non-blockingly, so a burst collapses
+		// to one pending notification.
+		ctx := context.Background()
+		store := storage.New(GinkgoT().TempDir())
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		cfg := ca.ServingConfig{Subject: "puppet.example.com"}
+		for i := 0; i < 3; i++ {
+			cfg.RenewBefore = 100 * 365 * 24 * time.Hour
+			Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		}
+		Expect(myCA.ServingCertIssued()).To(BeNumerically(">=", 3))
 	})
 })

@@ -46,6 +46,11 @@ const (
 	// not override them. They follow common Kubernetes trust-bundle conventions.
 	defaultCertKey = "ca.crt"
 	defaultCRLKey  = "ca.crl"
+	// defaultServingCertKey / defaultServingKeyKey follow the kubernetes.io/tls
+	// convention instead, because that is what an Ingress or Gateway reading
+	// the Secret expects to find.
+	defaultServingCertKey = "tls.crt"
+	defaultServingKeyKey  = "tls.key"
 )
 
 // Config is the top-level kubernetes_export configuration block. The feature is
@@ -84,14 +89,39 @@ type Target struct {
 	// kubernetes.io/tls Secret created by Flux): the API server defaults a new
 	// Secret to Opaque, and an existing Secret's type is left untouched.
 	Type string `yaml:"type"`
-	// Cert and CRL select which materials to include. At least one must be true.
+	// Cert and CRL select which materials to include. At least one of the four
+	// material flags must be true.
 	Cert bool `yaml:"cert"`
 	CRL  bool `yaml:"crl"`
+	// ServingCert and ServingKey publish the self-provisioned serving
+	// certificate and its private key, for an Ingress or Gateway that
+	// terminates TLS in front of the CA. Only meaningful with
+	// tls_self_provision enabled.
+	ServingCert bool `yaml:"serving_cert"`
+	ServingKey  bool `yaml:"serving_key"`
 	// CertKey and CRLKey name the data entries for the cert and CRL. Empty
 	// selects defaultCertKey / defaultCRLKey.
 	CertKey string `yaml:"cert_key"`
 	CRLKey  string `yaml:"crl_key"`
+	// ServingCertKey and ServingKeyKey name the data entries for the serving
+	// material. Empty selects defaultServingCertKey / defaultServingKeyKey.
+	ServingCertKey string `yaml:"serving_cert_key"`
+	ServingKeyKey  string `yaml:"serving_key_key"`
 }
+
+// wantsServingKey reports whether any target publishes the serving private key.
+// Used at startup to warn that an encrypted key is decrypted before publishing.
+func (c *Config) wantsServingKey() bool {
+	for i := range c.Targets {
+		if c.Targets[i].ServingKey {
+			return true
+		}
+	}
+	return false
+}
+
+// WantsServingKey reports whether any target publishes the serving private key.
+func (c *Config) WantsServingKey() bool { return c != nil && c.wantsServingKey() }
 
 // Enabled reports whether any export target is configured.
 func (c *Config) Enabled() bool {
@@ -129,11 +159,27 @@ func (t *Target) validate() error {
 	if strings.TrimSpace(t.Metadata.Name) == "" {
 		return fmt.Errorf("metadata.name is required")
 	}
-	if !t.Cert && !t.CRL {
-		return fmt.Errorf("at least one of cert or crl must be true")
+	if !t.Cert && !t.CRL && !t.ServingCert && !t.ServingKey {
+		return fmt.Errorf("at least one of cert, crl, serving_cert or serving_key must be true")
 	}
 	if t.Type != "" && t.Kind != KindSecret {
 		return fmt.Errorf("type is only valid for Secret targets")
+	}
+
+	// A ConfigMap is world-readable to anything that can get it and is not
+	// encrypted at rest. A private key does not belong in one.
+	if t.ServingKey && t.Kind != KindSecret {
+		return fmt.Errorf("serving_key is only valid for Secret targets, not a %s", t.Kind)
+	}
+
+	// SECURITY: a Secret holding ca.crt is routinely mounted widely — it is
+	// public trust material and workloads across the cluster read it. Letting
+	// it quietly acquire a tls.key entry would extend the serving key's reach
+	// to every one of them. Two targets cost nothing.
+	if t.ServingKey && (t.Cert || t.CRL) {
+		return fmt.Errorf("serving_key cannot be combined with cert or crl in one target: " +
+			"a Secret carrying public trust material is mounted far more widely than " +
+			"one carrying a private key. Use two targets")
 	}
 
 	if t.Cert && t.CertKey == "" {
@@ -142,10 +188,43 @@ func (t *Target) validate() error {
 	if t.CRL && t.CRLKey == "" {
 		t.CRLKey = defaultCRLKey
 	}
+	if t.ServingCert && t.ServingCertKey == "" {
+		t.ServingCertKey = defaultServingCertKey
+	}
+	if t.ServingKey && t.ServingKeyKey == "" {
+		t.ServingKeyKey = defaultServingKeyKey
+	}
 
-	// A single object cannot store both materials under the same key.
-	if t.Cert && t.CRL && t.CertKey == t.CRLKey {
-		return fmt.Errorf("cert_key and crl_key must differ (both %q)", t.CertKey)
+	// A single object cannot store two materials under the same key. Checked
+	// across every requested pair rather than just cert/crl, because the
+	// defaults now come from two different conventions and an operator
+	// overriding one could collide with any of the others.
+	if err := t.checkDistinctKeys(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkDistinctKeys reports the first data key claimed by two materials.
+func (t *Target) checkDistinctKeys() error {
+	seen := make(map[string]string, 4)
+	for _, e := range []struct {
+		want bool
+		name string
+		key  string
+	}{
+		{t.Cert, "cert_key", t.CertKey},
+		{t.CRL, "crl_key", t.CRLKey},
+		{t.ServingCert, "serving_cert_key", t.ServingCertKey},
+		{t.ServingKey, "serving_key_key", t.ServingKeyKey},
+	} {
+		if !e.want {
+			continue
+		}
+		if prev, ok := seen[e.key]; ok {
+			return fmt.Errorf("%s and %s must differ (both %q)", prev, e.name, e.key)
+		}
+		seen[e.key] = e.name
 	}
 	return nil
 }

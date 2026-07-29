@@ -78,6 +78,12 @@ func (t *Target) entries(m materials) map[string][]byte {
 	if t.CRL {
 		out[t.CRLKey] = m.crl
 	}
+	if t.ServingCert {
+		out[t.ServingCertKey] = m.servingCert
+	}
+	if t.ServingKey {
+		out[t.ServingKeyKey] = m.servingKey
+	}
 	return out
 }
 
