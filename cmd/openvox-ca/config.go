@@ -53,6 +53,45 @@ type serverConfig struct {
 	OCSPUrl           string `yaml:"ocsp_url"`
 	CRLUrl            string `yaml:"crl_url"`
 
+	// TLSSelfProvision makes the CA issue its own serving certificate from its
+	// own CA key and serve it from memory, instead of loading tls_cert/tls_key
+	// from disk. It exists for deployments where nothing else can issue that
+	// certificate: with the CA key at a provider, cert-manager cannot act as a
+	// CA issuer, and "openvox-ca-ctl generate" needs an admin client
+	// certificate that does not exist until the server is already serving.
+	//
+	// Mutually exclusive with tls_cert/tls_key — see serverConfig.validateTLS.
+	TLSSelfProvision bool `yaml:"tls_self_provision"`
+
+	// TLSSelfProvisionNames are extra DNS SANs beyond hostname, for the service
+	// and ingress names clients actually dial.
+	TLSSelfProvisionNames []string `yaml:"tls_self_provision_names"`
+
+	// TLSSelfProvisionRenewBeforeSec reissues the serving certificate once its
+	// remaining validity falls below this. 0 selects one third of the leaf
+	// validity, matching crl_refresh_before_sec's relationship to crl_validity.
+	TLSSelfProvisionRenewBeforeSec int `yaml:"tls_self_provision_renew_before_sec"`
+
+	// TLSSelfProvisionEncryptKey encrypts the serving private key at rest, the
+	// same way encrypt_ca_key does for the CA key. It requires an explicit
+	// passphrase source and refuses the auto-generated one, because that lives
+	// in cadir: with an ephemeral cadir each replica would encrypt under a
+	// different passphrase and none could read the shared blob after a restart.
+	TLSSelfProvisionEncryptKey bool `yaml:"tls_self_provision_encrypt_key"`
+
+	// TLSSelfProvisionRevokeAfterSec revokes a superseded serving certificate
+	// this long after it is replaced. 0 never revokes. The delay exists because
+	// the swap is per-process: a sibling replica may still be serving the old
+	// certificate, and revoking immediately would break every client that does
+	// revocation checking. See serverConfig.validateTLS for the lower bound.
+	TLSSelfProvisionRevokeAfterSec int `yaml:"tls_self_provision_revoke_after_sec"`
+
+	// MaintenanceIntervalSec is how often the shared maintenance loop runs.
+	// Named for the loop rather than for any one of its tenants: gating the
+	// interval — or the goroutine — on a single feature is how the tasks that
+	// do not belong to that feature stop running. 0 = built-in default (1h).
+	MaintenanceIntervalSec int `yaml:"maintenance_interval_sec"`
+
 	// MetricsListen, when non-empty, enables the Prometheus exporter on the
 	// given address (e.g. "127.0.0.1:9140" or ":9140"). The exporter serves
 	// /metrics over plain HTTP on a separate listener from the Puppet API and is
@@ -184,21 +223,89 @@ func (c *serverConfig) shutdownDrain() time.Duration {
 	return defaultShutdownDrain
 }
 
-// tlsEnabled reports whether the API listener will speak TLS.
+// defaultMaintenanceInterval is how often the shared maintenance loop runs when
+// the operator has not configured an interval. One hour matches the CRL
+// refresher's cadence and is well inside every window the loop's tasks care
+// about; it also sets the two-hour floor on tls_self_provision_revoke_after_sec.
+const defaultMaintenanceInterval = time.Hour
+
+// maintenanceInterval resolves how often the shared maintenance loop runs.
+func (c *serverConfig) maintenanceInterval() time.Duration {
+	if c.MaintenanceIntervalSec > 0 {
+		return time.Duration(c.MaintenanceIntervalSec) * time.Second
+	}
+	return defaultMaintenanceInterval
+}
+
+// tlsEnabled reports whether the API listener will speak TLS, by either route:
+// certificate and key files on disk, or a self-provisioned certificate the CA
+// issues to itself and serves from memory.
 //
 // This exists as one predicate because it used to be five copies of
 // `cfg.TLSCert != "" && cfg.TLSKey != ""` scattered through the startup path,
-// each driving something different: refusing plain HTTP off loopback, setting
-// Server.PlainHTTP, installing the authorisation middleware, building
-// tls.Config, and choosing ListenAndServeTLS over ListenAndServe.
-//
-// The cost of missing one is not uniform. The third gates srv.AuthConfig, and a
-// nil AuthConfig disables the authorisation middleware outright — so a listener
-// would come up on TLS with every endpoint unauthenticated. Collapsing the five
-// into one predicate makes that class of omission unrepresentable, which
-// matters as soon as there is more than one way to enable TLS.
+// and they do very different things: refuse to serve plain HTTP off loopback,
+// set Server.PlainHTTP, install the authorisation middleware, build
+// tls.Config, and choose ListenAndServeTLS over ListenAndServe. Adding a second
+// way to enable TLS meant teaching all five, and the cost of missing one is not
+// uniform — the third gates srv.AuthConfig, and a nil AuthConfig disables the
+// authorisation middleware outright, so a listener would come up on TLS with
+// every endpoint unauthenticated. One predicate makes that class of omission
+// unrepresentable.
 func (c *serverConfig) tlsEnabled() bool {
-	return c.TLSCert != "" && c.TLSKey != ""
+	return c.TLSSelfProvision || (c.TLSCert != "" && c.TLSKey != "")
+}
+
+// validateTLS rejects TLS configurations that cannot mean what they say.
+//
+// Called before anything is opened, so a bad combination is a startup error
+// rather than a silent precedence rule discovered from a packet capture.
+func (c *serverConfig) validateTLS() error {
+	if !c.TLSSelfProvision {
+		return nil
+	}
+
+	// One route supplies the certificate in memory, the other from disk. There
+	// is no sensible merge, and picking a winner silently would leave an
+	// operator serving material they did not think was in play.
+	if c.TLSCert != "" || c.TLSKey != "" {
+		return fmt.Errorf("tls_self_provision cannot be combined with tls_cert/tls_key: " +
+			"the CA either issues its own serving certificate or loads one from disk, not both")
+	}
+
+	// bootstrapCA falls back to the subject "puppet" when hostname is unset,
+	// which would produce a serving certificate no client validates — surfacing
+	// as a TLS handshake failure rather than as the configuration error it is.
+	if c.Hostname == "" {
+		return fmt.Errorf("tls_self_provision requires hostname to be set: it is the common name and " +
+			"first subject alternative name of the certificate clients will verify")
+	}
+
+	// The auto-generated passphrase lives in cadir. With an ephemeral cadir --
+	// the deployment this whole feature targets -- each replica would generate
+	// its own and none could read the shared blob after a restart, so the
+	// encrypted key would be permanently unreadable rather than merely awkward.
+	if c.TLSSelfProvisionEncryptKey && c.CAKeyPassphraseFile == "" && os.Getenv("PUPPET_CA_KEY_PASSPHRASE") == "" {
+		return fmt.Errorf("tls_self_provision_encrypt_key requires an explicit passphrase: set " +
+			"ca_key_passphrase_file or PUPPET_CA_KEY_PASSPHRASE. The auto-generated passphrase is " +
+			"written into cadir, so replicas sharing a storage backend could not read each other's key")
+	}
+
+	// A superseded certificate must stay valid long enough for every replica to
+	// have noticed its replacement, which takes up to one maintenance interval.
+	// A shorter delay reintroduces exactly the cross-replica breakage the delay
+	// exists to prevent. The factor of two is margin for a replica whose cycle
+	// has only just begun.
+	if c.TLSSelfProvisionRevokeAfterSec > 0 {
+		minimum := 2 * c.maintenanceInterval()
+		if configured := time.Duration(c.TLSSelfProvisionRevokeAfterSec) * time.Second; configured < minimum {
+			return fmt.Errorf("tls_self_provision_revoke_after_sec (%s) must be at least twice "+
+				"maintenance_interval_sec (%s), or a replica could still be serving the superseded "+
+				"certificate when it is revoked; use 0 to never revoke",
+				configured, minimum)
+		}
+	}
+
+	return nil
 }
 
 // defaultCRLRefreshInterval is how often the background job checks whether the
@@ -282,6 +389,34 @@ func applyServerEnv(cfg *serverConfig) {
 	}
 	if v := os.Getenv("PUPPET_CA_TLS_KEY"); v != "" {
 		cfg.TLSKey = v
+	}
+	if v := os.Getenv("PUPPET_CA_TLS_SELF_PROVISION"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.TLSSelfProvision = b
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_TLS_SELF_PROVISION_NAMES"); v != "" {
+		cfg.TLSSelfProvisionNames = splitAndTrim(v, ",")
+	}
+	if v := os.Getenv("PUPPET_CA_TLS_SELF_PROVISION_RENEW_BEFORE_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TLSSelfProvisionRenewBeforeSec = n
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_TLS_SELF_PROVISION_ENCRYPT_KEY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.TLSSelfProvisionEncryptKey = b
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_TLS_SELF_PROVISION_REVOKE_AFTER_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TLSSelfProvisionRevokeAfterSec = n
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_MAINTENANCE_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MaintenanceIntervalSec = n
+		}
 	}
 	if v := os.Getenv("PUPPET_CA_PUPPET_SERVER"); v != "" {
 		cfg.PuppetServer = v

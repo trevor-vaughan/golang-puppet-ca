@@ -71,6 +71,9 @@ type Collector struct {
 
 	crlUpdateFailures *prometheus.Desc
 
+	servingCertIssued      *prometheus.Desc
+	servingRenewalFailures *prometheus.Desc
+
 	caInfo      *prometheus.Desc
 	caNotBefore *prometheus.Desc
 	caNotAfter  *prometheus.Desc
@@ -111,6 +114,19 @@ func NewCollector(c *ca.CA) *Collector {
 				"that could not be re-signed or written (across revoke, cleanup, reissue and refresh). "+
 				"A rising value means the CRL is not being maintained; for revocations it means a "+
 				"superseded certificate may still be a valid credential.",
+			nil, nil),
+		servingCertIssued: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "serving_cert", "issued_total"),
+			"Total serving certificates this process has issued to itself (tls_self_provision). "+
+				"A sustained rate rather than an occasional increment means replicas disagree about "+
+				"which CA certificate is current, each reissuing over the other; a fleet restart resolves it.",
+			nil, nil),
+		servingRenewalFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "serving_cert", "renewal_failures_total"),
+			"Total maintenance passes that failed to renew the serving certificate. The existing "+
+				"certificate stays in place and the next cycle retries, so alert on a persistent rise: "+
+				"it is invisible until the certificate expires, and it breaks the bound that "+
+				"tls_self_provision_revoke_after_sec relies on.",
 			nil, nil),
 		caInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "ca_certificate", "info"),
@@ -171,6 +187,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.scrapeDuration
 	ch <- c.caReady
 	ch <- c.crlUpdateFailures
+	ch <- c.servingCertIssued
+	ch <- c.servingRenewalFailures
 	ch <- c.caInfo
 	ch <- c.caNotBefore
 	ch <- c.caNotAfter
@@ -204,6 +222,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// backend must not blind operators to CRL-maintenance failures.
 	ch <- prometheus.MustNewConstMetric(c.crlUpdateFailures, prometheus.CounterValue,
 		float64(c.ca.CRLUpdateFailures()))
+	ch <- prometheus.MustNewConstMetric(c.servingCertIssued, prometheus.CounterValue,
+		float64(c.ca.ServingCertIssued()))
+	ch <- prometheus.MustNewConstMetric(c.servingRenewalFailures, prometheus.CounterValue,
+		float64(c.ca.ServingRenewalFailureCount()))
 
 	if err != nil {
 		slog.Warn("Prometheus CA metrics scrape failed", "error", err)

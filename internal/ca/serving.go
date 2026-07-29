@@ -277,6 +277,7 @@ func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig) (*Se
 		return nil, fmt.Errorf("parsing freshly issued serving certificate: %w", err)
 	}
 
+	c.servingCertIssued.Add(1)
 	return &ServingCertificate{CertPEM: certPEM, KeyPEM: keyPEM, Leaf: leaf, Key: key, Issued: true}, nil
 }
 
