@@ -52,6 +52,10 @@ var fsLayout = map[string]string{
 	KeyInventory:     "inventory.txt",
 	KeyInventoryHMAC: ".inventory.hmac",
 	KeyHMACKey:       "private/.inventory_hmac_key",
+
+	KeyServingCert:       "serving_cert.pem",
+	KeyServingKey:        "private/serving_key.pem",
+	KeyServingSuperseded: "serving_superseded.json",
 }
 
 // FilesystemBackend stores blobs as files under a single base directory.

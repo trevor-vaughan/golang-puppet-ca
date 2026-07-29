@@ -41,6 +41,11 @@ func seedCA(b Backend) map[string][]byte {
 		KeyInventory:     []byte("0xABC /CN=a\n"),
 		KeyInventoryHMAC: []byte("hmac-bytes"),
 		KeyHMACKey:       []byte("hmac-key-bytes"),
+
+		KeyServingCert:       []byte("serving-cert-pem"),
+		KeyServingKey:        []byte("serving-key-pem"),
+		KeyServingSuperseded: []byte(`[{"serial":"0A","revoke_at":"2026-01-01T00:00:00Z"}]`),
+
 		CSRKey("web01"):  []byte("csr-web01"),
 		CSRKey("web02"):  []byte("csr-web02"),
 		CertKey("web01"): []byte("cert-web01"),
@@ -61,9 +66,9 @@ var _ = Describe("MigrateCopiesEverything", func() {
 
 		report, err := Migrate(ctx, src, dst, MigrateOptions{})
 		Expect(err).NotTo(HaveOccurred(), "Migrate")
-		Expect(report.Singletons).To(Equal(8), "want 8 singletons, 2 CSRs, 1 cert")
-		Expect(report.CSRs).To(Equal(2), "want 8 singletons, 2 CSRs, 1 cert")
-		Expect(report.Certs).To(Equal(1), "want 8 singletons, 2 CSRs, 1 cert")
+		Expect(report.Singletons).To(Equal(11), "want 11 singletons, 2 CSRs, 1 cert")
+		Expect(report.CSRs).To(Equal(2), "want 11 singletons, 2 CSRs, 1 cert")
+		Expect(report.Certs).To(Equal(1), "want 11 singletons, 2 CSRs, 1 cert")
 		Expect(report.Total()).To(Equal(len(want)))
 
 		for k, v := range want {
@@ -99,6 +104,9 @@ var _ = Describe("MigratePreservesVisibility", func() {
 			{KeyCAKey, FilePermPrivate},
 			{KeyInventory, FilePermPrivate},
 			{KeyHMACKey, FilePermPrivate},
+			{KeyServingCert, FilePermPublic},
+			{KeyServingKey, FilePermPrivate},
+			{KeyServingSuperseded, FilePermPrivate},
 		}
 		for _, c := range cases {
 			p := dst.Path(c.key)
@@ -256,6 +264,24 @@ var _ = Describe("MigrateRoundTripsLocalFileLayout", func() {
 		for _, rel := range []string{"ca_crt.pem", filepath.Join("private", "ca_key.pem"), filepath.Join("requests", "web01.pem")} {
 			_, err := os.Stat(filepath.Join(dstDir, rel))
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("expected %s on disk", rel))
+		}
+	})
+})
+
+// Every fixed blob a backend can hold must be migratable. migratableSingletons
+// is an explicit, exhaustive list, so a key added to the layout and forgotten
+// here is not a build error and not a test failure — it is silently dropped by
+// `openvox-ca-ctl migrate`. For serving_key that would mean a migrated
+// deployment could not serve TLS, with nothing reported.
+var _ = Describe("migratableSingletons", func() {
+	It("covers every singleton in the filesystem layout", func() {
+		listed := map[string]bool{}
+		for _, s := range migratableSingletons {
+			listed[s.Key] = true
+		}
+		for key := range fsLayout {
+			Expect(listed).To(HaveKey(key),
+				fmt.Sprintf("%q is in fsLayout but not migratableSingletons, so migrate would drop it", key))
 		}
 	})
 })

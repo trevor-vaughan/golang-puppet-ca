@@ -20,6 +20,9 @@ interface. Every backend serves the following logical keys:
 | `inventory` | Append-only log of issued/revoked certificates | sign / revoke |
 | `inventory_hmac` | Inventory integrity head (blob HMAC or hash chain on SQL) | sign / revoke |
 | `hmac_key` | Integrity key for `inventory_hmac` | first run |
+| `serving_cert` | Serving certificate the API listener presents (PEM) | `tls_self_provision` |
+| `serving_key` | Serving private key (PEM, optionally AES-256-GCM encrypted) | `tls_self_provision` |
+| `serving_superseded` | Pending revocations for replaced serving certificates (JSON) | `tls_self_provision` |
 | `csr/<subject>` | Pending certificate signing request (PEM), per subject | CSR submission |
 | `cert/<subject>` | Issued certificate (PEM), per subject | sign |
 
@@ -36,8 +39,11 @@ keys are whole-blob read/write/delete.
 ├── serial                          (KeySerial)
 ├── inventory.txt                   (KeyInventory)
 ├── .inventory.hmac                 (KeyInventoryHMAC)
+├── serving_cert.pem                (KeyServingCert)
+├── serving_superseded.json         (KeyServingSuperseded)
 ├── private/
 │   ├── ca_key.pem                  (KeyCAKey)          0600
+│   ├── serving_key.pem             (KeyServingKey)     0600
 │   ├── .inventory_hmac_key         (KeyHMACKey)        0600
 │   └── <subject>_key.pem           server-gen keys     0600
 ├── requests/
@@ -62,6 +68,9 @@ With the default prefix `/puppet-ca`:
 | `inventory` | `/puppet-ca/inventory/data` |
 | `inventory_hmac` | `/puppet-ca/inventory/hmac` |
 | `hmac_key` | `/puppet-ca/private/hmac_key` |
+| `serving_cert` | `/puppet-ca/serving/cert` |
+| `serving_key` | `/puppet-ca/private/serving_key` |
+| `serving_superseded` | `/puppet-ca/serving/superseded` |
 | `csr/<subject>` | `/puppet-ca/requests/<subject>` |
 | `cert/<subject>` | `/puppet-ca/signed/<subject>` |
 
@@ -111,6 +120,9 @@ separator):
 | `inventory` | `puppet-ca:inventory:data` |
 | `inventory_hmac` | `puppet-ca:inventory:hmac` |
 | `hmac_key` | `puppet-ca:private:hmac_key` |
+| `serving_cert` | `puppet-ca:serving:cert` |
+| `serving_key` | `puppet-ca:private:serving_key` |
+| `serving_superseded` | `puppet-ca:serving:superseded` |
 | `csr/<subject>` | `puppet-ca:requests:<subject>` |
 | `cert/<subject>` | `puppet-ca:signed:<subject>` |
 

@@ -62,6 +62,31 @@ const (
 	KeyInventoryHMAC = "inventory_hmac"
 	KeyHMACKey       = "hmac_key"
 
+	// KeyServingCert and KeyServingKey hold the certificate and private key the
+	// API listener serves when tls_self_provision is on.
+	//
+	// Deliberately not the per-subject cert/key blobs: CA.Clean and
+	// CleanupExpiredCerts both act on per-subject material and would otherwise
+	// be able to delete the certificate the listener is using, as a side effect
+	// of routine administration. Separate keys make that structurally
+	// impossible rather than merely unlikely.
+	//
+	// Named serving_* and not tls_*, because tls_cert and tls_key already name
+	// the server's certificate *file paths* in the configuration, and one term
+	// with three meanings helps nobody.
+	KeyServingCert = "serving_cert"
+	KeyServingKey  = "serving_key"
+
+	// KeyServingSuperseded holds pending revocations for serving certificates
+	// that have been replaced: a small JSON list of {serial, revoke_at}.
+	//
+	// Durable and shared because the replica that minted the replacement may
+	// die before the delay elapses, and a restarted replica would otherwise
+	// have no idea a supersession was pending. It cannot be derived from the
+	// inventory either: issueLeafLocked backdates NotBefore by a fixed 24
+	// hours, so the recorded timestamp is not the issue time.
+	KeyServingSuperseded = "serving_superseded"
+
 	csrPrefix  = "csr/"
 	certPrefix = "cert/"
 )
