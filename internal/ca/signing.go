@@ -304,6 +304,16 @@ func (c *CA) signWithDuration(ctx context.Context, subject string, ttl time.Dura
 // copied onto an issued leaf certificate. Bundling them keeps issueLeafLocked's
 // signature manageable and ensures every SAN type is threaded through together,
 // rather than DNS names alone.
+// extKeyUsageOrDefault resolves issueLeafLocked's variadic eku override to the
+// list that goes in the certificate. No override means the long-standing
+// serverAuth + clientAuth pair.
+func extKeyUsageOrDefault(eku []x509.ExtKeyUsage) []x509.ExtKeyUsage {
+	if len(eku) == 0 {
+		return []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+	}
+	return eku
+}
+
 type subjectAltNames struct {
 	DNSNames       []string
 	IPAddresses    []net.IP
@@ -316,10 +326,17 @@ type subjectAltNames struct {
 // appends the inventory entry and updates the in-memory serial index.
 // ttl=0 means use the default certValidity. c.mu must be held by the caller.
 //
+// eku overrides the extended key usage; omitting it keeps the serverAuth +
+// clientAuth pair every agent certificate has always carried. The override
+// exists for the CA's own serving certificate, which must not be a usable
+// client credential: its common name is the CA's hostname, and in a deployment
+// where that hostname also appears in puppet_server, a clientAuth certificate
+// sitting in the storage backend would be an admin credential.
+//
 // This is the tail shared by signWithDuration (inputs come from a submitted
 // CSR, after CSR-specific validation) and AutoRenew (inputs come from an
 // already-issued certificate's public key, with no CSR involved at all).
-func (c *CA) issueLeafLocked(ctx context.Context, subject string, subjectName pkix.Name, pubKey any, sans subjectAltNames, extraExtensions []pkix.Extension, ttl time.Duration) ([]byte, error) {
+func (c *CA) issueLeafLocked(ctx context.Context, subject string, subjectName pkix.Name, pubKey any, sans subjectAltNames, extraExtensions []pkix.Extension, ttl time.Duration, eku ...x509.ExtKeyUsage) ([]byte, error) {
 	// Defensive: a nil CACert here means the caller skipped Init() (or it
 	// failed). Without this guard the c.CACert.NotAfter dereference below
 	// would panic the entire frontend.
@@ -368,7 +385,7 @@ func (c *CA) issueLeafLocked(ctx context.Context, subject string, subjectName pk
 		NotAfter:     now.Add(validity),
 
 		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage: extKeyUsageOrDefault(eku),
 
 		BasicConstraintsValid: true,
 		IsCA:                  false,
