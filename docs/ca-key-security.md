@@ -62,6 +62,30 @@ today; see [OpenBao Transit-engine key custody](#openbao-transit-engine-key-cust
 below) or consider a hardware security module (HSM) via PKCS#11 (planned; see
 [Planned: PKCS#11 / HSM support](#planned-pkcs11--hsm-support) below).
 
+## The serving private key
+
+When `tls_self_provision` is enabled the CA also holds a **serving** private
+key — the one its own HTTPS listener presents. It lives in the storage backend
+as `serving_key`, alongside `ca_key`, and `tls_self_provision_encrypt_key`
+encrypts it at rest using exactly the machinery described above.
+
+Two things are worth stating plainly:
+
+- With encryption off and a SQL backend, that key is stored in your database in
+  plaintext. **This is the same posture `ca_key` has by default**, since
+  `encrypt_ca_key` is also off unless enabled. An operator who has accepted it
+  for the CA key has already made this decision; it is one blob over, not a new
+  class of exposure.
+- The serving key is far less valuable than the CA key. It authenticates one
+  host for one hostname and can be replaced at will — revoke the CA's own
+  hostname and the next maintenance pass issues a new one. Compromising the CA
+  key means reissuing every certificate in the fleet.
+
+`tls_self_provision_encrypt_key` requires an explicit passphrase source; it
+refuses the auto-generated one, because that passphrase is written into `cadir`
+and replicas with an ephemeral `cadir` could not read each other's key. See
+[configuration](configuration.md#self-provisioned-serving-certificate).
+
 ## OpenBao Transit-engine key custody
 
 `--ca-key-provider openbao` delegates the CA private key entirely to an
