@@ -621,6 +621,11 @@ func newRootCmd() *cobra.Command {
 			// route, so the decision is taken by serverAuthConfig against
 			// cfg.tlsEnabled() rather than by a second condition here that could
 			// drift from it.
+			//
+			// The holder is declared here rather than inside the TLS block below so
+			// the Kubernetes exporter can read the same pair the listener presents.
+			servingCerts := &servingCertHolder{}
+
 			authCfg, err := serverAuthConfig(cfg, myCA)
 			if err != nil {
 				return err
@@ -679,7 +684,9 @@ func newRootCmd() *cobra.Command {
 				// itself. Both routes end at the same holder, so GetCertificate
 				// is the only path the TLS stack ever takes and self-provisioned
 				// rotation needs no special case in the handshake.
-				servingCerts := &servingCertHolder{}
+				//
+				// Declared outside this block so the Kubernetes exporter can
+				// read the same pair the listener is presenting.
 				if cfg.TLSSelfProvision {
 					// Fatal on failure: a server with no serving certificate
 					// cannot serve, and failing fast beats a listener that never
@@ -793,10 +800,22 @@ func newRootCmd() *cobra.Command {
 				if err != nil {
 					slog.Error("Kubernetes export disabled: failed to initialise client", "error", err)
 				} else {
-					// The CA, not the storage service, supplies serving
-					// material: the key has to be decrypted before publication
-					// and only the CA holds the passphrase.
-					go runK8sExporter(ctx, myCA, k8sExporter.WithServingSource(myCA))
+					// The holder, not the CA or the storage service, supplies
+					// serving material: it swaps the certificate and its key as
+					// one atomic pointer, so an export can never publish a
+					// tls.crt and tls.key from different keypairs. It also
+					// already holds the decrypted signer, so encryption at rest
+					// costs the export path nothing.
+					//
+					// Attached only when self-provisioning is on. Without it the
+					// holder is empty, and leaving the source nil lets
+					// fetchMaterials say why — "serving_cert and serving_key
+					// require tls_self_provision" — rather than reporting a
+					// missing certificate.
+					if cfg.TLSSelfProvision {
+						k8sExporter = k8sExporter.WithServingSource(servingCerts)
+					}
+					go runK8sExporter(ctx, myCA, k8sExporter)
 				}
 			}
 

@@ -1088,6 +1088,30 @@ func (Chart) Test() error {
 			sets:  []string{tls},
 			wants: []string{"failureThreshold: 90"},
 		},
+		chartRenderCase{
+			name: "self-provisioning set through extraEnv also counts as TLS",
+			// extraEnv is a list of full EnvVar objects, scanned separately from
+			// the .Values.env map. Only the map was exercised, so a helper that
+			// ignored the list entirely would have rendered HTTP probes against
+			// an HTTPS listener with the suite green.
+			sets: []string{
+				"config.hostname=ca.example.com",
+				"extraEnv[0].name=PUPPET_CA_TLS_SELF_PROVISION",
+				"extraEnv[0].value=true",
+			},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
+			name: "an explicit false is off, not merely present",
+			// The string-parsing arm. Treating any value as enabled would make
+			// PUPPET_CA_TLS_SELF_PROVISION=false render as self-provisioning,
+			// which then demands no certificate and fails at startup.
+			sets: []string{
+				tls,
+				"env.PUPPET_CA_TLS_SELF_PROVISION=false",
+			},
+			wants: []string{"secretName: openvox-ca-tls"},
+		},
 	)
 
 	rejects := []chartRejectCase{
@@ -1152,6 +1176,21 @@ func (Chart) Test() error {
 			name:    "self-provisioning alongside a certificate path",
 			sets:    []string{"config.tls_self_provision=true", "config.hostname=ca.example.com", "config.tls_cert=/tls/tls.crt"},
 			wantErr: "cannot be combined",
+		},
+		{
+			name: "self-provisioning set by valueFrom, which the chart cannot read",
+			// The chart decides here whether to mount tls.existingSecret and how
+			// to shape the probes. A value it cannot see at render time would
+			// silently produce the wrong manifests, so it refuses rather than
+			// guessing — previously it read an absent .value as "off" and the
+			// install failed with no clue why.
+			sets: []string{
+				"config.hostname=ca.example.com",
+				"extraEnv[0].name=PUPPET_CA_TLS_SELF_PROVISION",
+				"extraEnv[0].valueFrom.secretKeyRef.name=flags",
+				"extraEnv[0].valueFrom.secretKeyRef.key=self-provision",
+			},
+			wantErr: "cannot read at render time",
 		},
 		{
 			name:    "a mistyped value the schema should catch",

@@ -1368,11 +1368,23 @@ var _ = Describe("ServingCertUpdated", func() {
 		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 		Expect(myCA.Init(ctx)).To(Succeed())
 
+		// Each pass is forced by widening the name set, so the stored
+		// certificate no longer covers the configuration. An over-large
+		// RenewBefore would not: servingRenewBefore clamps it, precisely so a
+		// window at or beyond the lifetime cannot make every certificate
+		// permanently due. Three real issuances are what makes this spec mean
+		// anything — with one, the buffered send always succeeds and the
+		// non-blocking default arm is never reached.
 		cfg := ca.ServingConfig{Subject: "puppet.example.com"}
 		for i := 0; i < 3; i++ {
-			cfg.RenewBefore = 100 * 365 * 24 * time.Hour
+			cfg.ExtraNames = append(cfg.ExtraNames, fmt.Sprintf("alt%d.example.com", i))
 			Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
 		}
 		Expect(myCA.ServingCertIssued()).To(BeNumerically(">=", 3))
+
+		// Exactly one notification survives the burst, which is the property
+		// the depth-1 buffer exists for.
+		Eventually(myCA.ServingCertUpdated()).Should(Receive())
+		Consistently(myCA.ServingCertUpdated()).ShouldNot(Receive())
 	})
 })

@@ -48,12 +48,18 @@ type MaterialSource interface {
 // ServingSource additionally provides the self-provisioned serving certificate
 // and its private key. It is separate from MaterialSource because the key must
 // be handed over *decrypted* — a kubernetes.io/tls Secret holding an encrypted
-// PEM is useless to every consumer of one — and only the CA can decrypt it.
-// The storage service satisfies MaterialSource alone, so a deployment that
-// exports no serving material needs no extra wiring.
+// PEM is useless to every consumer of one. The storage service satisfies
+// MaterialSource alone, so a deployment that exports no serving material needs
+// no extra wiring.
+//
+// One method returning both, deliberately, rather than two. Reading them
+// separately means two round trips with a rotation possible in between, which
+// publishes a tls.crt and a tls.key from different keypairs — a Secret that
+// looks well-formed and fails every handshake against it. The implementation
+// serves both from the pair the listener itself is using, which is swapped
+// atomically, so there is no window to lose.
 type ServingSource interface {
-	ServingCertPEM(ctx context.Context) ([]byte, error)
-	ServingKeyPEM(ctx context.Context) ([]byte, error)
+	ServingMaterial(ctx context.Context) (certPEM, keyPEM []byte, err error)
 }
 
 // Exporter reconciles the configured Secret/ConfigMap targets with the current
@@ -118,16 +124,24 @@ func (c *Config) needsDefaultNamespace() bool {
 // reads each material at most once. A failure applying one target is logged and
 // collected but does not prevent the others from being applied; the joined error
 // (or nil) is returned.
+//
+// A material that cannot be read fails only the targets that asked for it. The
+// obvious alternative — return early from the whole cycle — is what this used to
+// do, and it is worse in a way that is hard to see: recordApply never runs, so
+// no per-target series is written, and both arms of the shipped alert put
+// last_error on the left-hand side. A single transient read leaves every target
+// stale with nothing firing, and because cycles are edge-triggered on CRL and
+// serving-certificate changes, the next one may be a long time coming.
 func (e *Exporter) ExportAll(ctx context.Context) error {
-	m, err := e.fetchMaterials(ctx)
-	if err != nil {
-		return err
-	}
+	m, matErrs := e.fetchMaterials(ctx)
 
 	var errs []error
 	for i := range e.cfg.Targets {
 		t := &e.cfg.Targets[i]
-		err := e.applyTarget(ctx, t, m)
+		err := matErrs.forTarget(t)
+		if err == nil {
+			err = e.applyTarget(ctx, t, m)
+		}
 		e.metrics.recordApply(t, e.namespaceFor(t), err)
 		if err != nil {
 			slog.Warn("Kubernetes export failed for target",
@@ -152,9 +166,40 @@ type materials struct {
 	servingKey  []byte
 }
 
+// materialErrors records, per material, why it could not be read. A target is
+// failed only by the materials it actually requests, so one unreadable blob
+// does not silence the targets that never needed it.
+type materialErrors struct {
+	cert        error
+	crl         error
+	servingCert error
+	servingKey  error
+}
+
+// forTarget returns the first read failure affecting t, or nil.
+func (me materialErrors) forTarget(t *Target) error {
+	switch {
+	case t.Cert && me.cert != nil:
+		return me.cert
+	case t.CRL && me.crl != nil:
+		return me.crl
+	case t.ServingCert && me.servingCert != nil:
+		return me.servingCert
+	case t.ServingKey && me.servingKey != nil:
+		return me.servingKey
+	}
+	return nil
+}
+
 // fetchMaterials reads each material only if some target requires it.
-func (e *Exporter) fetchMaterials(ctx context.Context) (materials, error) {
+//
+// Read failures are returned alongside whatever succeeded rather than aborting,
+// so ExportAll can still apply the targets that do not depend on the missing
+// material — and, more importantly, can record a per-target failure for the ones
+// that do. See ExportAll for why that matters to the alert.
+func (e *Exporter) fetchMaterials(ctx context.Context) (materials, materialErrors) {
 	var m materials
+	var errs materialErrors
 	var wantCert, wantCRL, wantServingCert, wantServingKey bool
 	for i := range e.cfg.Targets {
 		wantCert = wantCert || e.cfg.Targets[i].Cert
@@ -165,38 +210,38 @@ func (e *Exporter) fetchMaterials(ctx context.Context) (materials, error) {
 	if wantCert {
 		certPEM, err := e.src.GetCACert(ctx)
 		if err != nil {
-			return materials{}, fmt.Errorf("reading CA certificate for export: %w", err)
+			errs.cert = fmt.Errorf("reading CA certificate for export: %w", err)
 		}
 		m.cert = certPEM
 	}
 	if wantCRL {
 		crlPEM, err := e.src.GetCRL(ctx)
 		if err != nil {
-			return materials{}, fmt.Errorf("reading CRL for export: %w", err)
+			errs.crl = fmt.Errorf("reading CRL for export: %w", err)
 		}
 		m.crl = crlPEM
 	}
 	if wantServingCert || wantServingKey {
 		if e.serving == nil {
-			return materials{}, fmt.Errorf("a target requests serving material but no serving source is configured; " +
+			err := fmt.Errorf("a target requests serving material but no serving source is configured; " +
 				"serving_cert and serving_key require tls_self_provision")
+			errs.servingCert, errs.servingKey = err, err
+			return m, errs
 		}
-	}
-	if wantServingCert {
-		certPEM, err := e.serving.ServingCertPEM(ctx)
+		certPEM, keyPEM, err := e.serving.ServingMaterial(ctx)
 		if err != nil {
-			return materials{}, fmt.Errorf("reading serving certificate for export: %w", err)
+			err = fmt.Errorf("reading serving material for export: %w", err)
+			errs.servingCert, errs.servingKey = err, err
+			return m, errs
 		}
-		m.servingCert = certPEM
-	}
-	if wantServingKey {
-		keyPEM, err := e.serving.ServingKeyPEM(ctx)
-		if err != nil {
-			return materials{}, fmt.Errorf("reading serving key for export: %w", err)
+		if wantServingCert {
+			m.servingCert = certPEM
 		}
-		m.servingKey = keyPEM
+		if wantServingKey {
+			m.servingKey = keyPEM
+		}
 	}
-	return m, nil
+	return m, errs
 }
 
 // namespaceFor returns the namespace a target should be applied to: its own, or

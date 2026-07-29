@@ -290,7 +290,13 @@ variable must not get a chart that renders as though TLS were off.
 {{- if eq $name "PUPPET_CA_TLS_SELF_PROVISION" }}{{ $on = $value }}{{ end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
-{{- if eq .name "PUPPET_CA_TLS_SELF_PROVISION" }}{{ $on = .value }}{{ end -}}
+{{- if eq .name "PUPPET_CA_TLS_SELF_PROVISION" -}}
+{{- if hasKey . "value" -}}
+{{- $on = .value -}}
+{{- else -}}
+{{- fail "extraEnv sets PUPPET_CA_TLS_SELF_PROVISION with valueFrom, which the chart cannot read at render time. It decides here whether to mount tls.existingSecret and how to shape the probes, so a value it cannot see would render the wrong manifests. Set tls_self_provision in config (or PUPPET_CA_TLS_SELF_PROVISION in .Values.env) instead." -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if kindIs "string" $on -}}
 {{- if or (eq (lower $on) "true") (eq $on "1") -}}true{{- else -}}false{{- end -}}

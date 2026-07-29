@@ -19,7 +19,10 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -56,6 +59,44 @@ func (h *servingCertHolder) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifica
 		return nil, fmt.Errorf("no serving certificate available")
 	}
 	return cert, nil
+}
+
+// ServingMaterial returns the certificate and key the listener is currently
+// presenting, as PEM, satisfying k8sexport.ServingSource.
+//
+// Served from the holder rather than from storage, and that is the whole point.
+// Two storage reads can straddle a rotation and yield a certificate and a key
+// from different keypairs — a kubernetes.io/tls Secret that is well-formed and
+// fails every handshake made against it. The holder swaps the pair as one
+// atomic pointer, so a reader gets a matched pair or nothing.
+//
+// It also removes the need to decrypt on the export path: the key here is the
+// signer the CA already decrypted when it validated the stored material, so
+// tls_self_provision_encrypt_key costs the exporter nothing.
+//
+// The residual window is between replicas, not inside one: two exporters can
+// still order their applies against each other, so a replica that fetched
+// before a rotation can land after another's corrective apply. The next
+// notification-driven cycle corrects it, and revoking superseded certificates
+// bounds how long the stale pair remains usable.
+func (h *servingCertHolder) ServingMaterial(context.Context) (certPEM, keyPEM []byte, err error) {
+	pair := h.current.Load()
+	if pair == nil || len(pair.Certificate) == 0 {
+		return nil, nil, fmt.Errorf("no serving certificate available")
+	}
+
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]})
+
+	signer, ok := pair.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, nil, fmt.Errorf("the serving key is not a signer")
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(signer)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshalling the serving key for export: %w", err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	return certPEM, keyPEM, nil
 }
 
 // servingConfigFrom derives the CA-layer serving configuration from the server

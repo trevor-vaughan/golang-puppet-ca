@@ -83,12 +83,12 @@ func (s stubSource) GetCRL(context.Context) ([]byte, error)    { return s.crl, s
 // decrypted before publication and only the CA holds the passphrase.
 type stubServing struct {
 	cert, key []byte
-	certErr   error
-	keyErr    error
+	err       error
 }
 
-func (s stubServing) ServingCertPEM(context.Context) ([]byte, error) { return s.cert, s.certErr }
-func (s stubServing) ServingKeyPEM(context.Context) ([]byte, error)  { return s.key, s.keyErr }
+func (s stubServing) ServingMaterial(context.Context) ([]byte, []byte, error) {
+	return s.cert, s.key, s.err
+}
 
 var _ = Describe("Exporter", func() {
 	var (
@@ -496,14 +496,108 @@ var _ = Describe("Exporter with serving material", func() {
 		}}}
 		Expect(cfg.Validate()).To(Succeed())
 
+		// The certificate and key now arrive together, atomically, so what
+		// matters is that the key is not *published* — a private key in a
+		// ConfigMap is world-readable to anything with get on the namespace.
 		exp := k8sexport.New(client, *cfg, src, "", nil).WithServingSource(stubServing{
-			cert:   []byte("SERVING-CERT-PEM"),
-			keyErr: errors.New("must not be called"),
+			cert: []byte("SERVING-CERT-PEM"),
+			key:  []byte("SERVING-KEY-PEM"),
 		})
 		Expect(exp.ExportAll(ctx)).To(Succeed())
 
 		cm, err := client.CoreV1().ConfigMaps("ns1").Get(ctx, "serving-cert", metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cm.Data).To(HaveKeyWithValue("tls.crt", "SERVING-CERT-PEM"))
+		Expect(cm.Data).NotTo(HaveKey("tls.key"))
+		for _, v := range cm.Data {
+			Expect(v).NotTo(ContainSubstring("SERVING-KEY-PEM"))
+		}
+	})
+})
+
+var _ = Describe("Material read failures", func() {
+	var (
+		ctx    context.Context
+		client *fake.Clientset
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		client = fake.NewClientset()
+	})
+
+	// twoTargets: one wants the CA cert, the other only the CRL.
+	twoTargets := func() k8sexport.Config {
+		return k8sexport.Config{Targets: []k8sexport.Target{
+			{
+				Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "wants-cert", Namespace: "ns1"},
+				Cert: true,
+			},
+			{
+				Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "wants-crl", Namespace: "ns1"},
+				CRL: true,
+			},
+		}}
+	}
+
+	It("fails only the targets that wanted the unreadable material", func() {
+		// The whole cycle used to abort, so recordApply never ran and no
+		// per-target series was written — and both arms of the shipped alert
+		// select on last_error. One transient read left every target stale with
+		// nothing firing.
+		cfg := twoTargets()
+		Expect(cfg.Validate()).To(Succeed())
+		src := stubSource{crl: []byte("CRL-PEM"), certErr: errors.New("storage blip")}
+
+		err := k8sexport.New(client, cfg, src, "", nil).ExportAll(ctx)
+		Expect(err).To(MatchError(ContainSubstring("storage blip")))
+
+		// The CRL-only target is unaffected and still published.
+		cm, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, "wants-crl", metav1.GetOptions{})
+		Expect(getErr).NotTo(HaveOccurred())
+		Expect(cm.Data).To(HaveKeyWithValue("ca.crl", "CRL-PEM"))
+
+		// The cert target was not applied at all.
+		_, getErr = client.CoreV1().ConfigMaps("ns1").Get(ctx, "wants-cert", metav1.GetOptions{})
+		Expect(getErr).To(HaveOccurred())
+	})
+
+	It("records a per-target failure so the alert can fire", func() {
+		cfg := twoTargets()
+		Expect(cfg.Validate()).To(Succeed())
+		reg := prometheus.NewRegistry()
+		m := k8sexport.NewMetrics(reg)
+		src := stubSource{crl: []byte("CRL-PEM"), certErr: errors.New("storage blip")}
+
+		_ = k8sexport.New(client, cfg, src, "", m).ExportAll(ctx)
+
+		families, err := reg.Gather()
+		Expect(err).NotTo(HaveOccurred())
+		var sawError bool
+		for _, f := range families {
+			if f.GetName() != "puppetca_k8s_export_last_error_timestamp_seconds" {
+				continue
+			}
+			for _, metric := range f.GetMetric() {
+				for _, l := range metric.GetLabel() {
+					if l.GetName() == "name" && l.GetValue() == "wants-cert" {
+						sawError = true
+					}
+				}
+			}
+		}
+		Expect(sawError).To(BeTrue(),
+			"a target whose material could not be read must record an error, or the alert cannot fire")
+	})
+
+	It("fails a serving target when no serving source is wired, naming the setting", func() {
+		cfg := k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving", Namespace: "ns1"},
+			ServingCert: true, ServingKey: true,
+		}}}
+		Expect(cfg.Validate()).To(Succeed())
+
+		err := k8sexport.New(client, cfg, stubSource{}, "", nil).ExportAll(ctx)
+		Expect(err).To(MatchError(ContainSubstring("require tls_self_provision")))
 	})
 })
