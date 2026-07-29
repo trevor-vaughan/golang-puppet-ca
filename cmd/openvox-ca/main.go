@@ -599,7 +599,7 @@ func newRootCmd() *cobra.Command {
 			// recorded would otherwise sit in storage indefinitely and fire much
 			// later if the delay were re-enabled. A failure here is logged and
 			// not fatal: it is bookkeeping, and the CA can still serve.
-			if err := myCA.ReconcileSuperseded(ctx, time.Duration(cfg.TLSSelfProvisionRevokeAfterSec)*time.Second); err != nil {
+			if err := myCA.ReconcileSuperseded(ctx, cfg.servingRevokeAfter()); err != nil {
 				slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
 			}
 

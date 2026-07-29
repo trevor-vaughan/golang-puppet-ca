@@ -165,7 +165,7 @@ type CA struct {
 	// breaks the assumption behind tls_self_provision_revoke_after_sec, which
 	// bounds a superseded certificate's exposure on the belief that every
 	// replica notices its replacement within one interval. Alert on this.
-	ServingRenewalFailures atomic.Uint64
+	servingRenewalFailures atomic.Uint64
 
 	// crlNotify carries a coalesced signal each time the CRL is re-signed (see
 	// signCRLLocked). It is buffered to depth 1 and written non-blockingly, so a
@@ -205,11 +205,18 @@ func (c *CA) ServingCertIssued() uint64 {
 	return c.servingCertIssued.Load()
 }
 
+// IncServingRenewalFailures records a maintenance pass that could not renew the
+// serving certificate. Called by the maintenance loop, which owns the retry
+// policy; the CA itself has no periodic tasks.
+func (c *CA) IncServingRenewalFailures() {
+	c.servingRenewalFailures.Add(1)
+}
+
 // ServingRenewalFailureCount returns how many maintenance passes failed to
 // renew the serving certificate. Surfaced as
 // puppetca_serving_cert_renewal_failures_total.
 func (c *CA) ServingRenewalFailureCount() uint64 {
-	return c.ServingRenewalFailures.Load()
+	return c.servingRenewalFailures.Load()
 }
 
 // CRLUpdated returns a channel that receives a value each time the CRL is

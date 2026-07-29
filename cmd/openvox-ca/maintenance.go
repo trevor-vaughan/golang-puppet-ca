@@ -91,8 +91,7 @@ func supersededRevocationTask(myCA *ca.CA, cfg *serverConfig) maintenanceTask {
 	return maintenanceTask{
 		name: "serving-cert-superseded-revocation",
 		run: func(ctx context.Context) {
-			revokeAfter := time.Duration(cfg.TLSSelfProvisionRevokeAfterSec) * time.Second
-			if err := myCA.ReconcileSuperseded(ctx, revokeAfter); err != nil {
+			if err := myCA.ReconcileSuperseded(ctx, cfg.servingRevokeAfter()); err != nil {
 				// The list is left intact, so the next pass retries. A
 				// superseded certificate staying valid is better than a
 				// revocation this replica cannot record.
@@ -114,7 +113,7 @@ func servingRenewalTask(myCA *ca.CA, cfg *serverConfig, holder *servingCertHolde
 				// failing renewal is otherwise invisible until the certificate
 				// expires, and it is also what breaks the bound on how long a
 				// superseded certificate stays in use.
-				myCA.ServingRenewalFailures.Add(1)
+				myCA.IncServingRenewalFailures()
 				slog.Error("Serving certificate renewal failed; keeping the current certificate",
 					"error", err)
 			}

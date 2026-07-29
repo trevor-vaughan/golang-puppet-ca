@@ -80,10 +80,19 @@ type serverConfig struct {
 	TLSSelfProvisionEncryptKey bool `yaml:"tls_self_provision_encrypt_key"`
 
 	// TLSSelfProvisionRevokeAfterSec revokes a superseded serving certificate
-	// this long after it is replaced. 0 never revokes. The delay exists because
-	// the swap is per-process: a sibling replica may still be serving the old
-	// certificate, and revoking immediately would break every client that does
-	// revocation checking. See serverConfig.validateTLS for the lower bound.
+	// this long after it is replaced. Sentinelled to -1 ("unset") so an
+	// explicit 0 (never revoke) is never confused with "not configured", the
+	// same convention CSRRateLimit uses; resolve it with servingRevokeAfter.
+	//
+	// The delay exists because the swap is per-process: a sibling replica may
+	// still be serving the old certificate, and revoking immediately would
+	// break every client that does revocation checking.
+	//
+	// Unset resolves to 24h rather than "never", because leaving a second valid
+	// serving credential in circulation until it expires is the worse failure,
+	// and it matches this project's existing posture: RevokeOnAutoRenew is
+	// already true by default so that only the newest serial for a subject
+	// stays valid.
 	TLSSelfProvisionRevokeAfterSec int `yaml:"tls_self_provision_revoke_after_sec"`
 
 	// MaintenanceIntervalSec is how often the shared maintenance loop runs.
@@ -197,6 +206,9 @@ func loadServerConfig(configFile string) (*serverConfig, error) {
 		CSRRateLimit:      -1,   // unset sentinel; 0 disables, -1 falls back to defaultCSRRateLimit
 		PromoteCNToSAN:    true, // RFC 2818: add CN as SAN when CSR has no SANs
 		RevokeOnAutoRenew: true, // only the newest serial per subject should be valid
+
+		// unset sentinel; 0 never revokes, -1 resolves via servingRevokeAfter
+		TLSSelfProvisionRevokeAfterSec: -1,
 	}
 
 	if configFile != "" {
@@ -235,6 +247,38 @@ func (c *serverConfig) maintenanceInterval() time.Duration {
 		return time.Duration(c.MaintenanceIntervalSec) * time.Second
 	}
 	return defaultMaintenanceInterval
+}
+
+// defaultServingRevokeAfter is how long a superseded serving certificate stays
+// valid before it is revoked, when the operator has not chosen otherwise.
+const defaultServingRevokeAfter = 24 * time.Hour
+
+// servingRevokeAfter resolves how long a superseded serving certificate stays
+// valid before revocation. Three states, per the CSRRateLimit convention:
+//
+//	 0  never revoke — an explicit operator choice
+//	>0  that duration, validated against the floor by validateTLS
+//	-1  unset: the built-in default, raised to the floor if the operator has
+//	    configured an unusually long maintenance interval
+//
+// Raising the unset value to the floor is what keeps a *default* from ever
+// being the thing that refuses to start. An explicitly configured value is
+// never adjusted — that one is validated and rejected instead, because
+// silently lengthening a delay an operator chose would misrepresent how long a
+// superseded credential stays valid.
+func (c *serverConfig) servingRevokeAfter() time.Duration {
+	if c.TLSSelfProvisionRevokeAfterSec >= 0 {
+		return time.Duration(c.TLSSelfProvisionRevokeAfterSec) * time.Second
+	}
+	return max(defaultServingRevokeAfter, c.servingRevokeFloor())
+}
+
+// servingRevokeFloor is the shortest delay that does not reintroduce the
+// cross-replica breakage the delay exists to prevent: a replica picks up a
+// replacement within one maintenance interval, and the factor of two is margin
+// for one whose cycle has only just begun.
+func (c *serverConfig) servingRevokeFloor() time.Duration {
+	return 2 * c.maintenanceInterval()
 }
 
 // tlsEnabled reports whether the API listener will speak TLS, by either route:
@@ -291,12 +335,11 @@ func (c *serverConfig) validateTLS() error {
 	}
 
 	// A superseded certificate must stay valid long enough for every replica to
-	// have noticed its replacement, which takes up to one maintenance interval.
-	// A shorter delay reintroduces exactly the cross-replica breakage the delay
-	// exists to prevent. The factor of two is margin for a replica whose cycle
-	// has only just begun.
+	// have noticed its replacement. Only an explicitly configured delay is
+	// checked: the unset value resolves to at least the floor by construction,
+	// so a default can never be what refuses to start.
 	if c.TLSSelfProvisionRevokeAfterSec > 0 {
-		minimum := 2 * c.maintenanceInterval()
+		minimum := c.servingRevokeFloor()
 		if configured := time.Duration(c.TLSSelfProvisionRevokeAfterSec) * time.Second; configured < minimum {
 			return fmt.Errorf("tls_self_provision_revoke_after_sec (%s) must be at least twice "+
 				"maintenance_interval_sec (%s), or a replica could still be serving the superseded "+

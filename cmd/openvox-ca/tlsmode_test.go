@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"os"
 	"path/filepath"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -171,20 +172,61 @@ var _ = Describe("serverConfig.validateTLS", func() {
 	})
 
 	Describe("revocation delay", func() {
-		It("accepts 0, which never revokes", func() {
+		// Three states, per the csr_rate_limit convention already in this file:
+		// unset (-1) takes the built-in default, 0 never revokes, and a
+		// positive value is the operator's own choice.
+
+		It("is unset by default, so 0 stays reachable", func() {
+			cfg, err := loadServerConfig("")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cfg.TLSSelfProvisionRevokeAfterSec).To(Equal(-1))
+		})
+
+		It("resolves unset to 24 hours", func() {
+			// Not "never": a second valid serving credential in circulation is
+			// the worse outcome, and revoke_on_auto_renew already defaults to
+			// keeping only the newest serial valid.
+			cfg.TLSSelfProvisionRevokeAfterSec = -1
+			Expect(cfg.servingRevokeAfter()).To(Equal(24 * time.Hour))
+		})
+
+		It("resolves an explicit 0 to never revoke", func() {
 			cfg.TLSSelfProvisionRevokeAfterSec = 0
+			Expect(cfg.servingRevokeAfter()).To(BeZero())
 			Expect(cfg.validateTLS()).To(Succeed())
 		})
 
-		It("rejects a delay under twice the maintenance interval", func() {
+		It("honours an explicit 0 from the config file", func() {
+			// The point of the sentinel: a default must never make 0
+			// unreachable.
+			path := writeTempConfig("tls_self_provision_revoke_after_sec: 0\n")
+			loaded, err := loadServerConfig(path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(loaded.TLSSelfProvisionRevokeAfterSec).To(BeZero())
+			Expect(loaded.servingRevokeAfter()).To(BeZero())
+		})
+
+		It("honours an explicit 0 from the environment", func() {
+			clearServerEnv()
+			setEnv("PUPPET_CA_TLS_SELF_PROVISION_REVOKE_AFTER_SEC", "0")
+			loaded, err := loadServerConfig("")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(loaded.servingRevokeAfter()).To(BeZero())
+		})
+
+		It("resolves a configured value verbatim", func() {
+			cfg.TLSSelfProvisionRevokeAfterSec = 7200
+			Expect(cfg.servingRevokeAfter()).To(Equal(2 * time.Hour))
+		})
+
+		It("rejects a configured delay under twice the maintenance interval", func() {
 			// A sibling replica notices a replacement within one maintenance
-			// interval; revoking sooner breaks exactly what the delay exists to
-			// protect. With the default hour, two hours is the floor.
+			// interval; revoking sooner breaks exactly what the delay protects.
 			cfg.TLSSelfProvisionRevokeAfterSec = 3600
 			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("at least twice")))
 		})
 
-		It("accepts exactly twice the maintenance interval", func() {
+		It("accepts a configured delay of exactly twice the interval", func() {
 			cfg.TLSSelfProvisionRevokeAfterSec = 7200
 			Expect(cfg.validateTLS()).To(Succeed())
 		})
@@ -196,6 +238,23 @@ var _ = Describe("serverConfig.validateTLS", func() {
 
 			cfg.TLSSelfProvisionRevokeAfterSec = 500
 			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("at least twice")))
+		})
+
+		It("raises the unset default to the floor instead of refusing to start", func() {
+			// The reason for the sentinel rather than a plain 86400 default:
+			// with a long maintenance interval the floor exceeds 24h, and a
+			// value the operator never set must not be what fails startup.
+			cfg.MaintenanceIntervalSec = 13 * 60 * 60
+			cfg.TLSSelfProvisionRevokeAfterSec = -1
+
+			Expect(cfg.validateTLS()).To(Succeed())
+			Expect(cfg.servingRevokeAfter()).To(Equal(26 * time.Hour))
+		})
+
+		It("never shortens the unset default below 24 hours", func() {
+			cfg.MaintenanceIntervalSec = 60
+			cfg.TLSSelfProvisionRevokeAfterSec = -1
+			Expect(cfg.servingRevokeAfter()).To(Equal(24 * time.Hour))
 		})
 	})
 })

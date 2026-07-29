@@ -65,7 +65,7 @@ func servingConfigFrom(cfg *serverConfig) ca.ServingConfig {
 		ExtraNames:  cfg.TLSSelfProvisionNames,
 		RenewBefore: time.Duration(cfg.TLSSelfProvisionRenewBeforeSec) * time.Second,
 		EncryptKey:  cfg.TLSSelfProvisionEncryptKey,
-		RevokeAfter: time.Duration(cfg.TLSSelfProvisionRevokeAfterSec) * time.Second,
+		RevokeAfter: cfg.servingRevokeAfter(),
 	}
 }
 
