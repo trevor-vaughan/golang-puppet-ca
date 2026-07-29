@@ -169,43 +169,97 @@ func (c *CA) storedServingLeaf(ctx context.Context) *x509.Certificate {
 	return leaf
 }
 
+// Reasons a stored serving certificate cannot be reused. Stable identifiers
+// rather than prose, so an operator can grep or alert on them and so that
+// nothing arbitrary ends up in the log line — see servingReason.
+const (
+	reasonNoCert          = "no-stored-certificate"
+	reasonCertUnreadable  = "certificate-unreadable"
+	reasonKeyUnreadable   = "key-unreadable"
+	reasonCertNotPEM      = "certificate-not-pem"
+	reasonCertUnparseable = "certificate-unparseable"
+	reasonKeyUnusable     = "key-unusable"
+	reasonKeyMismatch     = "key-does-not-match-certificate"
+	reasonNoCACert        = "ca-certificate-not-loaded"
+	reasonForeignIssuer   = "not-issued-by-current-ca-certificate"
+	reasonRenewalWindow   = "within-renewal-window"
+	reasonMissingName     = "missing-configured-name"
+	reasonRevocationCheck = "revocation-status-unknown"
+	reasonRevoked         = "certificate-revoked"
+)
+
+// servingReason is why a stored serving certificate must be replaced: a stable
+// code, plus optional detail for a human reading the log.
+//
+// The two are separate deliberately. Folding an arbitrary wrapped error into
+// one free-form string made the log line unpredictable — it could carry a
+// filesystem path, and on a SQL backend a driver error can carry the DSN, which
+// carries a password. Keeping the code fixed means the log line's shape does
+// not depend on what failed underneath, and confines anything variable to one
+// field that callers can choose not to emit.
+type servingReason struct {
+	// Code is one of the reason* constants above. Always safe to log.
+	Code string
+	// Detail is supplementary and may be empty. It is derived from configured
+	// values (a name, a duration) and never from an error whose text this code
+	// does not control.
+	Detail string
+}
+
+// LogValue renders the reason for slog, omitting an empty detail.
+func (r servingReason) LogValue() slog.Value {
+	if r.Detail == "" {
+		return slog.StringValue(r.Code)
+	}
+	return slog.StringValue(r.Code + " (" + r.Detail + ")")
+}
+
 // loadUsableServingCert returns the stored serving certificate when every reuse
-// condition holds, or nil plus a human-readable reason when it must be
-// replaced. The reason is logged, so a certificate churning between replicas is
-// diagnosable from one line rather than by comparing serials.
+// condition holds, or nil plus the reason it must be replaced. The reason is
+// logged, so a certificate churning between replicas is diagnosable from one
+// line rather than by comparing serials.
 //
 // The subject lock is held; c.mu must NOT be, because IsRevokedSerial takes it
 // for reading.
-func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*ServingCertificate, string) {
+func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*ServingCertificate, servingReason) {
 	certPEM, err := c.Storage.GetServingCert(ctx)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, "no serving certificate in storage"
+			return nil, servingReason{Code: reasonNoCert}
 		}
-		return nil, fmt.Sprintf("serving certificate unreadable: %v", err)
+		// Deliberately without the error text: this comes from the storage
+		// backend, and a SQL driver's connection error can carry the DSN. The
+		// failure is not lost — the caller either mints successfully, or fails
+		// with its own error that does surface the cause.
+		return nil, servingReason{Code: reasonCertUnreadable}
 	}
 	keyPEM, err := c.Storage.GetServingKey(ctx)
 	if err != nil {
 		// A torn write between the two Put calls lands here. Mint again.
-		return nil, fmt.Sprintf("serving key unreadable: %v", err)
+		return nil, servingReason{Code: reasonKeyUnreadable}
 	}
 
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		return nil, "stored serving certificate is not PEM"
+		return nil, servingReason{Code: reasonCertNotPEM}
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Sprintf("stored serving certificate does not parse: %v", err)
+		return nil, servingReason{Code: reasonCertUnparseable}
 	}
 
 	key, err := c.parseServingKey(keyPEM)
 	if err != nil {
 		// A rotated passphrase lands here. Mint again rather than crash-loop.
-		return nil, fmt.Sprintf("stored serving key unusable: %v", err)
+		//
+		// The error is withheld for the same reason as above and one more: it
+		// wraps resolvePassphrase, which names the configured passphrase file.
+		// That is a path rather than a secret, but it has no business in a
+		// routine Info line about certificate rotation.
+		return nil, servingReason{Code: reasonKeyUnusable}
 	}
 	if !publicKeysEqual(leaf.PublicKey, key.Public()) {
-		return nil, "stored serving key does not match the stored certificate"
+		return nil, servingReason{Code: reasonKeyMismatch}
 	}
 
 	// Verify against the CA certificate this process actually loaded, not
@@ -213,32 +267,38 @@ func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*Ser
 	// CA certificate re-signed by a new parent over the same key keeps the same
 	// SKI — and a stale serving certificate would be silently retained.
 	if c.CACert == nil {
-		return nil, "CA certificate not loaded"
+		return nil, servingReason{Code: reasonNoCACert}
 	}
 	if err := leaf.CheckSignatureFrom(c.CACert); err != nil {
-		return nil, "stored serving certificate was not issued by the current CA certificate"
+		return nil, servingReason{Code: reasonForeignIssuer}
 	}
 
 	if remaining := time.Until(leaf.NotAfter); remaining <= servingRenewBefore(cfg, leaf) {
-		return nil, fmt.Sprintf("within the renewal window (%s remaining)", remaining.Round(time.Minute))
+		// Detail from our own clock arithmetic, not from an error.
+		return nil, servingReason{
+			Code:   reasonRenewalWindow,
+			Detail: remaining.Round(time.Minute).String() + " remaining",
+		}
 	}
 
 	if missing := missingNames(leaf, servingNames(cfg)); missing != "" {
-		return nil, fmt.Sprintf("does not cover the configured name %q", missing)
+		// Detail is a configured name, which the operator supplied and which
+		// is already in the certificate this process serves.
+		return nil, servingReason{Code: reasonMissingName, Detail: missing}
 	}
 
 	revoked, err := c.IsRevokedSerial(ctx, leaf.SerialNumber)
 	if err != nil {
-		return nil, fmt.Sprintf("cannot determine revocation status: %v", err)
+		return nil, servingReason{Code: reasonRevocationCheck}
 	}
 	if revoked {
 		// This is the recovery route after `openvox-ca-ctl revoke` on the CA's
 		// own hostname, which is the documented way to replace a compromised
 		// serving key.
-		return nil, "stored serving certificate has been revoked"
+		return nil, servingReason{Code: reasonRevoked}
 	}
 
-	return &ServingCertificate{CertPEM: certPEM, KeyPEM: keyPEM, Leaf: leaf, Key: key}, ""
+	return &ServingCertificate{CertPEM: certPEM, KeyPEM: keyPEM, Leaf: leaf, Key: key}, servingReason{}
 }
 
 // publicKeysEqual compares two public keys by marshalled SubjectPublicKeyInfo,
