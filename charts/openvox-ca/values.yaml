@@ -347,9 +347,17 @@ readinessProbe:
     path: /healthz/ready
     port: https
 
+# failureThreshold x periodSeconds must exceed the worst-case startup, or the
+# kubelet restarts a pod that was making progress. That budget is 180s.
+#
+# The old 30 x 2 = 60s was exactly one lock timeout and left nothing for a
+# second. Startup can take two: the bootstrap lock during CA init, and the
+# per-subject lock when the CA issues its own serving certificate. Add a
+# signature that may be a Transit round trip rather than local CPU, and 60s is
+# not enough. 90 x 2 leaves room for both plus margin.
 startupProbe:
   enabled: true
-  failureThreshold: 30
+  failureThreshold: 90
   periodSeconds: 2
   httpGet:
     path: /healthz/startup

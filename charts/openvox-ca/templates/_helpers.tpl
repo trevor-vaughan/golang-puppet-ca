@@ -237,10 +237,13 @@ true
 {{/*
 Whether the server will serve HTTPS.
 
-It does so exactly when a certificate and a key are both configured — on any
-layer. The config file is the one the chart renders; environment variables
-outrank it, so PUPPET_CA_TLS_CERT/KEY set through env or extraEnv count too,
-and are how someone feeds the certificate paths in from a Secret.
+It does so by either route: a certificate and key both configured, or
+tls_self_provision, where the CA issues its own. Either counts, on any layer.
+The config file is the one the chart renders; environment variables outrank it,
+so PUPPET_CA_TLS_CERT/KEY and PUPPET_CA_TLS_SELF_PROVISION set through env or
+extraEnv count too — the first pair is how someone feeds certificate paths in
+from a Secret, and missing the third would render HTTP probes against an HTTPS
+listener and fail openvox-ca.validate on a correct install.
 
 When the configuration is not fully known this answers "true": HTTPS is the
 normal case, and it is the answer that neither blocks a correct install nor
@@ -248,6 +251,9 @@ makes the probes fail on one.
 */}}
 {{- define "openvox-ca.tlsConfigured" -}}
 {{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
+true
+{{- else -}}
+{{- if eq (include "openvox-ca.selfProvisionEnabled" .) "true" -}}
 true
 {{- else -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
@@ -266,6 +272,30 @@ true
 {{- else -}}
 false
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the CA issues its own serving certificate.
+
+Read from the merged config and from both environment layers, for the same
+reason tlsConfigured reads them: an operator setting this by environment
+variable must not get a chart that renders as though TLS were off.
+*/}}
+{{- define "openvox-ca.selfProvisionEnabled" -}}
+{{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- $on := dig "tls_self_provision" false $config -}}
+{{- range $name, $value := .Values.env -}}
+{{- if eq $name "PUPPET_CA_TLS_SELF_PROVISION" }}{{ $on = $value }}{{ end -}}
+{{- end -}}
+{{- range .Values.extraEnv -}}
+{{- if eq .name "PUPPET_CA_TLS_SELF_PROVISION" }}{{ $on = .value }}{{ end -}}
+{{- end -}}
+{{- if kindIs "string" $on -}}
+{{- if or (eq (lower $on) "true") (eq $on "1") -}}true{{- else -}}false{{- end -}}
+{{- else -}}
+{{- ternary "true" "false" (not (not $on)) -}}
 {{- end -}}
 {{- end -}}
 
@@ -319,7 +349,30 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 {{- $host := dig "host" "" $config | toString -}}
 {{- $loopback := or (hasPrefix "127." $host) (eq $host "localhost") -}}
 {{- if and (ne (include "openvox-ca.tlsConfigured" .) "true") (not (dig "no_tls_required" false $config)) (not $loopback) -}}
-{{- fail (printf "openvox-ca will refuse to start: no server TLS certificate is configured and the listen address (%s) is not loopback, which the server rejects as vulnerable to certificate injection.\n\nSet one of:\n  tls.existingSecret       a kubernetes.io/tls Secret holding the server certificate (recommended; Puppet agents require HTTPS)\n  config.tls_cert/tls_key  paths to a certificate you mount yourself\n  env/extraEnv             PUPPET_CA_TLS_CERT and PUPPET_CA_TLS_KEY, to feed those paths in from a Secret\n  config.no_tls_required   true, only behind a trusted TLS proxy that re-originates TLS\n  listen.host              127.0.0.1 or localhost, for a sidecar-only deployment" $host) -}}
+{{- fail (printf "openvox-ca will refuse to start: no server TLS certificate is configured and the listen address (%s) is not loopback, which the server rejects as vulnerable to certificate injection.\n\nSet one of:\n  tls.existingSecret       a kubernetes.io/tls Secret holding the server certificate (recommended; Puppet agents require HTTPS)\n  config.tls_self_provision  true, to have the CA issue and renew its own serving certificate (also set config.hostname)\n  config.tls_cert/tls_key  paths to a certificate you mount yourself\n  env/extraEnv             PUPPET_CA_TLS_CERT and PUPPET_CA_TLS_KEY, to feed those paths in from a Secret\n  config.no_tls_required   true, only behind a trusted TLS proxy that re-originates TLS\n  listen.host              127.0.0.1 or localhost, for a sidecar-only deployment" $host) -}}
+{{- end -}}
+
+{{/*
+  Self-provisioning needs a hostname: it is the certificate's common name and
+  first SAN. Without it the server refuses to start, because its "puppet"
+  fallback subject would produce a certificate no agent validates — which
+  surfaces as a TLS handshake failure rather than as the configuration error
+  it is. The chart does not set hostname by default, so this is the common
+  mistake rather than an exotic one.
+*/}}
+{{- if eq (include "openvox-ca.selfProvisionEnabled" .) "true" -}}
+{{- if not (dig "hostname" "" $config) -}}
+{{- fail "config.tls_self_provision requires config.hostname: it becomes the common name and first subject alternative name of the certificate agents verify. Without it the server refuses to start." -}}
+{{- end -}}
+
+{{/*
+  The two TLS routes are mutually exclusive at the server, so a chart that
+  renders both produces a Deployment that cannot start. tls.existingSecret is
+  the chart's own wiring for the file route, so it counts as tls_cert here.
+*/}}
+{{- if or .Values.tls.existingSecret (dig "tls_cert" "" $config) (dig "tls_key" "" $config) -}}
+{{- fail "config.tls_self_provision cannot be combined with tls.existingSecret or config.tls_cert/tls_key: the CA either issues its own serving certificate or loads one from disk, not both. The server refuses to start with both configured." -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

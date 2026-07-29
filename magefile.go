@@ -1068,6 +1068,28 @@ func (Chart) Test() error {
 		},
 	}
 
+	renders = append(renders,
+		chartRenderCase{
+			name: "self-provisioning counts as TLS, so probes render HTTPS",
+			sets: []string{"config.tls_self_provision=true", "config.hostname=ca.example.com"},
+			// No tls.existingSecret: this is the whole point — the chart must
+			// not demand the other route.
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
+			name: "self-provisioning set by environment variable also counts as TLS",
+			// Missing this is how a correct install renders HTTP probes against
+			// an HTTPS listener and then fails its own validation.
+			sets:  []string{"config.hostname=ca.example.com", "env.PUPPET_CA_TLS_SELF_PROVISION=true"},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
+			name:  "the startup budget covers two lock timeouts",
+			sets:  []string{tls},
+			wants: []string{"failureThreshold: 90"},
+		},
+	)
+
 	rejects := []chartRejectCase{
 		{
 			name:    "no TLS on a non-loopback address, which the server refuses to serve",
@@ -1115,6 +1137,21 @@ func (Chart) Test() error {
 			name:    "export RBAC bound to the namespace's default ServiceAccount",
 			sets:    []string{tls, "kubernetesExport.enabled=true", "serviceAccount.create=false"},
 			wantErr: "default ServiceAccount",
+		},
+		{
+			name:    "self-provisioning with no hostname to put in the certificate",
+			sets:    []string{"config.tls_self_provision=true"},
+			wantErr: "requires config.hostname",
+		},
+		{
+			name:    "self-provisioning alongside the Secret that supplies a certificate",
+			sets:    []string{tls, "config.tls_self_provision=true", "config.hostname=ca.example.com"},
+			wantErr: "cannot be combined",
+		},
+		{
+			name:    "self-provisioning alongside a certificate path",
+			sets:    []string{"config.tls_self_provision=true", "config.hostname=ca.example.com", "config.tls_cert=/tls/tls.crt"},
+			wantErr: "cannot be combined",
 		},
 		{
 			name:    "a mistyped value the schema should catch",

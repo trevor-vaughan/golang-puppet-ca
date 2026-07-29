@@ -1,0 +1,72 @@
+# The CA issues and renews its own serving certificate, publishing it to a
+# kubernetes.io/tls Secret for an ingress to terminate against.
+#
+# This is the deployment self-provisioning exists for: the CA key lives in
+# OpenBao Transit, so cert-manager cannot act as a CA issuer for it, and
+# `openvox-ca-ctl generate` would need an admin client certificate that does not
+# exist until the server is already serving. Nothing else can issue this
+# certificate — so the CA issues it itself.
+#
+# No tls.existingSecret and no config.tls_cert: those are the other route, and
+# the chart refuses both together.
+
+replicaCount: 2
+
+# The serving certificate and key live in the storage backend, so every replica
+# serves the same one and an ephemeral cadir loses nothing.
+persistence:
+  enabled: false
+emptyDir:
+  medium: Memory
+
+config:
+  storage_backend: postgres
+  # Required by tls_self_provision: the certificate's common name and first
+  # SAN. The chart refuses the install without it.
+  hostname: ca.example.com
+  tls_self_provision: true
+  tls_self_provision_names:
+    - openvox-ca.openvox-ca.svc.cluster.local
+    - ca.example.com
+  ca_key_provider: openbao
+  openbao:
+    addr: https://openbao.example.com:8200
+    key_name: openvox-ca
+    auth_method: kubernetes
+    kubernetes_role: openvox-ca
+
+extraEnv:
+  - name: PUPPET_CA_SQL_DSN
+    valueFrom:
+      secretKeyRef:
+        name: openvox-ca-db
+        key: dsn
+
+# Two targets, not one: a Secret carrying ca.crt is mounted widely across the
+# cluster, and the chart's own validation refuses to let it acquire a tls.key
+# entry alongside. The serving certificate is public and may share either.
+kubernetesExport:
+  enabled: true
+  targets:
+    - kind: Secret
+      metadata:
+        name: openvox-ca-trust
+      cert: true
+      crl: true
+    - kind: Secret
+      metadata:
+        name: openvox-ca-serving
+      type: kubernetes.io/tls
+      serving_cert: true
+      serving_key: true
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+  hosts:
+    - host: ca.example.com
+      paths:
+        - path: /
+          pathType: Prefix

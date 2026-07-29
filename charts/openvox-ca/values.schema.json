@@ -165,8 +165,12 @@
               "metadata": { "type": "object" },
               "cert": { "type": "boolean" },
               "crl": { "type": "boolean" },
+              "serving_cert": { "type": "boolean" },
+              "serving_key": { "type": "boolean" },
               "cert_key": { "type": "string" },
               "crl_key": { "type": "string" },
+              "serving_cert_key": { "type": "string" },
+              "serving_key_key": { "type": "string" },
               "type": { "type": "string" }
             },
             "required": ["kind", "metadata"]
