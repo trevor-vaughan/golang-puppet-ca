@@ -100,7 +100,7 @@ func (c *Config) needsDefaultNamespace() bool {
 // collected but does not prevent the others from being applied; the joined error
 // (or nil) is returned.
 func (e *Exporter) ExportAll(ctx context.Context) error {
-	certPEM, crlPEM, err := e.fetchMaterials(ctx)
+	m, err := e.fetchMaterials(ctx)
 	if err != nil {
 		return err
 	}
@@ -108,7 +108,7 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 	var errs []error
 	for i := range e.cfg.Targets {
 		t := &e.cfg.Targets[i]
-		err := e.applyTarget(ctx, t, certPEM, crlPEM)
+		err := e.applyTarget(ctx, t, m)
 		e.metrics.recordApply(t, e.namespaceFor(t), err)
 		if err != nil {
 			slog.Warn("Kubernetes export failed for target",
@@ -122,27 +122,38 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// fetchMaterials reads the cert and CRL PEM, fetching each only if some target
-// requires it.
-func (e *Exporter) fetchMaterials(ctx context.Context) (certPEM, crlPEM []byte, err error) {
+// materials is the set of PEM blobs one export cycle publishes. Passed as a
+// struct rather than as positional byte slices so that adding a material does
+// not mean editing every signature between here and the apply, and so that a
+// caller cannot transpose two of them.
+type materials struct {
+	cert []byte
+	crl  []byte
+}
+
+// fetchMaterials reads each material only if some target requires it.
+func (e *Exporter) fetchMaterials(ctx context.Context) (materials, error) {
+	var m materials
 	var wantCert, wantCRL bool
 	for i := range e.cfg.Targets {
 		wantCert = wantCert || e.cfg.Targets[i].Cert
 		wantCRL = wantCRL || e.cfg.Targets[i].CRL
 	}
 	if wantCert {
-		certPEM, err = e.src.GetCACert(ctx)
+		certPEM, err := e.src.GetCACert(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("reading CA certificate for export: %w", err)
+			return materials{}, fmt.Errorf("reading CA certificate for export: %w", err)
 		}
+		m.cert = certPEM
 	}
 	if wantCRL {
-		crlPEM, err = e.src.GetCRL(ctx)
+		crlPEM, err := e.src.GetCRL(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("reading CRL for export: %w", err)
+			return materials{}, fmt.Errorf("reading CRL for export: %w", err)
 		}
+		m.crl = crlPEM
 	}
-	return certPEM, crlPEM, nil
+	return m, nil
 }
 
 // namespaceFor returns the namespace a target should be applied to: its own, or
@@ -156,7 +167,7 @@ func (e *Exporter) namespaceFor(t *Target) string {
 
 // applyTarget server-side applies a single target. Force is set so the exporter
 // reclaims any of its fields that drifted (e.g. were edited by another manager).
-func (e *Exporter) applyTarget(ctx context.Context, t *Target, certPEM, crlPEM []byte) error {
+func (e *Exporter) applyTarget(ctx context.Context, t *Target, m materials) error {
 	ns := e.namespaceFor(t)
 	if ns == "" {
 		return fmt.Errorf("no namespace resolved")
@@ -165,10 +176,10 @@ func (e *Exporter) applyTarget(ctx context.Context, t *Target, certPEM, crlPEM [
 	// previously-good cert/CRL in the target object. A requested-but-empty
 	// material means the CA is in an unexpected state, so fail this target (it is
 	// counted and logged) and leave the existing object untouched.
-	if t.Cert && len(certPEM) == 0 {
+	if t.Cert && len(m.cert) == 0 {
 		return fmt.Errorf("refusing to export an empty CA certificate")
 	}
-	if t.CRL && len(crlPEM) == 0 {
+	if t.CRL && len(m.crl) == 0 {
 		return fmt.Errorf("refusing to export an empty CRL")
 	}
 	opts := metav1.ApplyOptions{FieldManager: e.cfg.FieldManager, Force: true}
@@ -178,10 +189,10 @@ func (e *Exporter) applyTarget(ctx context.Context, t *Target, certPEM, crlPEM [
 
 	switch t.Kind {
 	case KindSecret:
-		_, err := e.client.CoreV1().Secrets(ns).Apply(ctx, t.buildSecretApply(ns, certPEM, crlPEM), opts)
+		_, err := e.client.CoreV1().Secrets(ns).Apply(ctx, t.buildSecretApply(ns, m), opts)
 		return err
 	case KindConfigMap:
-		_, err := e.client.CoreV1().ConfigMaps(ns).Apply(ctx, t.buildConfigMapApply(ns, certPEM, crlPEM), opts)
+		_, err := e.client.CoreV1().ConfigMaps(ns).Apply(ctx, t.buildConfigMapApply(ns, m), opts)
 		return err
 	default:
 		// Unreachable after Validate, but fail loudly rather than silently skip.
