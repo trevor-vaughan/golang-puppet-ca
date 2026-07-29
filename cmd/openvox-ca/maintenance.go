@@ -80,6 +80,28 @@ func runMaintenance(ctx context.Context, interval time.Duration, tasks []mainten
 	}
 }
 
+// supersededRevocationTask revokes serving certificates whose delay has
+// elapsed, and reconciles the list when the delay is switched off.
+//
+// Registered whenever self-provisioning is on, including when the delay is
+// zero: with the delay at zero the pass discards entries a previously non-zero
+// setting recorded, so turning revocation off does not strand a revocation that
+// would then fire much later if it were turned back on.
+func supersededRevocationTask(myCA *ca.CA, cfg *serverConfig) maintenanceTask {
+	return maintenanceTask{
+		name: "serving-cert-superseded-revocation",
+		run: func(ctx context.Context) {
+			revokeAfter := time.Duration(cfg.TLSSelfProvisionRevokeAfterSec) * time.Second
+			if err := myCA.ReconcileSuperseded(ctx, revokeAfter); err != nil {
+				// The list is left intact, so the next pass retries. A
+				// superseded certificate staying valid is better than a
+				// revocation this replica cannot record.
+				slog.Error("Could not reconcile superseded serving certificates", "error", err)
+			}
+		},
+	}
+}
+
 // servingRenewalTask reissues the serving certificate when it falls into its
 // renewal window, and swaps the holder so the next handshake uses it.
 func servingRenewalTask(myCA *ca.CA, cfg *serverConfig, holder *servingCertHolder) maintenanceTask {

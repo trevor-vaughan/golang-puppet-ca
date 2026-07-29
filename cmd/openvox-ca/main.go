@@ -591,6 +591,20 @@ func newRootCmd() *cobra.Command {
 				return fmt.Errorf("failed to initialise CA: %w", err)
 			}
 
+			// Reconcile pending serving-certificate revocations before the
+			// listener opens, and deliberately without regard to whether
+			// tls_self_provision is on.
+			//
+			// Startup is the only moment a process reliably observes a
+			// configuration change, and with self-provisioning switched off no
+			// periodic task runs at all — so entries a previous configuration
+			// recorded would otherwise sit in storage indefinitely and fire much
+			// later if the delay were re-enabled. A failure here is logged and
+			// not fatal: it is bookkeeping, and the CA can still serve.
+			if err := myCA.ReconcileSuperseded(ctx, time.Duration(cfg.TLSSelfProvisionRevokeAfterSec)*time.Second); err != nil {
+				slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
+			}
+
 			// SECURITY: Warn if any private key files have overly permissive modes.
 			// The server does not modify existing file permissions; operators should
 			// fix these manually (e.g. chmod 0640 or stricter).
@@ -723,7 +737,9 @@ func newRootCmd() *cobra.Command {
 
 				if cfg.TLSSelfProvision {
 					slog.Info("TLS enabled", "certificate", "self-provisioned", "subject", cfg.Hostname)
-					maintenanceTasks = append(maintenanceTasks, servingRenewalTask(myCA, cfg, servingCerts))
+					maintenanceTasks = append(maintenanceTasks,
+						servingRenewalTask(myCA, cfg, servingCerts),
+						supersededRevocationTask(myCA, cfg))
 				} else {
 					slog.Info("TLS enabled", "cert", cfg.TLSCert)
 				}

@@ -23,6 +23,7 @@ import (
 	"crypto"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -122,19 +123,54 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 		}
 		slog.Info("Issuing serving certificate", "subject", cfg.Subject, "reason", why)
 
+		// Whatever is being replaced, if anything. Read before the mint so the
+		// old serial is still available; recorded after it succeeds, so a
+		// failed mint never schedules a revocation of the certificate still in
+		// use.
+		superseded := c.storedServingLeaf(ctx)
+
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		minted, err := c.issueServingCertLocked(ctx, cfg)
+		c.mu.Unlock()
 		if err != nil {
 			return err
 		}
 		result = minted
+
+		if superseded != nil && superseded.SerialNumber.Cmp(minted.Leaf.SerialNumber) != 0 {
+			if err := c.recordSupersededLocked(ctx, superseded, cfg.RevokeAfter); err != nil {
+				// Not fatal: the new certificate is in place and serving. The
+				// cost is a superseded certificate staying valid until it
+				// expires, which is strictly better than refusing to serve.
+				slog.Warn("Could not record the superseded serving certificate for revocation",
+					"serial", serialHexStr(superseded.SerialNumber), "error", err)
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// storedServingLeaf parses whatever serving certificate is in storage, or nil
+// when there is none or it cannot be read. Used to identify what a mint is
+// about to replace; a nil result simply means there is nothing to supersede.
+func (c *CA) storedServingLeaf(ctx context.Context) *x509.Certificate {
+	certPEM, err := c.Storage.GetServingCert(ctx)
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return nil
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return leaf
 }
 
 // loadUsableServingCert returns the stored serving certificate when every reuse
@@ -370,4 +406,128 @@ func (c *CA) parseServingKey(keyPEM []byte) (crypto.Signer, error) {
 		blockType = "PRIVATE KEY"
 	}
 	return parsePrivateKeyDER(blockType, der)
+}
+
+// supersededEntry records a serving certificate awaiting revocation.
+type supersededEntry struct {
+	Serial   string    `json:"serial"`
+	RevokeAt time.Time `json:"revoke_at"`
+}
+
+// recordSupersededLocked appends leaf to the pending-revocation list.
+//
+// The list is durable and shared rather than held in memory: the replica that
+// minted the replacement may die before the delay elapses, and a restarted
+// replica would otherwise never know a supersession was pending. It also cannot
+// be derived from the inventory, because issueLeafLocked backdates NotBefore by
+// a fixed 24 hours, so the recorded timestamp is not the issue time.
+//
+// The subject lock is held by the caller, which is what serialises this against
+// concurrent mints.
+func (c *CA) recordSupersededLocked(ctx context.Context, leaf *x509.Certificate, revokeAfter time.Duration) error {
+	if revokeAfter <= 0 || leaf == nil {
+		return nil
+	}
+	entries := c.readSuperseded(ctx)
+	entries = append(entries, supersededEntry{
+		Serial:   serialHexStr(leaf.SerialNumber),
+		RevokeAt: time.Now().UTC().Add(revokeAfter),
+	})
+	return c.writeSuperseded(ctx, entries)
+}
+
+// ReconcileSuperseded revokes serving certificates whose delay has elapsed and
+// prunes the list.
+//
+// It reconciles rather than merely draining. With the delay set back to zero —
+// or tls_self_provision switched off — entries already recorded would otherwise
+// sit there indefinitely and fire much later if the delay were re-enabled. So a
+// zero delay discards the list without revoking.
+//
+// Revocation is by recorded serial, never by subject. CA.Revoke resolves
+// subject to *current* certificate, so calling it here would revoke the live
+// serving certificate — the exact opposite of the intent.
+//
+// Idempotent and self-healing: revoking an already-revoked serial is a no-op,
+// and any replica completes work the minting replica started.
+func (c *CA) ReconcileSuperseded(ctx context.Context, revokeAfter time.Duration) error {
+	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	defer cancel()
+
+	entries := c.readSuperseded(ctx)
+	if len(entries) == 0 {
+		return nil
+	}
+
+	if revokeAfter <= 0 {
+		slog.Info("Discarding pending serving-certificate revocations; revocation is disabled",
+			"count", len(entries))
+		return c.writeSuperseded(ctx, nil)
+	}
+
+	now := time.Now().UTC()
+	var due, pending []supersededEntry
+	for _, e := range entries {
+		if now.After(e.RevokeAt) {
+			due = append(due, e)
+		} else {
+			pending = append(pending, e)
+		}
+	}
+	if len(due) == 0 {
+		return nil
+	}
+
+	// Subject lock → CRL lock → c.mu, the order Clean and AutoRenew already
+	// use. Taking them in any other order risks deadlocking against them.
+	err := c.Storage.WithLock(lockCtx, lockNameCRL, func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, e := range due {
+			if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
+				return fmt.Errorf("revoking superseded serving certificate %s: %w", e.Serial, err)
+			}
+			slog.Info("Revoked superseded serving certificate", "serial", e.Serial)
+		}
+		return nil
+	})
+	if err != nil {
+		// Leave the list intact so the next pass retries; a failed revocation
+		// that was pruned anyway would leave a valid credential in circulation
+		// with nothing recording that fact.
+		return err
+	}
+	return c.writeSuperseded(ctx, pending)
+}
+
+// readSuperseded loads the pending-revocation list, treating an absent or
+// unreadable blob as empty. A corrupt list must not stop the CA from serving:
+// the worst case is a superseded certificate staying valid until it expires,
+// where failing closed would take the listener down.
+func (c *CA) readSuperseded(ctx context.Context) []supersededEntry {
+	data, err := c.Storage.GetServingSuperseded(ctx)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Warn("Cannot read pending serving-certificate revocations", "error", err)
+		}
+		return nil
+	}
+	var entries []supersededEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		slog.Warn("Discarding unparseable pending serving-certificate revocations", "error", err)
+		return nil
+	}
+	return entries
+}
+
+// writeSuperseded persists the pending-revocation list.
+func (c *CA) writeSuperseded(ctx context.Context, entries []supersededEntry) error {
+	if len(entries) == 0 {
+		entries = []supersededEntry{}
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return fmt.Errorf("encoding pending serving-certificate revocations: %w", err)
+	}
+	return c.Storage.SaveServingSuperseded(ctx, data)
 }
