@@ -72,10 +72,22 @@ encrypts it at rest using exactly the machinery described above.
 Two things are worth stating plainly:
 
 - With encryption off and a SQL backend, that key is stored in your database in
-  plaintext. **This is the same posture `ca_key` has by default**, since
-  `encrypt_ca_key` is also off unless enabled. An operator who has accepted it
-  for the CA key has already made this decision; it is one blob over, not a new
-  class of exposure.
+  plaintext. **Whether that is a new exposure depends on where your CA key
+  lives**, and the two cases are genuinely different:
+  - **CA key in the backend** (the default, `ca_key_provider: file` with no
+    `ca_key_file`): this is the same posture `ca_key` already has, since
+    `encrypt_ca_key` is off unless enabled. An operator who accepted it for the
+    CA key has already made this decision; it is one blob over.
+  - **CA key held elsewhere** — `ca_key_provider: openbao`, an external signer,
+    or pinned to local disk with `ca_key_file` — your backend holds **no private
+    key at all** today. Enabling `tls_self_provision` puts one there, and that
+    *is* a new class of exposure. `ca_key_file` does not help: it pins only the
+    CA key, and there is no equivalent for the serving key. Set
+    `tls_self_provision_encrypt_key` (with an explicit passphrase — see below),
+    which is the protection available here.
+
+  This matters because holding the CA key at a provider is one of the reasons
+  this feature exists: cert-manager cannot act as a CA issuer without the key.
 - The serving key is far less valuable than the CA key. It authenticates one
   host for one hostname and can be replaced at will — revoke the CA's own
   hostname and the next maintenance pass issues a new one. Compromising the CA

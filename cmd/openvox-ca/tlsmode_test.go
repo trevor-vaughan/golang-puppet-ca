@@ -171,12 +171,41 @@ var _ = Describe("serverConfig.validateTLS", func() {
 		})
 	})
 
+	Describe("renewal window", func() {
+		It("accepts a window inside the certificate lifetime", func() {
+			cfg.TLSSelfProvisionRenewBeforeSec = int((30 * 24 * time.Hour).Seconds())
+			Expect(cfg.validateTLS()).To(Succeed())
+		})
+
+		It("refuses a window at or beyond the certificate lifetime", func() {
+			// Every freshly minted certificate would be immediately due for
+			// renewal, so the maintenance task would reissue on every pass —
+			// signing, appending to the inventory, and growing and re-signing
+			// the CRL each time.
+			cfg.LeafValidityDays = 30
+			cfg.TLSSelfProvisionRenewBeforeSec = int((30 * 24 * time.Hour).Seconds())
+			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("must be less than the certificate lifetime")))
+		})
+
+		It("measures against the configured lifetime, not the default", func() {
+			// A window of 90 days is fine under the five-year default and wrong
+			// under a 30-day leaf_validity_days; the check must read the config.
+			cfg.LeafValidityDays = 30
+			cfg.TLSSelfProvisionRenewBeforeSec = int((90 * 24 * time.Hour).Seconds())
+			Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("must be less than the certificate lifetime")))
+
+			cfg.LeafValidityDays = 0
+			Expect(cfg.validateTLS()).To(Succeed())
+		})
+	})
+
 	Describe("revocation delay", func() {
 		// Three states, per the csr_rate_limit convention already in this file:
 		// unset (-1) takes the built-in default, 0 never revokes, and a
 		// positive value is the operator's own choice.
 
 		It("is unset by default, so 0 stays reachable", func() {
+			clearServerEnv()
 			cfg, err := loadServerConfig("")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cfg.TLSSelfProvisionRevokeAfterSec).To(Equal(-1))

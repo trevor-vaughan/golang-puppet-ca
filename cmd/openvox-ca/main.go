@@ -601,7 +601,7 @@ func newRootCmd() *cobra.Command {
 			// recorded would otherwise sit in storage indefinitely and fire much
 			// later if the delay were re-enabled. A failure here is logged and
 			// not fatal: it is bookkeeping, and the CA can still serve.
-			if err := myCA.ReconcileSuperseded(ctx, cfg.servingRevokeAfter()); err != nil {
+			if err := myCA.ReconcileSuperseded(ctx, servingConfigFrom(cfg)); err != nil {
 				slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
 			}
 
@@ -640,18 +640,18 @@ func newRootCmd() *cobra.Command {
 			addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 			slog.Info("Listening", "address", addr)
 
-			// --- Prometheus exporter ---
-			// The exporter owns a private registry holding the Go/process
-			// collectors, the CA/CRL/leaf certificate collector, and the HTTP
-			// request metrics. When enabled, the API handler is instrumented so
-			// puppetca_http_* counts requests to the Puppet API, while /metrics is
-			// served on a separate listener (see metricsServer below).
 			// Tasks for the shared maintenance loop. Collected as the features
 			// that need them are wired up, and the loop is started below only if
 			// something registered. Each task is gated by its own feature, never
 			// by another's — see runMaintenance.
 			var maintenanceTasks []maintenanceTask
 
+			// --- Prometheus exporter ---
+			// The exporter owns a private registry holding the Go/process
+			// collectors, the CA/CRL/leaf certificate collector, and the HTTP
+			// request metrics. When enabled, the API handler is instrumented so
+			// puppetca_http_* counts requests to the Puppet API, while /metrics is
+			// served on a separate listener (see metricsServer below).
 			handler := srv.Routes()
 			var exporter *metrics.Exporter
 			if cfg.MetricsListen != "" {

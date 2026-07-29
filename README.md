@@ -119,6 +119,22 @@ When `--tls-cert` and `--tls-key` are both set, the server:
 2. Requests (but does not require) a client certificate from every connection
 3. Enforces endpoint-level authorization (see [Authorization tiers](docs/api.md#authorization-tiers))
 
+Alternatively, let the CA issue and renew its own serving certificate — useful
+where an external issuer cannot help, such as when the CA key is held in OpenBao
+and cert-manager therefore cannot act as a CA issuer:
+
+```bash
+./bin/openvox-ca \
+  --cadir /etc/puppetlabs/puppet/ssl \
+  --hostname puppet.example.com \
+  --tls-self-provision \
+  --puppet-server puppet.example.com
+```
+
+It enables HTTPS on the same terms, renews in the background, and is mutually
+exclusive with `--tls-cert`/`--tls-key`. See
+[self-provisioned serving certificate](docs/configuration.md#self-provisioned-serving-certificate).
+
 The complete flag, environment-variable, and config-file reference is in
 [configuring the server](docs/configuration.md).
 

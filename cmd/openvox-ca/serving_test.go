@@ -121,9 +121,10 @@ var _ = Describe("self-provisioned serving certificate", func() {
 		Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
 		before := dialServing(holder, roots, hostname)
 
-		// Force the next pass to reissue by putting any certificate inside the
-		// renewal window.
-		cfg.TLSSelfProvisionRenewBeforeSec = int((100 * 365 * 24 * time.Hour).Seconds())
+		// Force the next pass to reissue by adding a name the stored
+		// certificate does not cover. An over-large renew-before is clamped, so
+		// it cannot be used to force one.
+		cfg.TLSSelfProvisionNames = []string{"alt.example.com"}
 		Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
 
 		after := dialServing(holder, roots, hostname)
@@ -225,5 +226,153 @@ var _ = Describe("runMaintenance", func() {
 		Eventually(a.Load).Should(BeNumerically(">=", 3))
 		Expect(b.Load()).To(BeNumerically("~", a.Load(), 1),
 			"both tasks run on every pass, not one per tick")
+	})
+})
+
+var _ = Describe("serving certificate encrypted at rest", func() {
+	const hostname = "puppet.example.com"
+
+	var (
+		ctx    context.Context
+		store  *storage.StorageService
+		myCA   *ca.CA
+		cfg    *serverConfig
+		roots  *x509.CertPool
+		holder *servingCertHolder
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		roots = x509.NewCertPool()
+		roots.AddCert(myCA.CACert)
+
+		cfg = &serverConfig{
+			TLSSelfProvision:           true,
+			Hostname:                   hostname,
+			TLSSelfProvisionEncryptKey: true,
+		}
+		holder = &servingCertHolder{}
+	})
+
+	It("serves normally when the stored key is encrypted", func() {
+		// tls.X509KeyPair accepts any PEM block whose type ends " PRIVATE KEY",
+		// so an "ENCRYPTED PRIVATE KEY" block passes its type check and then
+		// fails to parse — taking the whole server down at startup, since a
+		// serving-certificate failure there is fatal. The certificate must be
+		// assembled from the decrypted signer, not from the stored blob.
+		Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+
+		presented := dialServing(holder, roots, hostname)
+		Expect(presented.Subject.CommonName).To(Equal(hostname))
+	})
+
+	It("stores the key encrypted rather than in plaintext", func() {
+		// Guards the other direction: a change that fixed the boot failure by
+		// quietly storing plaintext would pass the spec above.
+		Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+
+		keyPEM, err := store.GetServingKey(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(keyPEM)
+		Expect(block).NotTo(BeNil())
+		Expect(block.Type).To(Equal("ENCRYPTED PRIVATE KEY"))
+	})
+
+	It("recovers on restart, reading the encrypted key back", func() {
+		// The stored blob is what a restarted process reads, and parseServingKey
+		// keys on the block type rather than on config — so this is the path
+		// that stays broken if only the mint path is fixed.
+		Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+		first := dialServing(holder, roots, hostname)
+
+		restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
+		restarted.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		restarted.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(restarted.Init(ctx)).To(Succeed())
+
+		freshHolder := &servingCertHolder{}
+		Expect(ensureServingCert(ctx, restarted, cfg, freshHolder)).To(Succeed())
+
+		after := dialServing(freshHolder, roots, hostname)
+		Expect(after.SerialNumber).To(Equal(first.SerialNumber), "the certificate must be reused, not reminted")
+	})
+})
+
+var _ = Describe("maintenance tasks", func() {
+	const hostname = "puppet.example.com"
+
+	var (
+		ctx    context.Context
+		store  *storage.StorageService
+		myCA   *ca.CA
+		cfg    *serverConfig
+		holder *servingCertHolder
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		cfg = &serverConfig{TLSSelfProvision: true, Hostname: hostname}
+		holder = &servingCertHolder{}
+	})
+
+	Describe("servingRenewalTask", func() {
+		It("installs the certificate it resolves", func() {
+			task := servingRenewalTask(myCA, cfg, holder)
+			Expect(task.name).To(Equal("serving-cert-renewal"))
+
+			task.run(ctx)
+
+			pair, err := holder.GetCertificate(nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pair.Leaf.Subject.CommonName).To(Equal(hostname))
+			Expect(myCA.ServingRenewalFailureCount()).To(Equal(uint64(0)))
+		})
+
+		It("counts a failure and keeps the certificate already installed", func() {
+			// The counter is what the mixin alerts on, and the docs single it
+			// out; without a spec the failure branch is dead to the suite while
+			// the bound on how long a superseded certificate stays valid rests
+			// on renewals succeeding.
+			Expect(servingRenewalTask(myCA, cfg, holder).run).NotTo(BeNil())
+			servingRenewalTask(myCA, cfg, holder).run(ctx)
+			before, err := holder.GetCertificate(nil)
+			Expect(err).NotTo(HaveOccurred())
+
+			// An invalid subject fails inside EnsureServingCert, after the
+			// holder already holds a certificate.
+			broken := &serverConfig{TLSSelfProvision: true, Hostname: "../etc/passwd"}
+			servingRenewalTask(myCA, broken, holder).run(ctx)
+
+			Expect(myCA.ServingRenewalFailureCount()).To(Equal(uint64(1)))
+			after, err := holder.GetCertificate(nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after.Leaf.SerialNumber).To(Equal(before.Leaf.SerialNumber),
+				"a failed renewal must leave the working certificate in place")
+		})
+	})
+
+	Describe("supersededRevocationTask", func() {
+		It("passes the resolved delay through, so a zero setting still drains", func() {
+			// Registered even when the delay is zero, so entries a previously
+			// non-zero setting recorded are discarded rather than stranded.
+			cfg.TLSSelfProvisionRevokeAfterSec = -1
+			task := supersededRevocationTask(myCA, cfg)
+			Expect(task.name).To(Equal("serving-cert-superseded-revocation"))
+
+			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+			Expect(func() { task.run(ctx) }).NotTo(Panic())
+		})
 	})
 })

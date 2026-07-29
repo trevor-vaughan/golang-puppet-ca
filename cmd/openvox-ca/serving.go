@@ -70,13 +70,31 @@ func servingConfigFrom(cfg *serverConfig) ca.ServingConfig {
 }
 
 // toTLSCertificate assembles a tls.Certificate from issued material.
+//
+// It builds from the parsed leaf and the decrypted signer rather than from the
+// stored PEM. tls.X509KeyPair would be the obvious call and is wrong here:
+// crypto/tls accepts any PEM block whose type ends " PRIVATE KEY", so an
+// "ENCRYPTED PRIVATE KEY" block passes its type check and then fails to parse —
+// and because a serving-certificate failure at startup is fatal, enabling
+// tls_self_provision_encrypt_key would stop the server booting. Worse, the
+// encrypted blob is persisted before this runs, so turning the flag back off
+// would not recover it.
+//
+// ServingCertificate.Key is the key the CA already decrypted while validating
+// the stored material, so using it costs nothing and cannot disagree with the
+// certificate: EnsureServingCert has checked they match.
 func toTLSCertificate(sc *ca.ServingCertificate) (*tls.Certificate, error) {
-	pair, err := tls.X509KeyPair(sc.CertPEM, sc.KeyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("assembling serving certificate for TLS: %w", err)
+	if sc.Key == nil {
+		return nil, fmt.Errorf("assembling serving certificate for TLS: no private key resolved")
 	}
-	pair.Leaf = sc.Leaf
-	return &pair, nil
+	if sc.Leaf == nil {
+		return nil, fmt.Errorf("assembling serving certificate for TLS: no certificate resolved")
+	}
+	return &tls.Certificate{
+		Certificate: [][]byte{sc.Leaf.Raw},
+		PrivateKey:  sc.Key,
+		Leaf:        sc.Leaf,
+	}, nil
 }
 
 // ensureServingCert resolves the serving certificate and installs it in holder.

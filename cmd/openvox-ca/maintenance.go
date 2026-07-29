@@ -91,10 +91,16 @@ func supersededRevocationTask(myCA *ca.CA, cfg *serverConfig) maintenanceTask {
 	return maintenanceTask{
 		name: "serving-cert-superseded-revocation",
 		run: func(ctx context.Context) {
-			if err := myCA.ReconcileSuperseded(ctx, cfg.servingRevokeAfter()); err != nil {
+			if err := myCA.ReconcileSuperseded(ctx, servingConfigFrom(cfg)); err != nil {
 				// The list is left intact, so the next pass retries. A
 				// superseded certificate staying valid is better than a
-				// revocation this replica cannot record.
+				// revocation this replica cannot record — but only until the
+				// sweep succeeds, so a pass that keeps failing is counted as
+				// well as logged. crlUpdateFailures does not cover it: the
+				// failures this path hits first are a lock timeout or a storage
+				// error on the pending list, neither of which is a CRL
+				// amendment.
+				myCA.IncServingRevocationFailures()
 				slog.Error("Could not reconcile superseded serving certificates", "error", err)
 			}
 		},

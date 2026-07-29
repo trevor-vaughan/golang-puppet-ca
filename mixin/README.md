@@ -11,6 +11,11 @@ alerting rules for the openvox-ca exporter. It alerts on:
 - **CRL update failures** — the CA failing to amend its CRL (a revocation it
   could not record, or a CRL it could not re-sign or write), which can leave
   revoked or superseded certificates still valid.
+- **Serving-certificate renewal failures** — the CA failing to renew the
+  certificate its own listener presents (only when
+  [`tls_self_provision`](../docs/configuration.md#self-provisioned-serving-certificate)
+  is in use). Silent until the certificate expires, at which point every agent
+  handshake fails at once.
 - **Kubernetes export** targets whose applies keep failing (only when the
   [Kubernetes export](../docs/kubernetes-export.md) feature is in use).
 

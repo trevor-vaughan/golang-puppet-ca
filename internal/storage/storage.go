@@ -536,9 +536,12 @@ func (s *StorageService) SaveCAPubKey(ctx context.Context, data []byte) error {
 //
 // The key is BlobPrivate, exactly as the CA key already is. An operator running
 // a SQL backend without tls_self_provision_encrypt_key stores this key in their
-// database in plaintext — the same posture ca_key has by default, since
-// encrypt_ca_key is also off unless enabled. It is one blob over, not a new
-// class of exposure.
+// database in plaintext. Whether that is a new exposure depends on where the CA
+// key lives: with the default file provider it is the posture ca_key already
+// has, but under ca_key_provider: openbao, an external signer, or ca_key_file
+// the backend holds no private key at all until this feature is enabled.
+// collectOverrides has no KeyServingKey escape hatch, so ca_key_file does not
+// cover it — tls_self_provision_encrypt_key is the protection there.
 
 func (s *StorageService) GetServingCert(ctx context.Context) ([]byte, error) {
 	s.fileMu.RLock()

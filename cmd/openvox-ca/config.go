@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/config"
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
 	"go.yaml.in/yaml/v3"
@@ -348,7 +349,34 @@ func (c *serverConfig) validateTLS() error {
 		}
 	}
 
+	// A renewal window at or beyond the certificate's own lifetime makes every
+	// freshly minted certificate immediately due for renewal, so the
+	// maintenance task mints again on the next tick and forever after. Each
+	// pass signs a certificate, appends to the inventory, and schedules a
+	// revocation that grows and re-signs the CRL -- a remote round trip under
+	// ca_key_provider: openbao. Reject it here; servingRenewBefore also clamps,
+	// because the leaf's effective lifetime is capped by the CA certificate's
+	// remaining life and so shrinks below any fixed window eventually.
+	if c.TLSSelfProvisionRenewBeforeSec > 0 {
+		lifetime := leafValidity(c.LeafValidityDays)
+		if window := time.Duration(c.TLSSelfProvisionRenewBeforeSec) * time.Second; window >= lifetime {
+			return fmt.Errorf("tls_self_provision_renew_before_sec (%s) must be less than the certificate "+
+				"lifetime (%s): a window at or beyond it makes every new certificate immediately due for "+
+				"renewal, so the CA would reissue on every maintenance pass indefinitely",
+				window, lifetime)
+		}
+	}
+
 	return nil
+}
+
+// leafValidity resolves the configured leaf lifetime, mirroring the CA's own
+// defaulting so validation and issuance cannot disagree.
+func leafValidity(days int) time.Duration {
+	if days > 0 {
+		return time.Duration(days) * 24 * time.Hour
+	}
+	return ca.DefaultCertValidity
 }
 
 // defaultCRLRefreshInterval is how often the background job checks whether the

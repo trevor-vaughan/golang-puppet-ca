@@ -199,6 +199,31 @@
         ],
       },
       {
+        name: 'openvox-ca-serving-certificate',
+        rules: [
+          {
+            alert: 'PuppetCAServingCertRenewalFailing',
+            // The CA could not renew the certificate its own listener presents.
+            // Nothing breaks at the moment of failure — the current certificate
+            // keeps serving — so this is invisible until it expires and every
+            // agent's TLS handshake starts failing at once. It also undermines
+            // tls_self_provision_revoke_after_sec, whose exposure bound assumes
+            // a superseded certificate is promptly replaced. The counter resets
+            // on restart, so alert on increase() over a window.
+            expr: 'increase(puppetca_serving_cert_renewal_failures_total{%(selector)s}[%(window)s]) > 0' % {
+              selector: $._config.puppetCASelector,
+              window: $._config.servingRenewalWindow,
+            },
+            'for': $._config.servingRenewalFor,
+            labels: { severity: 'warning' } + $._config.alertLabels,
+            annotations: {
+              summary: 'Puppet CA is failing to renew its own serving certificate.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not renew the certificate its listener presents (puppetca_serving_cert_renewal_failures_total is rising). The current certificate still serves, so this is silent until it expires; check the CA logs and its storage backend.',
+            },
+          },
+        ],
+      },
+      {
         name: 'openvox-ca-kubernetes-export',
         rules: [
           {
