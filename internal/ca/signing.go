@@ -318,7 +318,6 @@ func extKeyUsageOrDefault(eku []x509.ExtKeyUsage) []x509.ExtKeyUsage {
 // copied onto an issued leaf certificate. Bundling them keeps issueLeafLocked's
 // signature manageable and ensures every SAN type is threaded through together,
 // rather than DNS names alone.
-
 type subjectAltNames struct {
 	DNSNames       []string
 	IPAddresses    []net.IP
@@ -777,6 +776,29 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte) ([]byte, 
 		// pass CRL/OCSP checks now that it is no longer the cert served for
 		// this subject. Best-effort like Clean's revoke-then-delete: a
 		// failure here shouldn't undo the renewal the caller is waiting on.
+		// SECURITY: never revoke the certificate the listener is serving.
+		//
+		// The serving certificate is an ordinary node certificate for the CA's
+		// own hostname, which is deliberate — but it means that if a node ever
+		// holds that same certname, LatestSerialForSubject resolves to
+		// whichever was issued last. When that is the CA's, this revoke would
+		// take the live serving certificate out of circulation immediately,
+		// with none of the delay tls_self_provision_revoke_after_sec exists to
+		// give, and every agent doing revocation checking would fail handshakes
+		// until the next maintenance pass re-mints.
+		//
+		// validateTLS refuses to start when hostname is a puppet_server CN, but
+		// it cannot see an ordinary agent that takes the name. This check can:
+		// it compares against the certificate actually stored for serving, so
+		// it holds for any colliding certname however it was issued. Gated on
+		// the hostname so it costs nothing for every other subject.
+		if subject == c.Hostname && c.servingSerialMatches(ctx, oldSerial) {
+			slog.Warn("Renew: refusing to revoke the CA's live serving certificate; "+
+				"another certificate has been issued under the CA's own hostname",
+				"subject", subject, "serial", oldSerial)
+			return nil
+		}
+
 		// Lock ordering: subject-lock (held) -> CRL-lock -> c.mu, matching Clean.
 		if err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
 			c.mu.Lock()

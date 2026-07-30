@@ -19,8 +19,13 @@ package ca_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -353,6 +358,10 @@ var _ = Describe("Superseded serving certificates", func() {
 
 	// reissue forces a mint by putting any stored certificate inside the
 	// renewal window, and returns the certificate it replaced.
+	//
+	// reissueCount is reset per spec in the BeforeEach below: the Describe body
+	// runs once at tree construction, so leaving it here would make each spec's
+	// forced SAN depend on how many siblings ran first.
 	reissueCount := 0
 	reissue := func() *x509.Certificate {
 		GinkgoHelper()
@@ -374,6 +383,7 @@ var _ = Describe("Superseded serving certificates", func() {
 	}
 
 	BeforeEach(func() {
+		reissueCount = 0
 		ctx = context.Background()
 		store = storage.New(GinkgoT().TempDir())
 		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
@@ -498,6 +508,123 @@ func revokeCfg(subject string, revokeAfter time.Duration) ca.ServingConfig {
 	return ca.ServingConfig{Subject: subject, RevokeAfter: revokeAfter}
 }
 
+// failReadBackend fails Get for one key with a non-fs.ErrNotExist error, so a
+// read failure can be told apart from absent material. Everything else passes
+// through to the real backend.
+type failReadBackend struct {
+	storage.Backend
+	failKey string
+}
+
+func (b *failReadBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if key == b.failKey {
+		return nil, errors.New("backend unavailable")
+	}
+	return b.Backend.Get(ctx, key)
+}
+
+var _ = Describe("Renewing a node that has taken the CA's hostname", func() {
+	// validateTLS refuses this configuration when it can see it -- a
+	// puppet_server CN -- but it cannot see an ordinary agent that takes the
+	// name. Without the guard in Renew, that agent's renewal revokes the
+	// certificate the listener is serving, immediately, with none of the delay
+	// tls_self_provision_revoke_after_sec exists to give.
+	const hostname = "openvox-ca.example.com"
+
+	var (
+		ctx   context.Context
+		store *storage.StorageService
+		myCA  *ca.CA
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+	})
+
+	It("does not revoke the live serving certificate", func() {
+		serving, err := myCA.EnsureServingCert(ctx, ca.ServingConfig{Subject: hostname})
+		Expect(err).NotTo(HaveOccurred())
+
+		// A node renews under the CA's own name. LatestSerialForSubject
+		// resolves to the serving certificate, because it was issued last.
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		Expect(err).NotTo(HaveOccurred())
+		der, err := x509.CreateCertificateRequest(rand.Reader,
+			&x509.CertificateRequest{Subject: pkix.Name{CommonName: hostname}}, key)
+		Expect(err).NotTo(HaveOccurred())
+		csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+
+		_, err = myCA.Renew(ctx, hostname, csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, serving.Leaf.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeFalse(),
+			"renewing under the CA's hostname must not revoke the certificate it is serving")
+	})
+})
+
+var _ = Describe("Serving certificate read failures", func() {
+	// The rule under test: a read failure is not evidence the stored material
+	// is unusable. Minting on it would let a degraded backend rotate the
+	// certificate every replica serves and schedule the good one for
+	// revocation. Without these specs the guard can be deleted and the whole
+	// suite stays green.
+	const subject = "puppet.example.com"
+
+	var (
+		ctx  context.Context
+		dir  string
+		base storage.Backend
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		dir = GinkgoT().TempDir()
+		base = storage.NewFilesystemBackend(dir)
+
+		// Seed a good certificate through a normal service first.
+		seed := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, subject)
+		seed.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		seed.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(seed.Init(ctx)).To(Succeed())
+		Expect(seed.EnsureServingCert(ctx, ca.ServingConfig{Subject: subject})).Error().NotTo(HaveOccurred())
+	})
+
+	withFailingRead := func(failKey string) *ca.CA {
+		GinkgoHelper()
+		store := storage.NewWithBackend(&failReadBackend{Backend: base, failKey: failKey}, dir)
+		blind := ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(blind.Init(ctx)).To(Succeed())
+		return blind
+	}
+
+	DescribeTable("surfaces the failure instead of minting over the stored certificate",
+		func(failKey, wantReason string) {
+			blind := withFailingRead(failKey)
+			before := blind.ServingCertIssued()
+
+			code, detail := blind.ServingReuseReasonForTest(ctx, ca.ServingConfig{Subject: subject})
+			Expect(code).To(Equal(wantReason))
+			Expect(detail).To(BeEmpty(), "backend error text must not reach the reason")
+
+			_, err := blind.EnsureServingCert(ctx, ca.ServingConfig{Subject: subject})
+			Expect(err).To(HaveOccurred(), "a read failure must not be treated as unusable material")
+			Expect(blind.ServingCertIssued()).To(Equal(before),
+				"nothing may be minted over a certificate we merely could not read")
+		},
+		Entry("certificate", storage.KeyServingCert, "certificate-unreadable"),
+		Entry("key", storage.KeyServingKey, "key-unreadable"),
+	)
+})
+
 var _ = Describe("Serving certificate reuse reasons", func() {
 	const subject = "puppet.example.com"
 
@@ -528,6 +655,31 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 		code, detail := reasonFor()
 		Expect(code).To(BeEmpty())
 		Expect(detail).To(BeEmpty())
+	})
+
+	It("mints again when the key never landed, and says so distinctly", func() {
+		// The torn-write case the code documents: certificate stored, key
+		// absent. Genuinely unusable material, so it must mint -- and it must
+		// be distinguishable from a key that could not be *read*, which is I/O
+		// and must not mint over a certificate that may be fine.
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Expect(store.Backend().Delete(ctx, storage.KeyServingKey)).To(Succeed())
+
+		code, detail := reasonFor()
+		Expect(code).To(Equal("key-missing"))
+		Expect(detail).To(BeEmpty())
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+	})
+
+	It("mints again when the stored certificate is not PEM", func() {
+		// The certificate side of the unusable-material policy; every other
+		// spec here corrupts the key.
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Expect(store.SaveServingCert(ctx, []byte("not a certificate\n"))).To(Succeed())
+
+		code, _ := reasonFor()
+		Expect(code).To(Equal("certificate-not-pem"))
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
 	})
 
 	It("reports a stable code with no detail when nothing is stored", func() {
