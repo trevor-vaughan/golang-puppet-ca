@@ -33,6 +33,26 @@ jobs:
       - name: Check formatting, vet, module tidy, and lint
         run: mage dev:check
 
+      # The mixin is Jsonnet, so a mistyped $._config key or format verb is an
+      # error at render time that no Go target would catch. dev:mixin skips
+      # cleanly when the tools are absent, so pin them here.
+      # promtool cannot be `go install`ed: the Prometheus module's go.mod carries
+      # replace directives, which `go install pkg@version` refuses. Take it from
+      # the release tarball instead.
+      - name: Install jsonnet and promtool
+        env:
+          PROMETHEUS_VERSION: 3.13.2
+        run: |
+          go install github.com/google/go-jsonnet/cmd/jsonnet@v0.21.0
+          curl -sSfL --retry 3 \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}"
+          sudo install "${RUNNER_TEMP}/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: Render and validate the Prometheus mixin
+        run: mage dev:mixin
+
   # -- Dockerfile lint (hadolint) ----------------------------------------------
   # Lints every Dockerfile in the repo. hadolint has no auto-fix mode (it only
   # reports), so this job fails the build on violations and the developer fixes

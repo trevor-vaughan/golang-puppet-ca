@@ -221,6 +221,47 @@
               description: 'The Puppet CA on {{ $labels.instance }} could not renew the certificate its listener presents (puppetca_serving_cert_renewal_failures_total is rising). The current certificate still serves, so this is silent until it expires; check the CA logs and its storage backend.',
             },
           },
+          {
+            alert: 'PuppetCAServingCertRevocationFailing',
+            // The sweep that revokes superseded serving certificates is
+            // failing. Nothing breaks visibly: the CA serves its current
+            // certificate throughout. What is lost is the exposure bound
+            // tls_self_provision_revoke_after_sec exists to enforce -- until a
+            // sweep succeeds, the certificate it replaced stays a valid
+            // credential.
+            expr: 'increase(puppetca_serving_cert_revocation_failures_total{%(selector)s}[%(window)s]) > 0' % {
+              selector: $._config.puppetCASelector,
+              window: $._config.servingRevocationWindow,
+            },
+            'for': $._config.servingRevocationFor,
+            labels: { severity: 'warning' } + $._config.alertLabels,
+            annotations: {
+              summary: 'Puppet CA is failing to revoke superseded serving certificates.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). The replaced certificate remains a valid credential until a sweep succeeds; check the CA logs and its storage backend.',
+            },
+          },
+          {
+            alert: 'PuppetCAServingCertChurning',
+            // Replicas minting over each other. Each pass writes an inventory
+            // row, schedules a revocation and re-signs the CRL -- a remote
+            // round trip under ca_key_provider: openbao -- and the CRL entries
+            // persist for the certificate's full validity. Inferring this from
+            // serials would mean noticing an inventory growing for no reason.
+            expr: 'increase(puppetca_serving_cert_issued_total{%(selector)s}[%(window)s]) > %(threshold)d' % {
+              selector: $._config.puppetCASelector,
+              window: $._config.servingChurnWindow,
+              threshold: $._config.servingChurnThreshold,
+            },
+            'for': $._config.servingChurnFor,
+            labels: { severity: 'warning' } + $._config.alertLabels,
+            annotations: {
+              summary: 'Puppet CA is reissuing its serving certificate repeatedly.',
+              description: 'The Puppet CA on {{ $labels.instance }} has reissued its serving certificate more than %(threshold)d times in %(window)s. Replicas that disagree about which CA certificate is current will mint over each other on every maintenance pass; a fleet restart resolves it.' % {
+                threshold: $._config.servingChurnThreshold,
+                window: $._config.servingChurnWindow,
+              },
+            },
+          },
         ],
       },
       {

@@ -11,11 +11,15 @@ alerting rules for the openvox-ca exporter. It alerts on:
 - **CRL update failures** — the CA failing to amend its CRL (a revocation it
   could not record, or a CRL it could not re-sign or write), which can leave
   revoked or superseded certificates still valid.
-- **Serving-certificate renewal failures** — the CA failing to renew the
-  certificate its own listener presents (only when
+- **Serving-certificate failures** — three rules, all only meaningful when
   [`tls_self_provision`](../docs/configuration.md#self-provisioned-serving-certificate)
-  is in use). Silent until the certificate expires, at which point every agent
-  handshake fails at once.
+  is in use. *Renewal failing*: the CA cannot renew the certificate its own
+  listener presents, which is silent until it expires, at which point every
+  agent handshake fails at once. *Revocation failing*: the sweep that revokes
+  superseded serving certificates is failing, so the replaced certificate stays
+  a valid credential past the bound `tls_self_provision_revoke_after_sec` is
+  meant to enforce. *Churning*: replicas reissuing over each other, which grows
+  the inventory and the CRL for no reason.
 - **Kubernetes export** targets whose applies keep failing (only when the
   [Kubernetes export](../docs/kubernetes-export.md) feature is in use).
 
@@ -99,3 +103,10 @@ jsonnet -J vendor -m . mixin.jsonnet
 | `crlUpdateWindow` | `1h` | Window over which CRL-update failures are counted (the metric is a restart-resetting counter). |
 | `crlUpdateFor` | `15m` | `for:` debounce for the CRL-update-failure alert. |
 | `expiryFor` / `scrapeFor` / `readyFor` / `downFor` / `k8sExportFailingFor` | `1h` / `15m` / `10m` / `5m` / `15m` | `for:` debounce durations. |
+| `servingRenewalWindow` | `1h` | Window over which serving-certificate renewal failures are counted. |
+| `servingRenewalFor` | `15m` | `for:` debounce for the serving-renewal-failure alert. |
+| `servingRevocationWindow` | `1h` | Window over which superseded-revocation failures are counted. |
+| `servingRevocationFor` | `15m` | `for:` debounce for the superseded-revocation-failure alert. |
+| `servingChurnWindow` | `6h` | Window over which serving-certificate reissues are counted. |
+| `servingChurnThreshold` | `4` | Reissues within that window before churn is alerted. One per renewal period is normal. |
+| `servingChurnFor` | `15m` | `for:` debounce for the churn alert. |

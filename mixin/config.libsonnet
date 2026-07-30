@@ -51,6 +51,17 @@
     servingRenewalWindow: '1h',
     servingRenewalFor: '15m',
 
+    // Superseded serving certificates that could not be revoked. Same shape as
+    // the renewal window: the counter resets on restart, so alert on increase().
+    servingRevocationWindow: '1h',
+    servingRevocationFor: '15m',
+
+    // Sustained reissue churn. One reissue per renewal period is normal; more
+    // than a handful in six hours means replicas are minting over each other.
+    servingChurnWindow: '6h',
+    servingChurnThreshold: 4,
+    servingChurnFor: '15m',
+
     // --- Kubernetes export ---
     // A target alerts while its most recent apply attempt failed (last-error
     // newer than last-success). Exports are event-driven and can be days apart

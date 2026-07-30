@@ -1765,6 +1765,37 @@ func (Dev) Lint() error {
 	return nil
 }
 
+// Mixin renders the Prometheus mixin and validates the rules it produces.
+//
+// The README documents these two commands; without a target nothing runs them,
+// and a mistyped $._config key or format verb is a Jsonnet error at import time
+// that would otherwise reach a release unnoticed.
+func (Dev) Mixin() error {
+	for _, tool := range []string{"jsonnet", "promtool"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			fmt.Printf("SKIP: %s not found on PATH; skipping mixin validation\n", tool)
+			return nil
+		}
+	}
+
+	fmt.Println("Rendering the Prometheus mixin...")
+	if err := os.MkdirAll(".test-output", 0755); err != nil {
+		return err
+	}
+	rules, err := sh.Output("jsonnet", "-S", "-e",
+		`std.manifestYamlDoc((import 'mixin/mixin.libsonnet').prometheusAlerts)`)
+	if err != nil {
+		return err
+	}
+	out := filepath.Join(".test-output", "puppet_ca_alerts.yaml")
+	if err := os.WriteFile(out, []byte(rules), 0644); err != nil {
+		return err
+	}
+
+	fmt.Println("Checking rules with promtool...")
+	return sh.RunV("promtool", "check", "rules", out)
+}
+
 // Tidy runs go mod tidy and go fmt on any files that need it.
 func (Dev) Tidy() error {
 	fmt.Println("Tidying modules...")

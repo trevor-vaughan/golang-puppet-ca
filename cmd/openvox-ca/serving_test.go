@@ -345,7 +345,6 @@ var _ = Describe("maintenance tasks", func() {
 			// out; without a spec the failure branch is dead to the suite while
 			// the bound on how long a superseded certificate stays valid rests
 			// on renewals succeeding.
-			Expect(servingRenewalTask(myCA, cfg, holder).run).NotTo(BeNil())
 			servingRenewalTask(myCA, cfg, holder).run(ctx)
 			before, err := holder.GetCertificate(nil)
 			Expect(err).NotTo(HaveOccurred())
@@ -364,15 +363,69 @@ var _ = Describe("maintenance tasks", func() {
 	})
 
 	Describe("supersededRevocationTask", func() {
-		It("passes the resolved delay through, so a zero setting still drains", func() {
+		It("passes a zero delay through, discarding the list without revoking", func() {
 			// Registered even when the delay is zero, so entries a previously
 			// non-zero setting recorded are discarded rather than stranded.
-			cfg.TLSSelfProvisionRevokeAfterSec = -1
-			task := supersededRevocationTask(myCA, cfg)
-			Expect(task.name).To(Equal("serving-cert-superseded-revocation"))
-
+			// Asserting the drain, not merely that it does not panic: this is
+			// the only place the resolved duration reaches the CA layer, so
+			// transposing RevokeAfter and RenewBefore in servingConfigFrom
+			// would otherwise leave the suite green.
+			// Recorded under a non-zero delay -- nothing is recorded at all
+			// when the delay is off -- then drained by a task configured with
+			// zero, which is exactly the "previously non-zero setting" the
+			// comment describes.
+			cfg.TLSSelfProvisionRevokeAfterSec = 7200
 			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
-			Expect(func() { task.run(ctx) }).NotTo(Panic())
+			first, err := holder.GetCertificate(nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.Storage.SaveServingKey(ctx, []byte("not a key\n"))).To(Succeed())
+			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+			pending, err := myCA.Storage.GetServingSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(pending)).NotTo(Equal("[]"))
+
+			off := &serverConfig{TLSSelfProvision: true, Hostname: hostname, TLSSelfProvisionRevokeAfterSec: 0}
+			task := supersededRevocationTask(myCA, off)
+			Expect(task.name).To(Equal("serving-cert-superseded-revocation"))
+			task.run(ctx)
+
+			drained, err := myCA.Storage.GetServingSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(drained)).To(Equal("[]"), "a zero delay discards the list")
+			revoked, err := myCA.IsRevokedSerial(ctx, first.Leaf.SerialNumber)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(revoked).To(BeFalse(), "discarding must not revoke")
+		})
+
+		It("counts a failure and leaves the pending list intact", func() {
+			// The sibling of the renewal-failure spec above, and for the same
+			// reason: this counter is what bounds how long a superseded
+			// certificate stays a valid credential, and without a spec its
+			// branch is dead to the suite.
+			cfg.TLSSelfProvisionRevokeAfterSec = 7200
+			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+			Expect(myCA.Storage.SaveServingKey(ctx, []byte("not a key\n"))).To(Succeed())
+			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+			before, err := myCA.Storage.GetServingSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(before)).NotTo(Equal("[]"))
+
+			// A malformed serial makes revokeSerialLocked fail *after* the list
+			// has been read, which is the branch that must not write the
+			// pruned list back. An empty hostname would return before touching
+			// storage, leaving the assertion below trivially true.
+			Expect(myCA.Storage.SaveServingSuperseded(ctx,
+				[]byte(`[{"serial":"zz","revoke_at":"2020-01-01T00:00:00Z"}]`))).To(Succeed())
+			before, err = myCA.Storage.GetServingSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			supersededRevocationTask(myCA, cfg).run(ctx)
+
+			Expect(myCA.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+			after, err := myCA.Storage.GetServingSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(after)).To(Equal(string(before)),
+				"a failed sweep must not drop what it could not revoke")
 		})
 	})
 })
