@@ -126,10 +126,17 @@ and cert-manager therefore cannot act as a CA issuer:
 ```bash
 ./bin/openvox-ca \
   --cadir /etc/puppetlabs/puppet/ssl \
-  --hostname puppet.example.com \
+  --hostname openvox-ca.example.com \
   --tls-self-provision \
   --puppet-server puppet.example.com
 ```
+
+The CA's `--hostname` must be a name of its own, not one a node also holds. The
+serving certificate is an ordinary node certificate issued under that name, so
+sharing it with the OpenVox Server would put two certificates in one
+per-subject slot. The CA refuses to start when that name is also a
+`--puppet-server` CN, but it cannot detect an ordinary agent sharing it — see
+[the caveat in the configuration guide](docs/configuration.md#self-provisioned-serving-certificate).
 
 It enables HTTPS on the same terms, renews in the background, and is mutually
 exclusive with `--tls-cert`/`--tls-key`. See

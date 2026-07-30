@@ -240,8 +240,19 @@ rather than as the configuration error it is.
 The certificate and its private key live in the storage backend
 (`serving_cert`, `serving_key`), not in `cadir`, so every replica serves the
 same certificate and it survives a restart with an ephemeral `cadir`. It is
-issued **serverAuth only**, so it is never usable as a client credential even
-when the CA's hostname also appears in `puppet_server`.
+issued **serverAuth only**, so it is never usable as a client credential.
+
+Otherwise it is an ordinary node certificate issued for the CA's own hostname:
+it occupies that subject's certificate slot and inventory row, and it renews and
+revokes through exactly the same machinery as any node's. That uniformity is
+deliberate — there is nothing about it to special-case — and it is why the CA's
+`hostname` **must be a name of its own**. If a node holds the same certname,
+both certificates land in one per-subject slot and whichever was issued last
+wins: renewing the node's revokes the certificate the CA is serving, and
+revoking the CA's hostname to rotate a compromised serving key can revoke the
+node's credential instead. `openvox-ca` refuses to start when `hostname` is also
+a `puppet_server` CN, but it cannot detect an ordinary agent that happens to
+share the name — choose a distinct one.
 
 ### Renewal
 

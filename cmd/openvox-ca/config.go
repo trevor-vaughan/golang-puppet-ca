@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -317,12 +318,31 @@ func (c *serverConfig) validateTLS() error {
 			"the CA either issues its own serving certificate or loads one from disk, not both")
 	}
 
-	// bootstrapCA falls back to the subject "puppet" when hostname is unset,
-	// which would produce a serving certificate no client validates — surfacing
-	// as a TLS handshake failure rather than as the configuration error it is.
+	// Caught here rather than at the CA layer for the message, not the
+	// behaviour: EnsureServingCert rejects an empty subject too, but its error
+	// names neither hostname nor tls_self_provision, so an operator reads a
+	// startup failure that does not say what to set.
 	if c.Hostname == "" {
 		return fmt.Errorf("tls_self_provision requires hostname to be set: it is the common name and " +
 			"first subject alternative name of the certificate clients will verify")
+	}
+
+	// The serving certificate is an ordinary node certificate issued for the
+	// CA's own hostname: same per-subject slot, same inventory subject, same
+	// renewal and revocation machinery. That uniformity is deliberate, and it
+	// is why the CA's hostname cannot also be a node's certname.
+	//
+	// Sharing the name is not a small misconfiguration. Both certificates
+	// resolve through LatestSerialForSubject, so whichever was issued last wins:
+	// a node renewal for that name revokes the live serving certificate
+	// outright, and "revoke the CA's hostname" to rotate a compromised serving
+	// key can instead revoke the node's admin credential. Neither is
+	// recoverable by retrying.
+	if slices.Contains(c.puppetServerCNs(), c.Hostname) {
+		return fmt.Errorf("tls_self_provision requires hostname (%q) not to be a puppet_server CN: "+
+			"the CA issues its serving certificate under that name, so a node holding it too would "+
+			"share the certificate's per-subject slot and inventory subject -- renewing one revokes "+
+			"the other. Give the CA a name of its own", c.Hostname)
 	}
 
 	// The auto-generated passphrase lives in cadir. With an ephemeral cadir --
@@ -814,6 +834,18 @@ func splitAndTrim(s, sep string) []string {
 		}
 	}
 	return out
+}
+
+// puppetServerCNs returns the admin CNs this configuration grants, from the
+// flag and the file together. Errors reading the file are ignored here: the
+// caller that builds the allow list reports them, and this is only used to
+// reject an overlap.
+func (c *serverConfig) puppetServerCNs() []string {
+	cns := splitAndTrim(c.PuppetServer, ",")
+	if fromFile, err := loadPuppetServerFile(c.PuppetServerFile); err == nil {
+		cns = append(cns, fromFile...)
+	}
+	return cns
 }
 
 // loadPuppetServerFile reads a file containing puppet-server CNs, one per
