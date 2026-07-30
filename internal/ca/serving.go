@@ -144,8 +144,24 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 		// use.
 		superseded := c.storedServingLeaf(ctx)
 
+		// Carry the stored certificate's names forward only when a missing name
+		// is why we are minting. That makes this path monotone: the name set
+		// only grows, so replicas whose configurations are *incomparable* -- a
+		// rename, where each has a name the other lacks -- converge on the
+		// union instead of minting over each other forever. A subset rule alone
+		// converges only when one configuration contains the other.
+		//
+		// Every other reason mints the configured names verbatim, which is what
+		// keeps the set shrinkable: revoking the serving certificate forces a
+		// mint under reasonRevoked, so it drops any name no longer configured.
+		// That is the documented way to apply a withdrawal.
+		var carry []string
+		if why.Code == reasonMissingName && superseded != nil {
+			carry = superseded.DNSNames
+		}
+
 		c.mu.Lock()
-		minted, err := c.issueServingCertLocked(ctx, cfg)
+		minted, err := c.issueServingCertLocked(ctx, cfg, carry)
 		c.mu.Unlock()
 		if err != nil {
 			return err
@@ -162,7 +178,8 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 				// can rediscover it. No later sweep will find it, which is the
 				// non-self-healing arm the counter's contract names.
 				c.IncServingRevocationFailures()
-				slog.Warn("Could not record the superseded serving certificate for revocation",
+				slog.Warn("Could not record the superseded serving certificate; it will not be "+
+					"scheduled for revocation",
 					"serial", serialHexStr(superseded.SerialNumber), "error", err)
 			}
 		}
@@ -384,7 +401,9 @@ func publicKeysEqual(a, b any) bool {
 // it mirrors Generate, and Generate's siblings Sign and SignWithTTL take the
 // subject lock themselves. Copying either would deadlock every backend on the
 // startup path.
-func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig) (*ServingCertificate, error) {
+// carryNames, when non-empty, is unioned with the configured names. Only the
+// name-drift path passes it; see EnsureServingCert.
+func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig, carryNames []string) (*ServingCertificate, error) {
 	// The serving key follows the leaf key configuration. No separate setting
 	// selects its algorithm: nothing distinguishes the CA's own serving
 	// certificate from any other leaf it issues, and an unused knob on a new
@@ -400,6 +419,9 @@ func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig) (*Se
 	}
 
 	names := servingNames(cfg)
+	if len(carryNames) > 0 {
+		names = unionNames(names, carryNames)
+	}
 	// serverAuth only. The common name is the CA's own hostname, and where that
 	// hostname also appears in puppet_server a clientAuth certificate sitting in
 	// the storage backend would be a usable admin credential.
@@ -450,6 +472,18 @@ func servingNames(cfg ServingConfig) []string {
 	return names
 }
 
+// unionNames returns want plus any of extra it does not already contain,
+// preserving want's order so the common name stays first.
+func unionNames(want, extra []string) []string {
+	out := append([]string{}, want...)
+	for _, n := range extra {
+		if !slices.Contains(out, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // missingNames returns the first configured name the certificate does not
 // cover, or "" when it covers all of them.
 //
@@ -459,12 +493,22 @@ func servingNames(cfg ServingConfig) []string {
 // deployment this feature targets, editing a ConfigMap and having one pod
 // restart leaves the fleet holding two different name lists indefinitely.
 //
-// A subset test is monotone under that split: the replica with the longer list
-// mints the union, the replica with the shorter list accepts it, and the fleet
-// stops. Set equality is not: neither certificate satisfies both configurations,
-// so the two mint over each other on every maintenance pass forever, each pass
-// adding an inventory row, a supersession entry and eventually a permanent CRL
-// entry that every agent downloads.
+// Set equality converges for no split at all: neither certificate satisfies
+// both configurations, so the two replicas mint over each other on every
+// maintenance pass forever, each pass adding an inventory row, a supersession
+// entry and eventually a permanent CRL entry that every agent downloads.
+//
+// A subset test alone is not enough either. It converges when one list contains
+// the other, but not when they are *incomparable* -- a rename, where each side
+// has a name the other lacks -- because a mint would write only its own
+// configured names and the two would trade places indefinitely.
+//
+// What makes it converge for any pair is the union carried on this path only
+// (see EnsureServingCert): the name set grows monotonically until it satisfies
+// every replica, and then everyone reuses. Growth is bounded by the number of
+// distinct names configured anywhere in the fleet, and it is not permanent --
+// revoking the serving certificate mints from the configured names alone, which
+// is how a withdrawal is applied.
 //
 // The cost is that withdrawing a name does not shrink the live certificate by
 // itself; it takes effect at the next renewal. To apply it immediately, revoke
@@ -664,12 +708,23 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 			return nil
 		}
 
+		// Per entry, not all-or-nothing. Aborting the loop on the first error
+		// and leaving the whole list is right for a transient failure, but a
+		// malformed serial never parses -- so one bad entry would stall every
+		// other due revocation on every pass, indefinitely, and every
+		// superseded certificate behind it would stay a valid credential.
+		// Entries that fail are carried forward and retried; only the ones
+		// actually revoked are dropped.
+		var failed []supersededEntry
 		err = c.Storage.WithLock(ctx, lockNameCRL, func() error {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			for _, e := range due {
 				if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
-					return fmt.Errorf("revoking superseded serving certificate %s: %w", e.Serial, err)
+					slog.Warn("Could not revoke superseded serving certificate; will retry",
+						"serial", e.Serial, "error", err)
+					failed = append(failed, e)
+					continue
 				}
 				slog.Info("Revoked superseded serving certificate", "serial", e.Serial)
 			}
@@ -681,7 +736,10 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 			// in circulation with nothing recording that fact.
 			return err
 		}
-		return c.writeSuperseded(ctx, pending)
+		if len(failed) > 0 {
+			c.IncServingRevocationFailures()
+		}
+		return c.writeSuperseded(ctx, append(pending, failed...))
 	})
 }
 

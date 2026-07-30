@@ -167,8 +167,9 @@ type CA struct {
 	// replica notices its replacement within one interval. Alert on this.
 	servingRenewalFailures atomic.Uint64
 
-	// servingRevocationFailures counts maintenance passes that could not
-	// reconcile the superseded serving-certificate list. Surfaced as
+	// servingRevocationFailures counts failures to record or to complete a
+	// supersession. See IncServingRevocationFailures for the three arms and
+	// which of them is self-healing. Surfaced as
 	// puppetca_serving_cert_revocation_failures_total.
 	servingRevocationFailures atomic.Uint64
 
@@ -225,9 +226,11 @@ func (c *CA) ServingRenewalFailureCount() uint64 {
 }
 
 // IncServingRevocationFailures records a failure to record or to complete a
-// supersession — a maintenance pass that could not reconcile the pending list,
-// or a mint that could not read the certificate it was replacing and so never
-// scheduled it. Only the first is self-healing.
+// supersession. Three arms: a maintenance pass that could not reconcile the
+// pending list; a mint that could not read the certificate it was replacing;
+// and a mint that read it but could not persist the pending list. Only the
+// first is self-healing — the other two leave a serial nothing can rediscover,
+// because the mint has already overwritten what named it.
 //
 // Counted separately from crlUpdateFailures because the failures this path hits
 // first are not CRL amendments at all — a lock timeout, or a storage error on
