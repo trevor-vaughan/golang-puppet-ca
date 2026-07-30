@@ -129,6 +129,30 @@ var _ = Describe("serverConfig.validateTLS", func() {
 		Expect((&serverConfig{TLSCert: "c.pem"}).validateTLS()).To(Succeed())
 	})
 
+	It("rejects a hostname that is also a puppet_server CN", func() {
+		// The collision is not cosmetic: both certificates resolve through
+		// LatestSerialForSubject, so a node renewal for that name revokes the
+		// live serving certificate, and the documented rotation procedure can
+		// revoke the node's admin credential instead.
+		cfg.PuppetServer = "other.example.com, " + cfg.Hostname
+		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("not to be a puppet_server CN")))
+	})
+
+	It("rejects a hostname that a puppet_server_file CN shares", func() {
+		// The file is the other half of the guard's input, and the half a
+		// larger deployment is more likely to use. Dropping it from
+		// puppetServerCNs would re-expose the collision with the suite green.
+		path := filepath.Join(GinkgoT().TempDir(), "cns.txt")
+		Expect(os.WriteFile(path, []byte("other.example.com\n"+cfg.Hostname+"\n"), 0o600)).To(Succeed())
+		cfg.PuppetServerFile = path
+		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("not to be a puppet_server CN")))
+	})
+
+	It("accepts a hostname that no puppet_server CN shares", func() {
+		cfg.PuppetServer = "other.example.com, third.example.com"
+		Expect(cfg.validateTLS()).To(Succeed())
+	})
+
 	It("rejects self-provision alongside tls_cert", func() {
 		// A silent precedence rule would leave the operator serving material
 		// they did not think was in play.

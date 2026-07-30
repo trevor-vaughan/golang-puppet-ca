@@ -65,11 +65,19 @@ const (
 	// KeyServingCert and KeyServingKey hold the certificate and private key the
 	// API listener serves when tls_self_provision is on.
 	//
-	// Deliberately not the per-subject cert/key blobs: CA.Clean and
-	// CleanupExpiredCerts both act on per-subject material and would otherwise
-	// be able to delete the certificate the listener is using, as a side effect
-	// of routine administration. Separate keys make that structurally
-	// impossible rather than merely unlikely.
+	// These are the copies the listener reads, and they are deliberately not
+	// the per-subject cert/key blobs: CA.Clean and CleanupExpiredCerts both act
+	// on per-subject material and would otherwise be able to delete the
+	// certificate the listener is using, as a side effect of routine
+	// administration. Separate keys make that structurally impossible rather
+	// than merely unlikely.
+	//
+	// Issuance is *not* separated, and that is deliberate too. The serving
+	// certificate is an ordinary node certificate for the CA's own hostname:
+	// it occupies that subject's per-subject slot and inventory row, and renews
+	// and revokes through the same machinery as any node's. What keeps the two
+	// from colliding is a configuration rule, not a namespace -- validateTLS
+	// refuses to start when the CA's hostname is also a puppet_server CN.
 	//
 	// Named serving_* and not tls_*, because tls_cert and tls_key already name
 	// the server's certificate *file paths* in the configuration, and one term
