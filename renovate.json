@@ -50,6 +50,31 @@
       ],
       "depNameTemplate": "github.com/yannh/kubeconform",
       "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "Update go-jsonnet version pinned via 'go install' in GitHub Actions workflows",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.*\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "go install github\\.com/google/go-jsonnet/cmd/jsonnet@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "github.com/google/go-jsonnet",
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the Prometheus release the mixin check takes promtool from. Not a 'go install' pin: promtool cannot be installed that way, because the Prometheus module's go.mod carries replace directives",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.*\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "PROMETHEUS_VERSION: (?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "prometheus/prometheus",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
     }
   ],
 

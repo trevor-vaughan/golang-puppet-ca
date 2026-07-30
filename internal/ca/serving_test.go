@@ -546,26 +546,54 @@ var _ = Describe("Renewing a node that has taken the CA's hostname", func() {
 		Expect(myCA.Init(ctx)).To(Succeed())
 	})
 
+	csrFor := func(cn string) []byte {
+		GinkgoHelper()
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		Expect(err).NotTo(HaveOccurred())
+		der, err := x509.CreateCertificateRequest(rand.Reader,
+			&x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}}, key)
+		Expect(err).NotTo(HaveOccurred())
+		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	}
+
 	It("does not revoke the live serving certificate", func() {
 		serving, err := myCA.EnsureServingCert(ctx, ca.ServingConfig{Subject: hostname})
 		Expect(err).NotTo(HaveOccurred())
 
 		// A node renews under the CA's own name. LatestSerialForSubject
 		// resolves to the serving certificate, because it was issued last.
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		Expect(err).NotTo(HaveOccurred())
-		der, err := x509.CreateCertificateRequest(rand.Reader,
-			&x509.CertificateRequest{Subject: pkix.Name{CommonName: hostname}}, key)
-		Expect(err).NotTo(HaveOccurred())
-		csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
-
-		_, err = myCA.Renew(ctx, hostname, csrPEM)
+		_, err = myCA.Renew(ctx, hostname, csrFor(hostname))
 		Expect(err).NotTo(HaveOccurred())
 
 		revoked, err := myCA.IsRevokedSerial(ctx, serving.Leaf.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(revoked).To(BeFalse(),
 			"renewing under the CA's hostname must not revoke the certificate it is serving")
+	})
+
+	It("revokes normally when no serving certificate is stored", func() {
+		// The precision half, and the fs.ErrNotExist arm. Without it the guard
+		// could be reduced to `subject == c.Hostname` and still pass, which
+		// would silently end revoke-on-renew for the CA's hostname -- and with
+		// tls_self_provision off that is an ordinary node certname.
+		//
+		// Note the collision cannot be built the other way round: while a
+		// serving certificate is stored, Generate and SaveRequest refuse a
+		// certificate for the same subject (ErrCertExists), so a node can only
+		// take the name if it held it first or the serving one was revoked.
+		first, err := myCA.Generate(ctx, hostname, nil)
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(first.CertificatePEM)
+		Expect(block).NotTo(BeNil())
+		firstCrt, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = myCA.Renew(ctx, hostname, csrFor(hostname))
+		Expect(err).NotTo(HaveOccurred())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, firstCrt.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue())
 	})
 })
 
@@ -605,6 +633,36 @@ var _ = Describe("Serving certificate read failures", func() {
 		Expect(blind.Init(ctx)).To(Succeed())
 		return blind
 	}
+
+	It("counts a revocation failure when it cannot read what it is replacing", func() {
+		// The supersession-record path, not the reuse path: the mint is already
+		// under way and storedServingLeaf cannot read the certificate being
+		// replaced, so nothing is scheduled for revocation and the only signal
+		// that happened is this counter.
+		store := storage.NewWithBackend(&failReadBackend{Backend: base, failKey: storage.KeyServingCert}, dir)
+		blind := ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(blind.Init(ctx)).To(Succeed())
+
+		Expect(blind.ServingRevocationFailureCount()).To(BeZero())
+		blind.StoredServingLeafForTest(ctx)
+		Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+	})
+
+	It("does not count a revocation failure for bytes that do not parse", func() {
+		// Those are not a credential in circulation, so counting them would
+		// fire an alert telling the operator a replaced certificate is still
+		// valid when none exists.
+		good := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, subject)
+		good.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		good.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(good.Init(ctx)).To(Succeed())
+		Expect(storage.New(dir).SaveServingCert(ctx, []byte("not a certificate\n"))).To(Succeed())
+
+		good.StoredServingLeafForTest(ctx)
+		Expect(good.ServingRevocationFailureCount()).To(BeZero())
+	})
 
 	DescribeTable("surfaces the failure instead of minting over the stored certificate",
 		func(failKey, wantReason string) {
@@ -723,8 +781,26 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 		cfg.ExtraNames = []string{"ingress.example.com"}
 
 		code, detail := reasonFor()
-		Expect(code).To(Equal("missing-configured-name"))
+		Expect(code).To(Equal("configured-name-drift"))
 		Expect(detail).To(Equal("ingress.example.com"))
+	})
+
+	It("reissues when a configured name is withdrawn, not only when one is added", func() {
+		// The other direction. Withdrawing a name removes the CA's authority to
+		// assert it; a subset check would leave the live certificate asserting
+		// it until its own renewal window, which at the default validity is
+		// years away.
+		cfg.ExtraNames = []string{"ingress.example.com"}
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		cfg.ExtraNames = nil
+		code, detail := reasonFor()
+		Expect(code).To(Equal("configured-name-drift"))
+		Expect(detail).To(Equal("ingress.example.com"))
+
+		reissued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reissued.Leaf.DNSNames).NotTo(ContainElement("ingress.example.com"))
 	})
 
 	It("carries only clock arithmetic as detail in the renewal window", func() {

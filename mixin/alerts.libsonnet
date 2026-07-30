@@ -237,7 +237,7 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'Puppet CA is failing to revoke superseded serving certificates.',
-              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). The replaced certificate remains a valid credential until a sweep succeeds; check the CA logs and its storage backend.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). The replaced certificate remains a valid credential. A failed sweep retries on the next pass and clears itself; but if the log says the stored certificate was unreadable while recording supersession, that serial was never scheduled at all and no future sweep will find it -- revoke it by hand. Check the CA logs and its storage backend.',
             },
           },
           {

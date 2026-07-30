@@ -58,7 +58,7 @@ import (
 
 type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVariant
 type Test mg.Namespace    // test:unit  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
-type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
+type Dev mg.Namespace     // dev:check  dev:lint  dev:mixin  dev:tidy  dev:clean  dev:container
 type Release mg.Namespace // release:prepare
 type Chart mg.Namespace   // chart:version  chart:lint  chart:validate  chart:package
 

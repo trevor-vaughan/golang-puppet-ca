@@ -58,6 +58,15 @@
 
     // Sustained reissue churn. One reissue per renewal period is normal; more
     // than a handful in six hours means replicas are minting over each other.
+    //
+    // All three windows above are calibrated to the CA's maintenance_interval_sec,
+    // which defaults to 1h and is operator-configurable. Raise them in step if
+    // you raise that: the two 1h windows are knife-edge at the default (a
+    // persistent failure resolves and re-fires between passes), and the churn
+    // rule needs servingChurnWindow / maintenance_interval_sec to exceed
+    // servingChurnThreshold or it can never fire at all -- at a 2h interval it
+    // yields 3 increments against a threshold of 4, and the condition the
+    // metric exists to expose becomes permanently invisible.
     servingChurnWindow: '6h',
     servingChurnThreshold: 4,
     servingChurnFor: '15m',

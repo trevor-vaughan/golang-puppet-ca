@@ -90,5 +90,7 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
   required checks too. A new template branch needs a fixture under
   `charts/openvox-ca/ci/`, and anything a reader has to trust needs a case in
   `chart:test`.
+- If you touched `mixin/`, run `mage dev:mixin` too — it renders the Jsonnet and
+  checks the rules with `promtool`, which nothing else does.
 - Internal design notes live under [docs/development/](docs/development/); update
   them when you change the behaviour they describe.

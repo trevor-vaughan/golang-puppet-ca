@@ -224,8 +224,10 @@ func (c *CA) ServingRenewalFailureCount() uint64 {
 	return c.servingRenewalFailures.Load()
 }
 
-// IncServingRevocationFailures records a maintenance pass that could not
-// reconcile the superseded-certificate list.
+// IncServingRevocationFailures records a failure to record or to complete a
+// supersession — a maintenance pass that could not reconcile the pending list,
+// or a mint that could not read the certificate it was replacing and so never
+// scheduled it. Only the first is self-healing.
 //
 // Counted separately from crlUpdateFailures because the failures this path hits
 // first are not CRL amendments at all — a lock timeout, or a storage error on
