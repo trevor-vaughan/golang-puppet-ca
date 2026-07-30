@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/big"
 	"slices"
 	"time"
 )
@@ -107,15 +108,27 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 		return nil, fmt.Errorf("serving certificate subject: %w", err)
 	}
 
-	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	// Shadow ctx rather than bounding acquisition alone: the deadline has to
+	// cover the work under the lock, not just the wait for it. Matches Sign,
+	// Renew, AutoRenew, Clean and Revoke. The caller here is the maintenance
+	// goroutine, whose context has no deadline at all.
+	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
 	defer cancel()
 
 	var result *ServingCertificate
-	err := c.Storage.WithLock(lockCtx, subjectLockName(cfg.Subject), func() error {
+	err := c.Storage.WithLock(ctx, subjectLockName(cfg.Subject), func() error {
 		existing, why := c.loadUsableServingCert(ctx, cfg)
 		if existing != nil {
 			result = existing
 			return nil
+		}
+		// Distinguish "the material is unusable" from "we could not read it".
+		// Only the first justifies minting over what is there; the second is
+		// I/O to retry, and minting on it would replace a certificate that may
+		// be perfectly good.
+		if why.Code == reasonCertUnreadable || why.Code == reasonKeyUnreadable ||
+			why.Code == reasonRevocationCheck {
+			return fmt.Errorf("reading the stored serving certificate: %s", why.Code)
 		}
 		slog.Info("Issuing serving certificate", "subject", cfg.Subject, "reason", why)
 
@@ -134,7 +147,7 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 		result = minted
 
 		if superseded != nil && superseded.SerialNumber.Cmp(minted.Leaf.SerialNumber) != 0 {
-			if err := c.recordSupersededLocked(ctx, superseded, cfg.RevokeAfter); err != nil {
+			if err := c.recordSuperseded(ctx, superseded, cfg.RevokeAfter); err != nil {
 				// Not fatal: the new certificate is in place and serving. The
 				// cost is a superseded certificate staying valid until it
 				// expires, which is strictly better than refusing to serve.
@@ -151,19 +164,41 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 }
 
 // storedServingLeaf parses whatever serving certificate is in storage, or nil
-// when there is none or it cannot be read. Used to identify what a mint is
-// about to replace; a nil result simply means there is nothing to supersede.
+// when there is none. Used to identify what a mint is about to replace.
+//
+// A nil result means there is nothing to supersede, and the caller acts on
+// that: it skips recording a revocation. So the absent case and the
+// cannot-read case must not look the same. Absent is nil with no noise;
+// anything else is logged and counted, because silently skipping the record
+// leaves the certificate being replaced valid for its full life — years — with
+// nothing anywhere saying it should not be.
 func (c *CA) storedServingLeaf(ctx context.Context) *x509.Certificate {
 	certPEM, err := c.Storage.GetServingCert(ctx)
-	if err != nil {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		// Without the error text: a SQL driver's connection error can carry
+		// the DSN.
+		slog.Warn("Serving certificate unreadable while recording supersession; " +
+			"the certificate being replaced will not be scheduled for revocation")
+		c.IncServingRevocationFailures()
 		return nil
 	}
+	// The two parse arms below deliberately do not count a revocation failure.
+	// That counter drives an alert whose text tells the operator a replaced
+	// certificate "remains a valid credential" -- but bytes that do not parse
+	// as a certificate are not a credential in circulation, so there is nothing
+	// at risk and nothing to revoke. Only the read failure above is a genuine
+	// "we could not tell".
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
+		slog.Warn("Stored serving certificate is not PEM; nothing to supersede")
 		return nil
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
+		slog.Warn("Stored serving certificate is unparseable; nothing to supersede", "error", err)
 		return nil
 	}
 	return leaf
@@ -175,6 +210,7 @@ func (c *CA) storedServingLeaf(ctx context.Context) *x509.Certificate {
 const (
 	reasonNoCert          = "no-stored-certificate"
 	reasonCertUnreadable  = "certificate-unreadable"
+	reasonKeyMissing      = "key-missing"
 	reasonKeyUnreadable   = "key-unreadable"
 	reasonCertNotPEM      = "certificate-not-pem"
 	reasonCertUnparseable = "certificate-unparseable"
@@ -227,15 +263,29 @@ func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*Ser
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, servingReason{Code: reasonNoCert}
 		}
+		// A read failure is not evidence that the stored certificate is
+		// unusable — it is evidence that we could not look. Treating it like
+		// unusable material would let a degraded backend, where a read times
+		// out under load but a write later succeeds, rotate the certificate
+		// every replica is serving and schedule the good one it replaced for
+		// revocation. Surfacing it instead leaves the running listener on the
+		// certificate it already holds, counts a renewal failure, and retries
+		// next pass, which is what the counter and its alert are for.
+		//
 		// Deliberately without the error text: this comes from the storage
-		// backend, and a SQL driver's connection error can carry the DSN. The
-		// failure is not lost — the caller either mints successfully, or fails
-		// with its own error that does surface the cause.
+		// backend, and a SQL driver's connection error can carry the DSN.
 		return nil, servingReason{Code: reasonCertUnreadable}
 	}
 	keyPEM, err := c.Storage.GetServingKey(ctx)
 	if err != nil {
-		// A torn write between the two Put calls lands here. Mint again.
+		if errors.Is(err, fs.ErrNotExist) {
+			// A torn write between the two Put calls: the certificate is
+			// there and the key never landed. Genuinely unusable material,
+			// so mint again.
+			return nil, servingReason{Code: reasonKeyMissing}
+		}
+		// A read failure, which says nothing about the stored key. Same
+		// reasoning as the certificate above: surface it, do not mint over it.
 		return nil, servingReason{Code: reasonKeyUnreadable}
 	}
 
@@ -484,7 +534,11 @@ type supersededEntry struct {
 	RevokeAt time.Time `json:"revoke_at"`
 }
 
-// recordSupersededLocked appends leaf to the pending-revocation list.
+// recordSuperseded appends leaf to the pending-revocation list.
+//
+// Not named *Locked: in this package that suffix means c.mu is held, and this
+// runs with c.mu released. It needs only the subject lock, which the caller
+// holds.
 //
 // The list is durable and shared rather than held in memory: the replica that
 // minted the replacement may die before the delay elapses, and a restarted
@@ -494,7 +548,7 @@ type supersededEntry struct {
 //
 // The subject lock is held by the caller, which is what serialises this against
 // concurrent mints.
-func (c *CA) recordSupersededLocked(ctx context.Context, leaf *x509.Certificate, revokeAfter time.Duration) error {
+func (c *CA) recordSuperseded(ctx context.Context, leaf *x509.Certificate, revokeAfter time.Duration) error {
 	if revokeAfter <= 0 || leaf == nil {
 		return nil
 	}
@@ -545,10 +599,13 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 	if cfg.Subject == "" {
 		return fmt.Errorf("serving certificate subject is required")
 	}
-	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	// Shadowed, not a separate acquisition context: this critical section does
+	// a CRL read-modify-write, so the deadline has to cover the work as well as
+	// the wait. See EnsureServingCert.
+	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
 	defer cancel()
 
-	return c.Storage.WithLock(lockCtx, subjectLockName(cfg.Subject), func() error {
+	return c.Storage.WithLock(ctx, subjectLockName(cfg.Subject), func() error {
 		entries, err := c.readSuperseded(ctx)
 		if err != nil {
 			return err
@@ -576,7 +633,7 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 			return nil
 		}
 
-		err = c.Storage.WithLock(lockCtx, lockNameCRL, func() error {
+		err = c.Storage.WithLock(ctx, lockNameCRL, func() error {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			for _, e := range due {
@@ -615,7 +672,10 @@ func (c *CA) readSuperseded(ctx context.Context) ([]supersededEntry, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("reading pending serving-certificate revocations: %w", err)
+		// Without the backend's error text, for the reason storedServingLeaf
+		// gives: a SQL driver's connection error can carry the DSN, and this
+		// error reaches a Warn line on the mint path.
+		return nil, errors.New("reading pending serving-certificate revocations")
 	}
 	var entries []supersededEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
@@ -635,4 +695,36 @@ func (c *CA) writeSuperseded(ctx context.Context, entries []supersededEntry) err
 		return fmt.Errorf("encoding pending serving-certificate revocations: %w", err)
 	}
 	return c.Storage.SaveServingSuperseded(ctx, data)
+}
+
+// servingSerialMatches reports whether serial is the one in the certificate the
+// listener is currently serving.
+//
+// Used to stop routine per-subject administration revoking the CA's own serving
+// certificate when a node has taken the CA's hostname. Failure to read or parse
+// is reported as "no match": this guards a revocation that is otherwise correct,
+// so it must not suppress it on a storage blip.
+func (c *CA) servingSerialMatches(ctx context.Context, serial string) bool {
+	if serial == "" {
+		return false
+	}
+	certPEM, err := c.Storage.GetServingCert(ctx)
+	if err != nil {
+		return false
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	// Normalise both sides: the inventory string and serialHexStr can differ in
+	// padding, which is why deleteStoredCertIfSerialMatches does the same.
+	want := new(big.Int)
+	if _, ok := want.SetString(serial, 16); !ok {
+		return false
+	}
+	return serialHexStr(leaf.SerialNumber) == serialHexStr(want)
 }
