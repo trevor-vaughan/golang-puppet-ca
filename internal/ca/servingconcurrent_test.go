@@ -170,6 +170,37 @@ var _ = Describe("Serving certificate across replicas", func() {
 		Expect(issued).To(Equal(uint64(1)), "exactly one replica may mint")
 	})
 
+	It("converges when replicas disagree about the configured names", func() {
+		// Incomparable configurations -- a rename, where each side has a name
+		// the other lacks -- which is what an ingress hostname change plus one
+		// pod left on a stale ConfigMap produces. Neither list contains the
+		// other, so a rule that mints only its own configured names has no
+		// fixed point: the two replicas trade places on every maintenance pass
+		// forever, each one adding an inventory row, a supersession entry and
+		// eventually a permanent CRL entry that every agent downloads.
+		//
+		// Alternating passes rather than goroutines: the question is whether
+		// the sequence terminates, not whether the lock serialises it.
+		a := newReplica()
+		b := newReplica()
+		cfgA := ca.ServingConfig{Subject: subject, ExtraNames: []string{"a.example.com"}}
+		cfgB := ca.ServingConfig{Subject: subject, ExtraNames: []string{"b.example.com"}}
+
+		for i := 0; i < 6; i++ {
+			Expect(a.EnsureServingCert(ctx, cfgA)).Error().NotTo(HaveOccurred())
+			Expect(b.EnsureServingCert(ctx, cfgB)).Error().NotTo(HaveOccurred())
+		}
+
+		Expect(a.ServingCertIssued()+b.ServingCertIssued()).To(BeNumerically("<=", uint64(3)),
+			"incomparable name lists must converge, not mint on every pass")
+
+		final, err := a.EnsureServingCert(ctx, cfgA)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(final.Issued).To(BeFalse(), "the fleet must reach a fixed point")
+		Expect(final.Leaf.DNSNames).To(ContainElements("a.example.com", "b.example.com"),
+			"the fixed point is the union, which satisfies both configurations")
+	})
+
 	It("sweeps the pending list under the same lock the mint path appends beneath", func() {
 		// The sweep read-modify-writes the pending list; so does the mint path,
 		// under the subject lock. Serialising them on different locks lets a

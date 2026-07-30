@@ -267,6 +267,23 @@ A certificate is also reissued when it stops being usable for any other reason:
 it no longer covers a configured name, it does not verify against the current CA
 certificate, or it has been revoked.
 
+**Adding a name reissues; withdrawing one does not.** Every replica evaluates
+one shared certificate against its own configuration, which it read at startup,
+so the check has to be one-directional or a fleet part-way through a config
+change would mint over itself indefinitely. A name added to
+`tls_self_provision_names` is picked up on the next maintenance pass; a name
+removed stays on the live certificate until it is reissued for some other
+reason. To apply a withdrawal immediately, revoke the serving certificate — the
+next pass then mints from the configured names alone:
+
+```bash
+openvox-ca-ctl revoke --certname openvox-ca.example.com
+```
+
+A *rename* — adding one name and removing another in the same edit — briefly
+carries both while the fleet disagrees, and settles on the union until every
+replica has the new configuration and the certificate is revoked once.
+
 Renewal failures are logged and counted as
 `puppetca_serving_cert_renewal_failures_total`, leaving the existing certificate
 in place. **Alert on that counter** — a persistently failing renewal is

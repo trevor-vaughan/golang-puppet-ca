@@ -15,10 +15,11 @@ alerting rules for the openvox-ca exporter. It alerts on:
   [`tls_self_provision`](../docs/configuration.md#self-provisioned-serving-certificate)
   is in use. *Renewal failing*: the CA cannot renew the certificate its own
   listener presents, which is silent until it expires, at which point every
-  agent handshake fails at once. *Revocation failing*: the sweep that revokes
-  superseded serving certificates is failing, so the replaced certificate stays
-  a valid credential past the bound `tls_self_provision_revoke_after_sec` is
-  meant to enforce. *Churning*: replicas reissuing over each other, which grows
+  agent handshake fails at once. *Revocation failing*: a superseded certificate was
+  not revoked, so it stays a valid credential past the bound
+  `tls_self_provision_revoke_after_sec` is meant to enforce. A failed sweep
+  retries and clears itself; a mint that could not read or write down what it
+  replaced never scheduled that serial at all, and needs revoking by hand. *Churning*: replicas reissuing over each other, which grows
   the inventory and the CRL for no reason.
 - **Kubernetes export** targets whose applies keep failing (only when the
   [Kubernetes export](../docs/kubernetes-export.md) feature is in use).
