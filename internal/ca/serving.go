@@ -128,7 +128,7 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 		// be perfectly good.
 		if why.Code == reasonCertUnreadable || why.Code == reasonKeyUnreadable ||
 			why.Code == reasonRevocationCheck {
-			return fmt.Errorf("reading the stored serving certificate: %s", why.Code)
+			return fmt.Errorf("cannot confirm the stored serving certificate is usable: %s", why.Code)
 		}
 		slog.Info("Issuing serving certificate", "subject", cfg.Subject, "reason", why)
 
@@ -168,10 +168,11 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 //
 // A nil result means there is nothing to supersede, and the caller acts on
 // that: it skips recording a revocation. So the absent case and the
-// cannot-read case must not look the same. Absent is nil with no noise;
-// anything else is logged and counted, because silently skipping the record
-// leaves the certificate being replaced valid for its full life — years — with
-// nothing anywhere saying it should not be.
+// cannot-read case must not look the same. Absent is nil with no noise; a read
+// failure is logged and counted, because silently skipping the record leaves
+// the certificate being replaced valid for its full life — years — with nothing
+// anywhere saying it should not be. Bytes that do not parse are logged only,
+// for the reason given at that arm below.
 func (c *CA) storedServingLeaf(ctx context.Context) *x509.Certificate {
 	certPEM, err := c.Storage.GetServingCert(ctx)
 	switch {
@@ -219,7 +220,7 @@ const (
 	reasonNoCACert        = "ca-certificate-not-loaded"
 	reasonForeignIssuer   = "not-issued-by-current-ca-certificate"
 	reasonRenewalWindow   = "within-renewal-window"
-	reasonMissingName     = "missing-configured-name"
+	reasonMissingName     = "configured-name-drift"
 	reasonRevocationCheck = "revocation-status-unknown"
 	reasonRevoked         = "certificate-revoked"
 )
@@ -331,7 +332,7 @@ func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*Ser
 		}
 	}
 
-	if missing := missingNames(leaf, servingNames(cfg)); missing != "" {
+	if missing := nameDrift(leaf, servingNames(cfg)); missing != "" {
 		// Detail is a configured name, which the operator supplied and which
 		// is already in the certificate this process serves.
 		return nil, servingReason{Code: reasonMissingName, Detail: missing}
@@ -438,11 +439,24 @@ func servingNames(cfg ServingConfig) []string {
 	return names
 }
 
-// missingNames returns the first configured name the certificate does not
-// cover, or "" when it covers all of them.
-func missingNames(leaf *x509.Certificate, want []string) string {
+// nameDrift returns the first name the certificate and the configuration
+// disagree about, or "" when they match exactly.
+//
+// Both directions, deliberately. A configured name the certificate lacks is the
+// obvious case. A name the certificate carries and the configuration no longer
+// does matters as much: an operator who withdraws a hostname -- because it has
+// been handed to another service, or an ingress was retired -- has removed the
+// CA's authority to assert it, and a subset check would let the live
+// certificate keep asserting it until it fell into its own renewal window,
+// which at the default validity is years away.
+func nameDrift(leaf *x509.Certificate, want []string) string {
 	for _, n := range want {
 		if !slices.Contains(leaf.DNSNames, n) {
+			return n
+		}
+	}
+	for _, n := range leaf.DNSNames {
+		if !slices.Contains(want, n) {
 			return n
 		}
 	}
@@ -697,20 +711,39 @@ func (c *CA) writeSuperseded(ctx context.Context, entries []supersededEntry) err
 	return c.Storage.SaveServingSuperseded(ctx, data)
 }
 
-// servingSerialMatches reports whether serial is the one in the certificate the
-// listener is currently serving.
+// servingSerialMatches reports whether serial might be the one in the
+// certificate the listener is currently serving.
 //
 // Used to stop routine per-subject administration revoking the CA's own serving
-// certificate when a node has taken the CA's hostname. Failure to read or parse
-// is reported as "no match": this guards a revocation that is otherwise correct,
-// so it must not suppress it on a storage blip.
+// certificate when a node has taken the CA's hostname.
+//
+// The two failure directions are not symmetric, so they are not collapsed.
+// Absent (fs.ErrNotExist) is a real answer -- with tls_self_provision off there
+// is no serving certificate, and returning "match" would silently stop revoking
+// replaced certificates for any node whose certname equals the CA's hostname.
+// A read *failure* is not an answer: proceeding would revoke the live serving
+// certificate with none of the delay tls_self_provision_revoke_after_sec gives,
+// which is the harm this guard exists to prevent. So absent means no match and
+// the revoke proceeds; unreadable means treat it as a possible match, skip the
+// revoke, and say so. The revoke being skipped is already best-effort -- a CRL
+// failure a few lines on is only logged -- so the cost of skipping is one node
+// certificate staying valid, against a fleet-wide handshake outage.
+//
+// Bytes that do not parse are not a credential in circulation, so those arms
+// report no match, consistent with storedServingLeaf.
 func (c *CA) servingSerialMatches(ctx context.Context, serial string) bool {
 	if serial == "" {
 		return false
 	}
 	certPEM, err := c.Storage.GetServingCert(ctx)
-	if err != nil {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
 		return false
+	case err != nil:
+		slog.Warn("Could not read the serving certificate while deciding whether to revoke a " +
+			"replaced certificate; skipping the revocation rather than risk revoking the one " +
+			"the listener is serving")
+		return true
 	}
 	block, _ := pem.Decode(certPEM)
 	if block == nil {

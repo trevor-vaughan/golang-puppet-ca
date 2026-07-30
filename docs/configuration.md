@@ -232,9 +232,9 @@ tls_self_provision_names:
 ```
 
 `tls_self_provision` and `tls_cert`/`tls_key` are mutually exclusive, and
-`hostname` is required — without it the certificate would carry the fallback
-subject `puppet`, which no client validates, surfacing as a handshake failure
-rather than as the configuration error it is.
+`hostname` is required. The CA layer rejects an empty serving subject too, but
+its error names neither `hostname` nor `tls_self_provision`, so the check is
+here for the message rather than for the behaviour.
 
 The certificate and its private key live in the storage backend
 (`serving_cert`, `serving_key`), not in `cadir`, so every replica serves the
@@ -247,9 +247,11 @@ revokes through exactly the same machinery as any node's. That uniformity is
 deliberate — there is nothing about it to special-case — and it is why the CA's
 `hostname` **must be a name of its own**. If a node holds the same certname,
 both certificates land in one per-subject slot and whichever was issued last
-wins: renewing the node's revokes the certificate the CA is serving, and
-revoking the CA's hostname to rotate a compromised serving key can revoke the
-node's credential instead. `openvox-ca` refuses to start when `hostname` is also
+wins: issuing one overwrites the other's stored certificate, and revoking the
+CA's hostname to rotate a compromised serving key can revoke the node's
+credential instead, leaving the compromised key serving. (Renewal is separately
+guarded — the CA refuses to revoke the certificate its own listener is
+presenting — but that is a backstop, not a licence to share the name.) `openvox-ca` refuses to start when `hostname` is also
 a `puppet_server` CN, but it cannot detect an ordinary agent that happens to
 share the name — choose a distinct one.
 

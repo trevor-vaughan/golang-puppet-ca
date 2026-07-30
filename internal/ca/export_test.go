@@ -17,7 +17,10 @@
 
 package ca
 
-import "context"
+import (
+	"context"
+	"crypto/x509"
+)
 
 // ServingReuseReasonForTest reports why the stored serving certificate would be
 // replaced: the stable code and the detail, separately.
@@ -29,4 +32,11 @@ import "context"
 func (c *CA) ServingReuseReasonForTest(ctx context.Context, cfg ServingConfig) (code, detail string) {
 	_, reason := c.loadUsableServingCert(ctx, cfg)
 	return reason.Code, reason.Detail
+}
+
+// StoredServingLeafForTest exposes storedServingLeaf so its counter policy can
+// be pinned: a read failure counts a revocation failure, unparseable bytes do
+// not. Both directions were changed in review and neither had a spec.
+func (c *CA) StoredServingLeafForTest(ctx context.Context) *x509.Certificate {
+	return c.storedServingLeaf(ctx)
 }

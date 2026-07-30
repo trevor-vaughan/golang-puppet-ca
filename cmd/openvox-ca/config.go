@@ -333,16 +333,22 @@ func (c *serverConfig) validateTLS() error {
 	// is why the CA's hostname cannot also be a node's certname.
 	//
 	// Sharing the name is not a small misconfiguration. Both certificates
-	// resolve through LatestSerialForSubject, so whichever was issued last wins:
-	// a node renewal for that name revokes the live serving certificate
-	// outright, and "revoke the CA's hostname" to rotate a compromised serving
-	// key can instead revoke the node's admin credential. Neither is
-	// recoverable by retrying.
+	// occupy one per-subject slot and one inventory subject, so
+	// LatestSerialForSubject resolves to whichever was issued last: issuing one
+	// overwrites the other's stored certificate, and "revoke the CA's hostname"
+	// to rotate a compromised serving key can instead revoke the node's
+	// credential, leaving the compromised key serving.
+	//
+	// Renew separately refuses to revoke the certificate the listener is
+	// serving, which is the defence for the collision this check cannot see —
+	// an ordinary agent rather than a configured admin CN. This check is the
+	// fail-fast for the one it can.
 	if slices.Contains(c.puppetServerCNs(), c.Hostname) {
 		return fmt.Errorf("tls_self_provision requires hostname (%q) not to be a puppet_server CN: "+
 			"the CA issues its serving certificate under that name, so a node holding it too would "+
-			"share the certificate's per-subject slot and inventory subject -- renewing one revokes "+
-			"the other. Give the CA a name of its own", c.Hostname)
+			"share the certificate's per-subject slot and inventory subject -- issuing one "+
+			"overwrites the other, and revoking that name resolves to whichever was issued last. "+
+			"Give the CA a name of its own", c.Hostname)
 	}
 
 	// The auto-generated passphrase lives in cadir. With an ephemeral cadir --

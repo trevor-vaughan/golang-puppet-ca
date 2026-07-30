@@ -44,6 +44,17 @@ var _ = Describe("serverConfig.tlsEnabled", func() {
 	// pre-existing behaviour: the listener comes up on plain HTTP and the
 	// non-loopback guard is what refuses to start. Pinned because the whole
 	// point of the helper is that every call site agrees on this answer.
+	It("is true with self-provision alone", func() {
+		// The arm the helper exists for, and the consequential one: without it
+		// main.go leaves AuthConfig nil, so the listener comes up on TLS with
+		// every endpoint unauthenticated.
+		Expect((&serverConfig{TLSSelfProvision: true}).tlsEnabled()).To(BeTrue())
+	})
+
+	It("is true with self-provision even when only half a manual pair is set", func() {
+		Expect((&serverConfig{TLSSelfProvision: true, TLSCert: "c.pem"}).tlsEnabled()).To(BeTrue())
+	})
+
 	It("is false with only a certificate", func() {
 		Expect((&serverConfig{TLSCert: "c.pem"}).tlsEnabled()).To(BeFalse())
 	})
@@ -166,15 +177,18 @@ var _ = Describe("serverConfig.validateTLS", func() {
 	})
 
 	It("requires a hostname", func() {
-		// Without it bootstrapCA's "puppet" fallback would produce a
-		// certificate no client validates — a handshake failure presenting as
-		// anything but the configuration error it is.
+		// The CA layer rejects an empty serving subject too; this check exists
+		// so the error names hostname and tls_self_provision rather than
+		// failing deeper with a message that names neither.
 		cfg.Hostname = ""
 		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("requires hostname")))
 	})
 
 	Describe("encrypted serving key", func() {
 		It("refuses the auto-generated passphrase", func() {
+			// Reads the process environment directly, and this variable is not
+			// in serverEnvVars, so clearServerEnv does not cover it.
+			setEnv("PUPPET_CA_KEY_PASSPHRASE", "")
 			// It is written into cadir, so with an ephemeral cadir each replica
 			// would encrypt under a different passphrase and none could read
 			// the shared blob after a restart.

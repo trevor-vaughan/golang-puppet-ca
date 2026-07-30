@@ -82,5 +82,7 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
   explains *why*. Stage files by name and review `git diff --staged` before
   committing.
 - Make sure `mage dev:check`, `mage test:unit`, and `markdownlint-cli2` pass.
+- If you touched `mixin/`, run `mage dev:mixin` too — it renders the Jsonnet and
+  checks the rules with `promtool`, which nothing else does.
 - Internal design notes live under [docs/development/](docs/development/); update
   them when you change the behaviour they describe.
