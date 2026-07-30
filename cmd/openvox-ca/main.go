@@ -599,8 +599,17 @@ func newRootCmd() *cobra.Command {
 			// recorded would otherwise sit in storage indefinitely and fire much
 			// later if the delay were re-enabled. A failure here is logged and
 			// not fatal: it is bookkeeping, and the CA can still serve.
-			if err := myCA.ReconcileSuperseded(ctx, servingConfigFrom(cfg)); err != nil {
-				slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
+			//
+			// Skipped only when there is no hostname to reconcile under.
+			// ReconcileSuperseded rejects an empty subject, and hostname is
+			// optional whenever self-provisioning is off — so without this
+			// guard every such deployment warns on every boot about a feature
+			// it has never used, which is how operators learn to stop reading
+			// boot logs.
+			if cfg.Hostname != "" {
+				if err := myCA.ReconcileSuperseded(ctx, servingConfigFrom(cfg)); err != nil {
+					slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
+				}
 			}
 
 			// SECURITY: Warn if any private key files have overly permissive modes.

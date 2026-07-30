@@ -102,6 +102,13 @@ var _ = Describe("EtcdPhysicalKey", func() {
 		Entry(nil, KeyInventory, "/puppet-ca/inventory/data", false),
 		Entry(nil, KeyInventoryHMAC, "/puppet-ca/inventory/hmac", false),
 		Entry(nil, KeyHMACKey, "/puppet-ca/private/hmac_key", false),
+		// physicalKey fails closed on an unmapped key, so an omission from
+		// etcdLayout makes the serving certificate unstorable at runtime -- on
+		// exactly the backends this feature exists for -- while the unit suite
+		// stays green.
+		Entry(nil, KeyServingCert, "/puppet-ca/serving/cert", false),
+		Entry(nil, KeyServingKey, "/puppet-ca/private/serving_key", false),
+		Entry(nil, KeyServingSuperseded, "/puppet-ca/serving/superseded", false),
 		Entry(nil, CSRKey("node1.example.com"), "/puppet-ca/requests/node1.example.com", false),
 		Entry(nil, CertKey("node1.example.com"), "/puppet-ca/signed/node1.example.com", false),
 		Entry(nil, "", "", true),

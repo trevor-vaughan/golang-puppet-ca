@@ -653,6 +653,27 @@ var _ = Describe("applyServerEnv each variable", func() {
 			func(c *serverConfig) bool { return c.DisableCRLRefresh }, "DisableCRLRefresh"),
 		Entry("CRL_REFRESH_INTERVAL_SEC", "PUPPET_CA_CRL_REFRESH_INTERVAL_SEC", "900",
 			func(c *serverConfig) bool { return c.CRLRefreshIntervalSec == 900 }, "CRLRefreshIntervalSec"),
+		// A typo in any of these would leave the feature silently off, or a
+		// duration silently at its default, with the only symptom a listener
+		// that comes up without TLS.
+		Entry("TLS_SELF_PROVISION", "PUPPET_CA_TLS_SELF_PROVISION", "true",
+			func(c *serverConfig) bool { return c.TLSSelfProvision }, "TLSSelfProvision"),
+		Entry("TLS_SELF_PROVISION_NAMES", "PUPPET_CA_TLS_SELF_PROVISION_NAMES", "a.example.com,b.example.com",
+			func(c *serverConfig) bool {
+				return len(c.TLSSelfProvisionNames) == 2 &&
+					c.TLSSelfProvisionNames[0] == "a.example.com" &&
+					c.TLSSelfProvisionNames[1] == "b.example.com"
+			}, "TLSSelfProvisionNames"),
+		Entry("TLS_SELF_PROVISION_RENEW_BEFORE_SEC", "PUPPET_CA_TLS_SELF_PROVISION_RENEW_BEFORE_SEC", "604800",
+			func(c *serverConfig) bool { return c.TLSSelfProvisionRenewBeforeSec == 604800 },
+			"TLSSelfProvisionRenewBeforeSec"),
+		Entry("TLS_SELF_PROVISION_ENCRYPT_KEY", "PUPPET_CA_TLS_SELF_PROVISION_ENCRYPT_KEY", "true",
+			func(c *serverConfig) bool { return c.TLSSelfProvisionEncryptKey }, "TLSSelfProvisionEncryptKey"),
+		Entry("TLS_SELF_PROVISION_REVOKE_AFTER_SEC", "PUPPET_CA_TLS_SELF_PROVISION_REVOKE_AFTER_SEC", "7200",
+			func(c *serverConfig) bool { return c.TLSSelfProvisionRevokeAfterSec == 7200 },
+			"TLSSelfProvisionRevokeAfterSec"),
+		Entry("MAINTENANCE_INTERVAL_SEC", "PUPPET_CA_MAINTENANCE_INTERVAL_SEC", "1800",
+			func(c *serverConfig) bool { return c.MaintenanceIntervalSec == 1800 }, "MaintenanceIntervalSec"),
 		Entry("CRL_REFRESH_BEFORE_SEC", "PUPPET_CA_CRL_REFRESH_BEFORE_SEC", "86400",
 			func(c *serverConfig) bool { return c.CRLRefreshBeforeSec == 86400 }, "CRLRefreshBeforeSec"),
 		// The zero value of RevokeOnAutoRenew is already false, so assert the

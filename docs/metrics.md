@@ -92,14 +92,15 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 
 ### Self-provisioned serving certificate
 
-Emitted only when [`tls_self_provision`](configuration.md#self-provisioned-serving-certificate)
-is enabled; both are zero otherwise.
+Always exported; all three read zero unless
+[`tls_self_provision`](configuration.md#self-provisioned-serving-certificate) is
+in use, so a dashboard or alert can select them either way.
 
 | Metric | Description |
 | --- | --- |
-| `puppetca_serving_cert_issued_total` | Counter of serving certificates this process has issued to itself. A sustained rate rather than an occasional increment means replicas disagree about which CA certificate is current, each reissuing over the other; a fleet restart resolves it. Resets to `0` on process restart. |
+| `puppetca_serving_cert_issued_total` | Counter of serving certificates this process has issued to itself. A sustained rate rather than an occasional increment means replicas disagree about which CA certificate is current, each reissuing over the other; a fleet restart resolves it. **Alerted** as `PuppetCAServingCertChurning`, because inferring it otherwise would mean noticing an inventory growing for no reason. Resets to `0` on process restart. |
 | `puppetca_serving_cert_renewal_failures_total` | Counter of maintenance passes that failed to renew the serving certificate. The existing certificate stays in place and the next cycle retries. **Alert on this** — the shipped mixin does, as `PuppetCAServingCertRenewalFailing`: a persistent rise is invisible until the certificate expires, and it breaks the bound `tls_self_provision_revoke_after_sec` relies on. Resets to `0` on process restart. |
-| `puppetca_serving_cert_revocation_failures_total` | Counter of maintenance passes that failed to revoke superseded serving certificates. The pending list is left intact and the next cycle retries; until one succeeds, the superseded certificate remains a valid credential. Resets to `0` on process restart. |
+| `puppetca_serving_cert_revocation_failures_total` | Counter of maintenance passes that failed to revoke superseded serving certificates. The pending list is left intact and the next cycle retries; until one succeeds, the superseded certificate remains a valid credential — which is the exposure bound `tls_self_provision_revoke_after_sec` exists to enforce, so the mixin **alerts** on it as `PuppetCAServingCertRevocationFailing`. Resets to `0` on process restart. |
 
 ### Leaf certificates
 
@@ -169,6 +170,6 @@ puppetca_k8s_export_last_error_timestamp_seconds
 See the [`mixin/`](../mixin/) directory for the Jsonnet monitoring mixin and
 instructions for rendering or importing it. It alerts on exporter availability,
 CA/CRL/leaf expiry, pending requests, CRL update failures
-(`puppetca_crl_update_failures_total`), serving-certificate renewal failures
-(`puppetca_serving_cert_renewal_failures_total`), and Kubernetes export
+(`puppetca_crl_update_failures_total`), serving-certificate renewal, revocation and issuance churn
+(`puppetca_serving_cert_*`), and Kubernetes export
 failures, with all thresholds configurable.

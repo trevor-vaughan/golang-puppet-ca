@@ -298,7 +298,8 @@ database by default; enable `encrypt_ca_key` or pin it to a local file with
 `ca_key_file`.
 
 > **`tls_self_provision` adds a second private key.** The serving key is stored the same way, and `ca_key_file` does **not** pin it — only `tls_self_provision_encrypt_key` protects it at rest. If you hold the CA key at a provider or in a local file, this is the only private key in the backend. See [CA key security](ca-key-security.md).
- `openvox-ca-ctl setup` / `import` work on the local filesystem
+
+`openvox-ca-ctl setup` / `import` work on the local filesystem
 only; bootstrap against a scratch directory, then point a SQLite-backed
 `openvox-ca` at a fresh database.
 
