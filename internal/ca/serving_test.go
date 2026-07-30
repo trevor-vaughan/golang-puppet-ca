@@ -27,6 +27,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"time"
@@ -569,6 +570,55 @@ var _ = Describe("Renewing a node that has taken the CA's hostname", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(revoked).To(BeFalse(),
 			"renewing under the CA's hostname must not revoke the certificate it is serving")
+
+		// And the comparison must be a comparison: a second renewal replaces
+		// the node's own certificate, whose serial is not the serving one, so
+		// that predecessor must still be revoked. Widening the guard to "a
+		// serving certificate exists" would leave it valid indefinitely.
+		latest, err := myCA.Storage.LatestSerialForSubject(ctx, hostname)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.Renew(ctx, hostname, csrFor(hostname))
+		Expect(err).NotTo(HaveOccurred())
+
+		want := new(big.Int)
+		_, ok := want.SetString(latest, 16)
+		Expect(ok).To(BeTrue())
+		revoked, err = myCA.IsRevokedSerial(ctx, want)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue(),
+			"a replaced certificate that is not the serving one must still be revoked")
+	})
+
+	It("skips the revocation when the serving certificate cannot be read", func() {
+		// The arm round 3 added, and the one that had no spec: reverting it to
+		// `return false` restores the fail-open a reviewer blocked on, with the
+		// whole suite otherwise green. A read failure is not an answer, so the
+		// revoke must not proceed on it.
+		dir := GinkgoT().TempDir()
+		seed := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, hostname)
+		seed.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		seed.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(seed.Init(ctx)).To(Succeed())
+		serving, err := seed.EnsureServingCert(ctx, ca.ServingConfig{Subject: hostname})
+		Expect(err).NotTo(HaveOccurred())
+
+		base := storage.NewFilesystemBackend(dir)
+		blind := ca.New(storage.NewWithBackend(
+			&failReadBackend{Backend: base, failKey: storage.KeyServingCert}, dir),
+			ca.AutosignConfig{Mode: "off"}, hostname)
+		blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(blind.Init(ctx)).To(Succeed())
+
+		_, err = blind.Renew(ctx, hostname, csrFor(hostname))
+		Expect(err).NotTo(HaveOccurred())
+
+		// The serial Renew resolves is the serving certificate's -- it was
+		// issued last -- so that is the one that must survive.
+		revoked, err := blind.IsRevokedSerial(ctx, serving.Leaf.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeFalse(),
+			"an unreadable serving certificate must not let the revocation through")
 	})
 
 	It("revokes normally when no serving certificate is stored", func() {
@@ -781,25 +831,40 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 		cfg.ExtraNames = []string{"ingress.example.com"}
 
 		code, detail := reasonFor()
-		Expect(code).To(Equal("configured-name-drift"))
+		Expect(code).To(Equal("missing-configured-name"))
 		Expect(detail).To(Equal("ingress.example.com"))
 	})
 
-	It("reissues when a configured name is withdrawn, not only when one is added", func() {
-		// The other direction. Withdrawing a name removes the CA's authority to
-		// assert it; a subset check would leave the live certificate asserting
-		// it until its own renewal window, which at the default validity is
-		// years away.
+	It("keeps a withdrawn name until the certificate is reissued for another reason", func() {
+		// Not an oversight: a subset test is what makes a mixed-configuration
+		// fleet converge. Set equality would leave replicas whose name lists
+		// differ minting over each other forever. See missingNames.
 		cfg.ExtraNames = []string{"ingress.example.com"}
 		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
 
 		cfg.ExtraNames = nil
-		code, detail := reasonFor()
-		Expect(code).To(Equal("configured-name-drift"))
-		Expect(detail).To(Equal("ingress.example.com"))
+		code, _ := reasonFor()
+		Expect(code).To(BeEmpty(), "a withdrawn name alone must not force a reissue")
+
+		reused, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reused.Issued).To(BeFalse())
+		Expect(reused.Leaf.DNSNames).To(ContainElement("ingress.example.com"))
+	})
+
+	It("drops a withdrawn name once the serving certificate is revoked", func() {
+		// The remedy the missingNames comment points at, and the reason the
+		// subset rule is acceptable: revocation is shared state, so every
+		// replica agrees, and the reissue picks up the current configuration.
+		cfg.ExtraNames = []string{"ingress.example.com"}
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		cfg.ExtraNames = nil
+		Expect(myCA.Revoke(ctx, subject)).To(Succeed())
 
 		reissued, err := myCA.EnsureServingCert(ctx, cfg)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(reissued.Issued).To(BeTrue())
 		Expect(reissued.Leaf.DNSNames).NotTo(ContainElement("ingress.example.com"))
 	})
 

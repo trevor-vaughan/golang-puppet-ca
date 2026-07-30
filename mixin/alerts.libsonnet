@@ -224,11 +224,12 @@
           {
             alert: 'PuppetCAServingCertRevocationFailing',
             // The sweep that revokes superseded serving certificates is
-            // failing. Nothing breaks visibly: the CA serves its current
-            // certificate throughout. What is lost is the exposure bound
-            // tls_self_provision_revoke_after_sec exists to enforce -- until a
-            // sweep succeeds, the certificate it replaced stays a valid
-            // credential.
+            // failing, or a mint could not record what it replaced. Nothing
+            // breaks visibly: the CA serves its current certificate
+            // throughout. What is lost is the exposure bound
+            // tls_self_provision_revoke_after_sec exists to enforce. A failed
+            // sweep retries; a failure to record leaves nothing for any sweep
+            // to find, so that one needs revoking by hand.
             expr: 'increase(puppetca_serving_cert_revocation_failures_total{%(selector)s}[%(window)s]) > 0' % {
               selector: $._config.puppetCASelector,
               window: $._config.servingRevocationWindow,

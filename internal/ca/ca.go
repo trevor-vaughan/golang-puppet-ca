@@ -238,8 +238,8 @@ func (c *CA) IncServingRevocationFailures() {
 	c.servingRevocationFailures.Add(1)
 }
 
-// ServingRevocationFailureCount returns how many maintenance passes failed to
-// revoke superseded serving certificates. Surfaced as
+// ServingRevocationFailureCount returns how many supersessions could not be
+// recorded or completed. Only the completion failures are self-healing. Surfaced as
 // puppetca_serving_cert_revocation_failures_total.
 func (c *CA) ServingRevocationFailureCount() uint64 {
 	return c.servingRevocationFailures.Load()

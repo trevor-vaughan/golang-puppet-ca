@@ -95,6 +95,12 @@ type ServingCertificate struct {
 //
 // # Failure policy
 //
+// Material that could not be *read* is the exception, and errors rather than
+// minting -- a read failure says nothing about whether the stored certificate
+// is good, and minting over it would rotate the fleet on a storage blip. The
+// caller decides what that means: the maintenance pass counts a renewal failure
+// and retries, while at startup it is fatal.
+//
 // Any single unusable-material condition mints a replacement rather than
 // erroring. That is deliberate: a torn write between the two Put calls, or a
 // rotated passphrase leaving the stored key undecryptable, would otherwise be
@@ -151,6 +157,11 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 				// Not fatal: the new certificate is in place and serving. The
 				// cost is a superseded certificate staying valid until it
 				// expires, which is strictly better than refusing to serve.
+				// Counted, not just logged: the old serial was read before the
+				// mint and storage now holds the new certificate, so nothing
+				// can rediscover it. No later sweep will find it, which is the
+				// non-self-healing arm the counter's contract names.
+				c.IncServingRevocationFailures()
 				slog.Warn("Could not record the superseded serving certificate for revocation",
 					"serial", serialHexStr(superseded.SerialNumber), "error", err)
 			}
@@ -220,7 +231,7 @@ const (
 	reasonNoCACert        = "ca-certificate-not-loaded"
 	reasonForeignIssuer   = "not-issued-by-current-ca-certificate"
 	reasonRenewalWindow   = "within-renewal-window"
-	reasonMissingName     = "configured-name-drift"
+	reasonMissingName     = "missing-configured-name"
 	reasonRevocationCheck = "revocation-status-unknown"
 	reasonRevoked         = "certificate-revoked"
 )
@@ -332,7 +343,7 @@ func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*Ser
 		}
 	}
 
-	if missing := nameDrift(leaf, servingNames(cfg)); missing != "" {
+	if missing := missingNames(leaf, servingNames(cfg)); missing != "" {
 		// Detail is a configured name, which the operator supplied and which
 		// is already in the certificate this process serves.
 		return nil, servingReason{Code: reasonMissingName, Detail: missing}
@@ -439,24 +450,30 @@ func servingNames(cfg ServingConfig) []string {
 	return names
 }
 
-// nameDrift returns the first name the certificate and the configuration
-// disagree about, or "" when they match exactly.
+// missingNames returns the first configured name the certificate does not
+// cover, or "" when it covers all of them.
 //
-// Both directions, deliberately. A configured name the certificate lacks is the
-// obvious case. A name the certificate carries and the configuration no longer
-// does matters as much: an operator who withdraws a hostname -- because it has
-// been handed to another service, or an ingress was retired -- has removed the
-// CA's authority to assert it, and a subset check would let the live
-// certificate keep asserting it until it fell into its own renewal window,
-// which at the default validity is years away.
-func nameDrift(leaf *x509.Certificate, want []string) string {
+// One-directional on purpose, and the direction matters for convergence rather
+// than for tidiness. Each replica evaluates the *shared* stored certificate
+// against its *own* configuration, which is read once at startup — so on the
+// deployment this feature targets, editing a ConfigMap and having one pod
+// restart leaves the fleet holding two different name lists indefinitely.
+//
+// A subset test is monotone under that split: the replica with the longer list
+// mints the union, the replica with the shorter list accepts it, and the fleet
+// stops. Set equality is not: neither certificate satisfies both configurations,
+// so the two mint over each other on every maintenance pass forever, each pass
+// adding an inventory row, a supersession entry and eventually a permanent CRL
+// entry that every agent downloads.
+//
+// The cost is that withdrawing a name does not shrink the live certificate by
+// itself; it takes effect at the next renewal. To apply it immediately, revoke
+// the serving certificate — that is the documented rotation route, it forces a
+// reissue against the current configuration, and because the revocation is
+// shared state every replica agrees about it.
+func missingNames(leaf *x509.Certificate, want []string) string {
 	for _, n := range want {
 		if !slices.Contains(leaf.DNSNames, n) {
-			return n
-		}
-	}
-	for _, n := range leaf.DNSNames {
-		if !slices.Contains(want, n) {
 			return n
 		}
 	}
@@ -729,8 +746,13 @@ func (c *CA) writeSuperseded(ctx context.Context, entries []supersededEntry) err
 // failure a few lines on is only logged -- so the cost of skipping is one node
 // certificate staying valid, against a fleet-wide handshake outage.
 //
-// Bytes that do not parse are not a credential in circulation, so those arms
-// report no match, consistent with storedServingLeaf.
+// The parse arms answer the same way as the read error, and deliberately not
+// the way storedServingLeaf answers them. There the question is "what am I
+// about to replace", and unparseable bytes really are nothing. Here it is "is
+// the serial I am about to revoke the one being served" -- and that serial
+// comes from the inventory, not from these bytes. The listener holds its
+// certificate in memory, so corrupt storage means it is still presenting the
+// one it loaded. Every state in which this cannot tell must behave alike.
 func (c *CA) servingSerialMatches(ctx context.Context, serial string) bool {
 	if serial == "" {
 		return false
@@ -747,11 +769,17 @@ func (c *CA) servingSerialMatches(ctx context.Context, serial string) bool {
 	}
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		return false
+		slog.Warn("Stored serving certificate is not PEM while deciding whether to revoke a " +
+			"replaced certificate; skipping the revocation rather than risk revoking the one " +
+			"the listener is serving")
+		return true
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return false
+		slog.Warn("Stored serving certificate is unparseable while deciding whether to revoke a "+
+			"replaced certificate; skipping the revocation rather than risk revoking the one "+
+			"the listener is serving", "error", err)
+		return true
 	}
 	// Normalise both sides: the inventory string and serialHexStr can differ in
 	// padding, which is why deleteStoredCertIfSerialMatches does the same.

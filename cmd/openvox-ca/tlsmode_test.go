@@ -40,10 +40,6 @@ var _ = Describe("serverConfig.tlsEnabled", func() {
 		Expect((&serverConfig{TLSCert: "c.pem", TLSKey: "k.pem"}).tlsEnabled()).To(BeTrue())
 	})
 
-	// Half-configured TLS stays off rather than erroring here, which is the
-	// pre-existing behaviour: the listener comes up on plain HTTP and the
-	// non-loopback guard is what refuses to start. Pinned because the whole
-	// point of the helper is that every call site agrees on this answer.
 	It("is true with self-provision alone", func() {
 		// The arm the helper exists for, and the consequential one: without it
 		// main.go leaves AuthConfig nil, so the listener comes up on TLS with
@@ -55,6 +51,10 @@ var _ = Describe("serverConfig.tlsEnabled", func() {
 		Expect((&serverConfig{TLSSelfProvision: true, TLSCert: "c.pem"}).tlsEnabled()).To(BeTrue())
 	})
 
+	// Half-configured TLS stays off rather than erroring here, which is the
+	// pre-existing behaviour: the listener comes up on plain HTTP and the
+	// non-loopback guard is what refuses to start. Pinned because the whole
+	// point of the helper is that every call site agrees on this answer.
 	It("is false with only a certificate", func() {
 		Expect((&serverConfig{TLSCert: "c.pem"}).tlsEnabled()).To(BeFalse())
 	})
