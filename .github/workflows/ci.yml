@@ -44,9 +44,18 @@ jobs:
           PROMETHEUS_VERSION: 3.13.2
         run: |
           go install github.com/google/go-jsonnet/cmd/jsonnet@v0.21.0
-          curl -sSfL --retry 3 \
-            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
-            | tar -xz -C "${RUNNER_TEMP}"
+          # Verified, not just pinned: a release asset can be replaced without
+          # the tag moving, and this is the only binary in CI covered by neither
+          # a commit SHA nor the Go checksum database.
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/prometheus.tar.gz" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/sha256sums.txt" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/sha256sums.txt"
+          (cd "${RUNNER_TEMP}" \
+            && grep " prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz$" sha256sums.txt \
+            | sed "s| prometheus-.*| prometheus.tar.gz|" \
+            | sha256sum -c -)
+          tar -xzf "${RUNNER_TEMP}/prometheus.tar.gz" -C "${RUNNER_TEMP}"
           sudo install "${RUNNER_TEMP}/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
           promtool --version
 

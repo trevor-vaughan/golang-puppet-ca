@@ -131,9 +131,10 @@ func NewCollector(c *ca.CA) *Collector {
 			nil, nil),
 		servingRevocationFailures: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "serving_cert", "revocation_failures_total"),
-			"Total maintenance passes that failed to revoke superseded serving certificates. "+
-				"The list is left intact and the next cycle retries, so alert on a persistent rise: "+
-				"a superseded certificate stays a valid credential until the sweep succeeds.",
+			"Total failures to record or to complete a supersession of the serving certificate. "+
+				"A failed sweep leaves the list intact and retries; a failure to record leaves "+
+				"nothing for any sweep to find. Either way the replaced certificate stays a "+
+				"valid credential, so alert on a persistent rise.",
 			nil, nil),
 		caInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "ca_certificate", "info"),
