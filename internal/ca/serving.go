@@ -745,17 +745,20 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 		if err != nil {
 			return err
 		}
-		if corrupt {
-			// Overwrite rather than fall through the empty-list return below.
-			// Those bytes will never parse, so leaving them re-warns and
-			// re-counts on every pass forever -- which latches the alert with
-			// nothing an operator can do to clear it, and the realistic response
-			// to a permanently firing warning is to silence it.
-			return c.writeSuperseded(ctx, nil)
-		}
 		if len(entries) == 0 {
+			if corrupt {
+				// Overwrite rather than take the no-op return below. Those bytes
+				// will never parse, so leaving them re-warns and re-counts on
+				// every pass forever -- which latches the alert with nothing an
+				// operator can do to clear it, and the realistic response to a
+				// permanently firing warning is to silence it.
+				return c.writeSuperseded(ctx, nil)
+			}
 			return nil
 		}
+		// With entries recovered from a corrupt blob the normal path is right:
+		// they are swept like any others, and the write-back at the end persists
+		// the survivors, which is the same overwrite the empty case needs.
 
 		if cfg.RevokeAfter <= 0 {
 			slog.Info("Discarding pending serving-certificate revocations; revocation is disabled",
@@ -854,6 +857,11 @@ func (c *CA) readSuperseded(ctx context.Context) (entries []supersededEntry, cor
 		return nil, false, errors.New("reading pending serving-certificate revocations")
 	}
 	if err := json.Unmarshal(data, &entries); err != nil {
+		// entries keeps whatever decoded before the failure: encoding/json fills
+		// the slice as it goes. Those are real, revocable serials, so they are
+		// returned rather than discarded -- the caller sweeps them normally and
+		// its write-back drops only the part that will never parse.
+		//
 		// Counted, and for the same reason as the mint-path arms: however many
 		// entries these bytes named, they are gone. Nothing can rediscover them
 		// -- the mints that recorded them have long since overwritten
@@ -864,12 +872,29 @@ func (c *CA) readSuperseded(ctx context.Context) (entries []supersededEntry, cor
 		// Still not fatal: nothing is recoverable from unparseable bytes, and
 		// failing closed would take the listener down over a certificate that
 		// at worst stays valid until it expires.
+		// The raw bytes are logged because this is the one arm with no other
+		// record: the sweep is about to overwrite them, and unlike the mint-path
+		// arms the line can name no serial -- there may have been several. The
+		// blob holds only hex serials and RFC3339 timestamps, no key material
+		// and no credentials, so it is safe to log; it is truncated in case the
+		// corruption made it large.
 		c.IncServingRevocationFailures()
 		slog.Warn("Discarding unparseable pending serving-certificate revocations; whatever they "+
-			"named will not be scheduled for revocation", "error", err)
-		return nil, true, nil
+			"named will not be scheduled for revocation",
+			"error", err, "recovered", len(entries), "raw", truncateForLog(data))
+		return entries, true, nil
 	}
 	return entries, false, nil
+}
+
+// truncateForLog bounds a stored blob before it reaches a log line, so a
+// corrupt or maliciously large value cannot flood the log.
+func truncateForLog(data []byte) string {
+	const max = 1024
+	if len(data) <= max {
+		return string(data)
+	}
+	return string(data[:max]) + "...(truncated)"
 }
 
 // writeSuperseded persists the pending-revocation list.

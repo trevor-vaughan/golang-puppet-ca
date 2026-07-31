@@ -108,7 +108,46 @@ case with no retry, since no periodic task is registered. Do not silence
 | --- | --- |
 | `puppetca_serving_cert_issued_total` | Counter of serving certificates this process has issued to itself. A sustained rate rather than an occasional increment means replicas disagree about which CA certificate is current, each reissuing over the other; a fleet restart resolves it. **Alerted** as `PuppetCAServingCertChurning`, because inferring it otherwise would mean noticing an inventory growing for no reason. Resets to `0` on process restart. |
 | `puppetca_serving_cert_renewal_failures_total` | Counter of maintenance passes that failed to renew the serving certificate. The existing certificate stays in place and the next cycle retries. **Alert on this** — the shipped mixin does, as `PuppetCAServingCertRenewalFailing`: a persistent rise is invisible until the certificate expires, and it breaks the bound `tls_self_provision_revoke_after_sec` relies on. Resets to `0` on process restart. |
-| `puppetca_serving_cert_revocation_failures_total` | Counter of failures to record or to complete a supersession. A failed *sweep* leaves the pending list intact and retries — except at startup with `tls_self_provision` off, where no periodic task is registered and nothing retries until the CA restarts; a failure to *record* — the mint could not read, or could not write down, what it was replacing — leaves nothing for any sweep to find. **There is no way to revoke it.** Revocation is by subject, and the subject now resolves to the *live* serving certificate, so `openvox-ca-ctl revoke --certname <hostname>` would take the working credential out of circulation and leave the orphan valid. Until a by-serial revoke exists ([#177](https://github.com/voxpupuli/openvox-ca/issues/177)), treat this as an incident: the orphaned certificate stays a valid credential for the CA's hostname until its `notAfter`, and the only containment is network-level or rotating the CA. A single entry whose revocation failed is retried; one whose serial is malformed is discarded, since it names nothing revocable. Either way the replaced certificate remains a valid credential — which is the exposure bound `tls_self_provision_revoke_after_sec` exists to enforce, so the mixin **alerts** on it as `PuppetCAServingCertRevocationFailing`. Resets to `0` on process restart. |
+| `puppetca_serving_cert_revocation_failures_total` | Counter of failures to record or to complete a supersession. The replaced certificate stays a valid credential either way, which is the exposure bound `tls_self_provision_revoke_after_sec` exists to enforce, so the mixin **alerts** on it as `PuppetCAServingCertRevocationFailing`. Some cases retry and some can never be retired; see [Superseded serving certificates](#superseded-serving-certificates) below. Resets to `0` on process restart. |
+
+#### Superseded serving certificates
+
+When `puppetca_serving_cert_revocation_failures_total` rises, the CA log line
+says which case it is. They differ in whether anything will clear it.
+
+**Retried on the next pass.** `Could not reconcile superseded serving
+certificates`, and `will retry` for one entry the sweep could not revoke. The
+pending list is left intact. Because the alert fires only while the counter is
+still rising, a firing instance means the retries are *not* succeeding — treat
+it as a storage-backend fault rather than waiting.
+
+**Not retried.** The same reconcile line ending `at startup`, when
+`tls_self_provision` is off. No periodic task is registered in that
+configuration, so the startup sweep is the only one the process runs and nothing
+retries until the CA restarts.
+
+**Cannot be retired at all.** `will not be scheduled for revocation` and `can
+never be revoked`. The mint has already overwritten what named the old serial,
+so no sweep can rediscover it, and there is **no by-serial revoke**
+([#177](https://github.com/voxpupuli/openvox-ca/issues/177)) — `openvox-ca-ctl
+revoke --certname <hostname>` resolves to the certificate the listener is
+currently serving, so running it makes things worse. The orphan stays a valid
+CA-signed credential for the CA's hostname until its `notAfter`. Contain it at
+the network layer, or rotate the CA.
+
+To record what was orphaned, for the incident:
+
+- the `will not be scheduled for revocation` line carries a `serial` field when
+  it knows one;
+- when the certificate itself was unreadable it does not, and the orphan is the
+  second-newest inventory row for the CA's hostname;
+- when the *pending list* could not be parsed it does not either, and there may
+  have been **several** — the log line carries the raw list as `raw` and a
+  `recovered` count of the entries that still decoded. Reconstruct the rest from
+  the inventory rows for the CA's hostname newer than
+  `tls_self_provision_revoke_after_sec` ago;
+- `can never be revoked` carries only the malformed value that caused it, so use
+  the inventory there too.
 
 ### Leaf certificates
 

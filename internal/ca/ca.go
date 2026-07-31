@@ -226,13 +226,18 @@ func (c *CA) ServingRenewalFailureCount() uint64 {
 }
 
 // IncServingRevocationFailures records a failure to record or to complete a
-// supersession. Six arms, and they differ in whether they clear themselves.
+// supersession. Seven conditions across six call sites, and they differ in
+// whether they clear themselves.
+//
+// The sweep's increment is once per pass, not once per entry: five entries
+// failing in one pass move the counter by one. The alert fires on any increase,
+// so that does not change whether it fires, only what the value means.
 //
 // Self-healing — the next pass retries:
 //
 //   - a maintenance pass that could not reconcile the pending list, logged
 //     "Could not reconcile superseded serving certificates";
-//   - a single entry whose revocation failed, logged "will retry".
+//   - one or more entries whose revocation failed, each logged "will retry".
 //
 // Not self-healing:
 //

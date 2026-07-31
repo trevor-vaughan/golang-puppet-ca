@@ -227,9 +227,12 @@
             // failing, or a mint could not record what it replaced. Nothing
             // breaks visibly: the CA serves its current certificate
             // throughout. What is lost is the exposure bound
-            // tls_self_provision_revoke_after_sec exists to enforce. A failed
-            // sweep retries; a failure to record leaves nothing for any sweep
-            // to find, so that one needs revoking by hand.
+            // tls_self_provision_revoke_after_sec exists to enforce. The sweep
+            // retries, so a single failure clears itself -- but this alert only
+            // fires on a counter still rising, so a firing instance is a fault
+            // the retries are not clearing. A failure to *record* leaves nothing
+            // for any sweep to find, and there is no by-serial revoke, so that
+            // one cannot be retired at all: see the runbook annotation.
             expr: 'increase(puppetca_serving_cert_revocation_failures_total{%(selector)s}[%(window)s]) > 0' % {
               selector: $._config.puppetCASelector,
               window: $._config.servingRevocationWindow,
@@ -238,7 +241,8 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'Puppet CA is failing to revoke superseded serving certificates.',
-              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). The replaced certificate remains a valid credential. The log line says which case it is. "Could not reconcile superseded serving certificates" or "will retry": transient, and the next pass clears it -- except when that line ends "at startup" and tls_self_provision is off, where there is no next pass until the CA restarts. "will not be scheduled for revocation" or "can never be revoked": no sweep can find it, and there is no by-serial revoke -- "openvox-ca-ctl revoke --certname" resolves to the LIVE serving certificate and would take the working credential out of circulation instead. The orphan stays valid until its notAfter; contain it at the network or rotate the CA. Record the serial for the incident: the "will not be scheduled" line carries it unless the certificate itself was unreadable (then take the second-newest inventory row for the CA hostname), and the "can never be revoked" line carries only the malformed value that caused it, so use the inventory there too. Check the CA logs and its storage backend.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). That certificate stays a valid credential for the CA hostname past the bound tls_self_provision_revoke_after_sec exists to enforce. This alert fires only while the counter is still rising, so the retries are not clearing it: check the CA logs and its storage backend. Do NOT run "openvox-ca-ctl revoke --certname" against the CA hostname -- it resolves to the certificate the listener is currently serving. The log line names which case it is; see the runbook for what each one needs.',
+              runbook_url: '%(servingRevocationRunbook)s' % $._config,
             },
           },
           {

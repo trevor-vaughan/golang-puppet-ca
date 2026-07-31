@@ -378,6 +378,27 @@ var _ = Describe("maintenance tasks", func() {
 		})
 	})
 
+	Describe("servingMaintenanceTasks", func() {
+		It("registers both tasks when self-provisioning is on", func() {
+			// The feature's two standing promises -- renew before expiry, revoke
+			// what was superseded. Both constructors are well specced, but
+			// nothing pinned that either is ever registered, and a task that
+			// never runs never fails, so neither counter would signal its
+			// absence.
+			tasks := servingMaintenanceTasks(myCA, cfg, holder)
+			names := make([]string, 0, len(tasks))
+			for _, t := range tasks {
+				names = append(names, t.name)
+			}
+			Expect(names).To(ConsistOf(
+				"serving-cert-renewal", "serving-cert-superseded-revocation"))
+		})
+
+		It("registers nothing when self-provisioning is off", func() {
+			Expect(servingMaintenanceTasks(myCA, &serverConfig{Hostname: hostname}, holder)).To(BeEmpty())
+		})
+	})
+
 	Describe("servingConfigFrom", func() {
 		It("carries the configured renewal window through to the CA", func() {
 			// The sibling of the RevokeAfter assertion below, and the half that
