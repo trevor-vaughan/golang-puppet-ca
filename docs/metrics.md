@@ -92,15 +92,23 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 
 ### Self-provisioned serving certificate
 
-Always exported; all three read zero unless
+Always exported, so a dashboard or alert can select them whether or not
 [`tls_self_provision`](configuration.md#self-provisioned-serving-certificate) is
-in use, so a dashboard or alert can select them either way.
+in use.
+
+Two of them read zero without the feature. The **revocation** counter does not:
+the startup sweep that drains pending revocations runs whenever `hostname` is
+set, deliberately without regard to `tls_self_provision`, so that entries a
+previous configuration recorded are not stranded. A backend error at boot
+therefore raises it on a CA that has never enabled the feature — and that is the
+case with no retry, since no periodic task is registered. Do not silence
+`PuppetCAServingCertRevocationFailing` on non-self-provisioning CAs.
 
 | Metric | Description |
 | --- | --- |
 | `puppetca_serving_cert_issued_total` | Counter of serving certificates this process has issued to itself. A sustained rate rather than an occasional increment means replicas disagree about which CA certificate is current, each reissuing over the other; a fleet restart resolves it. **Alerted** as `PuppetCAServingCertChurning`, because inferring it otherwise would mean noticing an inventory growing for no reason. Resets to `0` on process restart. |
 | `puppetca_serving_cert_renewal_failures_total` | Counter of maintenance passes that failed to renew the serving certificate. The existing certificate stays in place and the next cycle retries. **Alert on this** — the shipped mixin does, as `PuppetCAServingCertRenewalFailing`: a persistent rise is invisible until the certificate expires, and it breaks the bound `tls_self_provision_revoke_after_sec` relies on. Resets to `0` on process restart. |
-| `puppetca_serving_cert_revocation_failures_total` | Counter of failures to record or to complete a supersession. A failed *sweep* leaves the pending list intact and retries; a failure to *record* — the mint could not read, or could not write down, what it was replacing — leaves nothing for any sweep to find, so that one needs revoking by hand. A single entry whose revocation failed is retried; one whose serial is malformed is discarded, since it names nothing revocable. Either way the replaced certificate remains a valid credential — which is the exposure bound `tls_self_provision_revoke_after_sec` exists to enforce, so the mixin **alerts** on it as `PuppetCAServingCertRevocationFailing`. Resets to `0` on process restart. |
+| `puppetca_serving_cert_revocation_failures_total` | Counter of failures to record or to complete a supersession. A failed *sweep* leaves the pending list intact and retries — except at startup with `tls_self_provision` off, where no periodic task is registered and nothing retries until the CA restarts; a failure to *record* — the mint could not read, or could not write down, what it was replacing — leaves nothing for any sweep to find. **There is no way to revoke it.** Revocation is by subject, and the subject now resolves to the *live* serving certificate, so `openvox-ca-ctl revoke --certname <hostname>` would take the working credential out of circulation and leave the orphan valid. Until a by-serial revoke exists ([#177](https://github.com/voxpupuli/openvox-ca/issues/177)), treat this as an incident: the orphaned certificate stays a valid credential for the CA's hostname until its `notAfter`, and the only containment is network-level or rotating the CA. A single entry whose revocation failed is retried; one whose serial is malformed is discarded, since it names nothing revocable. Either way the replaced certificate remains a valid credential — which is the exposure bound `tls_self_provision_revoke_after_sec` exists to enforce, so the mixin **alerts** on it as `PuppetCAServingCertRevocationFailing`. Resets to `0` on process restart. |
 
 ### Leaf certificates
 

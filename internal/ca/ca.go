@@ -168,8 +168,8 @@ type CA struct {
 	servingRenewalFailures atomic.Uint64
 
 	// servingRevocationFailures counts failures to record or to complete a
-	// supersession. See IncServingRevocationFailures for the four arms and
-	// which of them is self-healing. Surfaced as
+	// supersession. See IncServingRevocationFailures for the arms and which of
+	// them are self-healing. Surfaced as
 	// puppetca_serving_cert_revocation_failures_total.
 	servingRevocationFailures atomic.Uint64
 
@@ -226,19 +226,30 @@ func (c *CA) ServingRenewalFailureCount() uint64 {
 }
 
 // IncServingRevocationFailures records a failure to record or to complete a
-// supersession. Four arms, and they differ in whether they clear themselves:
+// supersession. Six arms, and they differ in whether they clear themselves.
 //
-//   - a maintenance pass that could not reconcile the pending list, and a
-//     single entry whose revocation failed — both retried on the next pass;
+// Self-healing — the next pass retries:
+//
+//   - a maintenance pass that could not reconcile the pending list, logged
+//     "Could not reconcile superseded serving certificates";
+//   - a single entry whose revocation failed, logged "will retry".
+//
+// Not self-healing:
+//
+//   - the startup reconcile failing, logged with the same phrase but ending
+//     "at startup". With tls_self_provision off no periodic task is registered,
+//     so that call is the only sweep the process runs and nothing retries it
+//     until the CA restarts;
 //   - a mint that could not read the certificate it was replacing, or read it
-//     and could not persist the pending list — neither is recoverable, because
-//     the mint has already overwritten what named that serial, so no later
-//     sweep can find it;
-//   - an entry discarded for a malformed serial, which is unrevokable by
-//     construction and will not recur.
+//     and could not persist the pending list, logged "will not be scheduled for
+//     revocation" — the mint has already overwritten what named that serial, so
+//     no later sweep can find it;
+//   - a pending list that could not be parsed, logged with the same phrase:
+//     whatever those bytes named is gone the same way.
 //
-// The log line says which: "will retry" for the first, "will not be scheduled
-// for revocation" for the second, "can never be revoked" for the third.
+// An entry discarded for a malformed serial is counted too, logged "can never
+// be revoked". It is unrevokable by construction and will not recur, so it
+// neither heals nor needs to.
 //
 // Counted separately from crlUpdateFailures because the failures this path hits
 // first are not CRL amendments at all — a lock timeout, or a storage error on
@@ -250,7 +261,8 @@ func (c *CA) IncServingRevocationFailures() {
 }
 
 // ServingRevocationFailureCount returns how many supersessions could not be
-// recorded or completed. Only the completion failures are self-healing. Surfaced as
+// recorded or completed. Only some arms are self-healing; see
+// IncServingRevocationFailures, which enumerates them. Surfaced as
 // puppetca_serving_cert_revocation_failures_total.
 func (c *CA) ServingRevocationFailureCount() uint64 {
 	return c.servingRevocationFailures.Load()
