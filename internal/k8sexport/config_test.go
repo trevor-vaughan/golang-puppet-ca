@@ -112,7 +112,7 @@ var _ = Describe("Config", func() {
 				Entry("serving_key in a ConfigMap", k8sexport.Target{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true}, "only valid for Secret targets"),
 				Entry("serving_key with cert", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true, Cert: true}, "cannot be combined with cert or crl"),
 				Entry("serving_key with crl", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingKey: true, CRL: true}, "cannot be combined with cert or crl"),
-				Entry("serving key colliding with cert key", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Cert: true, ServingCert: true, CertKey: "tls.crt"}, "must differ"),
+				Entry("serving certificate colliding with the serving key", k8sexport.Target{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, ServingCert: true, ServingKey: true, ServingCertKey: "tls.key"}, "must differ"),
 				// The API server requires both tls.crt and tls.key in a
 				// kubernetes.io/tls Secret, so half a pair is accepted here and
 				// then rejected on every apply for the life of the deployment.
@@ -162,10 +162,23 @@ var _ = Describe("Config", func() {
 				Expect(cfg.Targets[0].ServingKeyKey).To(Equal("tls.key"))
 			})
 
-			It("allows the serving certificate alongside public trust material", func() {
-				// Only the private key is separated; the certificate is public.
+			It("separates the serving certificate from public trust material", func() {
+				// Not for blast radius -- the certificate is public -- but for
+				// freshness. A replica that has not caught up with a rotation
+				// skips every target carrying serving material, and server-side
+				// apply cannot omit just those keys without deleting them, so a
+				// shared object would take ca.crt and ca.crl dark with it.
 				cfg := &k8sexport.Config{Targets: []k8sexport.Target{
 					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "x"}, Cert: true, ServingCert: true},
+				}}
+				Expect(cfg.Validate()).To(MatchError(ContainSubstring("serving_cert cannot be combined")))
+			})
+
+			It("allows each on its own target", func() {
+				cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust"}, Cert: true, CRL: true},
+					{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving"}, Type: "kubernetes.io/tls",
+						ServingCert: true, ServingKey: true},
 				}}
 				Expect(cfg.Validate()).To(Succeed())
 			})

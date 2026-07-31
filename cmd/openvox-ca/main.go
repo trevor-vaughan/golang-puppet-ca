@@ -815,7 +815,7 @@ func newRootCmd() *cobra.Command {
 					// validateServingExport above has already established is the
 					// only way a serving target can be configured.
 					go runK8sExporter(ctx, myCA,
-						attachServingSource(k8sExporter, cfg, servingCerts, myCA), exportResyncInterval)
+						attachServingSource(k8sExporter, cfg, servingCerts, store))
 				}
 			}
 

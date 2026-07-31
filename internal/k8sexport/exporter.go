@@ -181,7 +181,8 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 			// holding. The replica that minted publishes the right thing, and
 			// this one catches up on its next maintenance pass.
 			slog.Debug("Skipping serving export: this replica is behind",
-				"kind", t.Kind, "name", t.Metadata.Name, "namespace", e.namespaceFor(t))
+				"kind", t.Kind, "name", t.Metadata.Name, "namespace", e.namespaceFor(t),
+				"reason", m.staleReason)
 			continue
 		}
 		err := matErrs.forTarget(t)
@@ -213,7 +214,9 @@ type materials struct {
 
 	// servingStale reports that this replica holds a superseded pair, so any
 	// target wanting serving material is skipped rather than applied or failed.
+	// staleReason carries the two serials for the log line.
 	servingStale bool
+	staleReason  error
 }
 
 // materialErrors records, per material, why it could not be read. A target is
@@ -281,7 +284,10 @@ func (e *Exporter) fetchMaterials(ctx context.Context) (materials, materialError
 		certPEM, keyPEM, err := e.serving.ServingMaterial(ctx)
 		switch {
 		case errors.Is(err, ErrServingStale):
-			m.servingStale = true
+			// Keep the text: it names both serials, which is the only way to
+			// tell a replica one rotation behind (normal, clears on its next
+			// maintenance pass) from one behind by days (a fault).
+			m.servingStale, m.staleReason = true, err
 			return m, errs
 		case err != nil:
 			err = fmt.Errorf("reading serving material for export: %w", err)

@@ -256,6 +256,20 @@ func (t *Target) validate() error {
 			"one carrying a private key. Use two targets, with different names")
 	}
 
+	// Freshness, not blast radius, separates this one. A replica that is behind
+	// skips every target carrying serving material, because server-side apply
+	// with Force would delete the keys it omitted rather than leave them. That
+	// is right for the serving pair and wrong for a trust bundle: sharing an
+	// object would take ca.crt and ca.crl dark for as long as that replica is
+	// behind -- up to one maintenance interval -- and leave a stale
+	// PuppetCAKubernetesExportFailing with no way to clear it. Separate targets
+	// keep each material on its own freshness clock.
+	if t.ServingCert && (t.Cert || t.CRL) {
+		return fmt.Errorf("serving_cert cannot be combined with cert or crl in one target: " +
+			"a replica that has not yet caught up with a rotation skips its serving targets, " +
+			"which would take the trust material with them. Use two targets, with different names")
+	}
+
 	// type: kubernetes.io/tls is validated by the API server, which requires
 	// both tls.crt and tls.key to be present. Half a pair is accepted here and
 	// then rejected on every apply for the life of the deployment, which shows

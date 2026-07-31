@@ -183,10 +183,21 @@ configured target (cardinality is bounded by the configuration).
 
 > Exports run on every event (startup, CRL updates, serving-certificate
 > rotations) and on a ten-minute floor besides, so attempts are never sparse. A
-> failed cycle retries after two minutes. Alert by comparing
+> failed cycle retries after two minutes.
+>
+> One exception: a replica that has not yet caught up with a serving-certificate
+> rotation **skips** its serving targets rather than republishing a superseded
+> pair. A skip records nothing at all, so `applies_total` and
+> `last_success_timestamp_seconds` stop advancing for those targets on that
+> instance while its peers carry on. That is expected and needs no action; it
+> clears on that replica's next maintenance pass, and a replica that stays
+> behind is one whose maintenance pass is failing, which
+> `PuppetCAServingCertRenewalFailing` covers.
+>
+> Alert by comparing
 > `last_error` against `last_success` (the mixin's
-> `PuppetCAKubernetesExportFailing` does this) rather than with rate windows or
-> staleness thresholds, which misbehave between sparse attempts.
+> `PuppetCAKubernetesExportFailing` does this) rather than with rate windows,
+> which a skip would read as an outage.
 >
 > A material that cannot be read from storage fails only the targets that
 > requested it, and each of those records an error here — so the alert fires on

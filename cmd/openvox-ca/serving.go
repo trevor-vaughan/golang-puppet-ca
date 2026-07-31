@@ -100,9 +100,10 @@ func (h *servingCertHolder) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifica
 //
 // The residual window is between replicas, not inside one: two exporters can
 // still order their applies against each other, so a replica that fetched
-// before a rotation can land after another's corrective apply. The next
-// notification-driven cycle corrects it, and revoking superseded certificates
-// bounds how long the stale pair remains usable.
+// before a rotation can land after another's corrective apply. Nothing notices
+// at the time -- both applies succeed -- and the losing write is corrected by
+// the next periodic reconcile, which is the only thing that repairs it. See
+// currentOnly and exportResyncInterval in k8sexport.go.
 func (h *servingCertHolder) ServingMaterial(context.Context) (certPEM, keyPEM []byte, err error) {
 	pair := h.current.Load()
 	if pair == nil || len(pair.Certificate) == 0 {

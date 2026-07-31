@@ -153,18 +153,27 @@ consumer of one: it would look correct and fail at the first handshake. That is 
 The server logs a warning at startup whenever a `serving_key` target is
 configured. Restrict who can read that Secret.
 
-**The exported Secret only ever holds the serving certificate the backend
-holds.** Before publishing, a replica compares the certificate it is presenting
-with the one in storage; if they differ it is behind — another replica has
-rotated — and it publishes nothing that cycle rather than writing its own copy
-back. That is a quiet skip, not a failure: it is normal, it clears when that
-replica's next maintenance pass catches it up, and the replica that rotated has
-already published the new pair. Nothing alerts, and nothing needs to.
+**A replica never publishes a serving pair it knows is superseded.** Before
+publishing, it compares the certificate it is presenting with the one in
+storage; if they differ it is behind — another replica has rotated — and it
+publishes nothing that cycle rather than writing its own copy back. That is a
+quiet skip, not a failure: it is normal, it clears when that replica's next
+maintenance pass catches it up, and the replica that rotated has already
+published the new pair. Nothing alerts, and nothing needs to — a replica that
+stays behind is one whose maintenance pass is failing, which
+`PuppetCAServingCertRenewalFailing` already covers.
 
-It follows that a revoked pair is never republished either — revoking replaces
-it in storage, so a replica still holding it fails the comparison. Revoking
-after a key compromise is not undone by a lagging replica, whatever that
-replica's own view of the CRL happens to be.
+That is a bound, not an absolute. The comparison happens when the material is
+read, and the apply follows; two replicas can still order their applies against
+each other, so a Secret can briefly carry the pair the losing replica read. The
+ten-minute reconcile corrects it.
+
+Revoking alone does not stop republication: `openvox-ca-ctl revoke` adds the
+serial to the CRL, it does not replace the stored certificate. Republication
+stops once some replica notices the revocation and mints the replacement, which
+happens on its next maintenance pass. **After a key compromise, restart the
+replicas** so a fresh boot mints immediately, and delete or overwrite the
+exported Secret rather than waiting for it to be corrected.
 
 ### Secret type
 

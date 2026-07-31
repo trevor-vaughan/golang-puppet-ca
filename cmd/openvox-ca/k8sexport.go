@@ -56,19 +56,16 @@ import (
 //
 //   - after a failure, exportRetryInterval, so a target that failed once is not
 //     stale until something unrelated moves the CRL;
-//   - after a success, exportResyncInterval, because a *successful* apply can
-//     still have published stale material. servingNotify is per-process, so a
-//     replica that did not mint never learns of a rotation until its own hourly
-//     maintenance pass refreshes its holder — and any CRL event in that window
-//     has it republish its old pair over the correct one, successfully, with
-//     nothing to alert on. Server-side apply makes the extra cycles idempotent.
-func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter, resync time.Duration) {
+//   - after a success, exportResyncInterval, so an object edited or deleted out
+//     from under the exporter is repaired. Server-side apply makes an unchanged
+//     re-apply a genuine no-op, so the extra cycles cost nothing.
+func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter) {
 	slog.Info("Starting Kubernetes export job")
 
 	retry := time.NewTimer(exportRetryInterval)
 	defer retry.Stop()
 	stopTimer(retry)
-	retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter), resync))
+	retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter)))
 
 	for {
 		var reason string
@@ -86,14 +83,14 @@ func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter,
 
 		slog.Debug("Re-exporting to Kubernetes", "reason", reason)
 		stopTimer(retry)
-		retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter), resync))
+		retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter)))
 	}
 }
 
 // nextExportInterval picks how long to wait before the next unprompted cycle.
-func nextExportInterval(ok bool, resync time.Duration) time.Duration {
+func nextExportInterval(ok bool) time.Duration {
 	if ok {
-		return resync
+		return exportResyncInterval
 	}
 	return exportRetryInterval
 }
@@ -109,13 +106,15 @@ func nextExportInterval(ok bool, resync time.Duration) time.Duration {
 var exportRetryInterval = 2 * time.Minute
 
 // exportResyncInterval is the floor for cycles that had no failures — the
-// periodic reconcile every controller needs, since an apply can succeed while
-// publishing material this replica has not yet caught up with.
+// periodic reconcile every controller needs.
 //
-// It repairs drift -- an object edited or deleted out from under the exporter --
-// and nothing else: a replica that is behind publishes nothing at all rather
-// than publishing something stale more slowly, so this interval no longer has
-// to be reasoned about against the maintenance interval.
+// It repairs drift -- an object edited or deleted out from under the exporter,
+// and a Secret left holding the pair a lost cross-replica apply race put there.
+// A replica that is behind publishes nothing at all, so this interval no longer
+// has to be reasoned about against the maintenance interval.
+//
+// docs/kubernetes-export.md and docs/metrics.md both state this figure; a spec
+// pins it, because it has been wrong three times.
 var exportResyncInterval = 10 * time.Minute
 
 // validateServingExport refuses a serving export that can never succeed.
@@ -169,11 +168,11 @@ func servingExportWarnings(cfg *serverConfig) []string {
 // Separated from the serve command so that "the exporter reads the same pair the
 // listener serves" is a proposition a spec can check: inline, pointing it at a
 // different or empty holder compiled and passed.
-func attachServingSource(e *k8sexport.Exporter, cfg *serverConfig, holder *servingCertHolder, c *ca.CA) *k8sexport.Exporter {
+func attachServingSource(e *k8sexport.Exporter, cfg *serverConfig, holder *servingCertHolder, store *storage.StorageService) *k8sexport.Exporter {
 	if !cfg.TLSSelfProvision {
 		return e
 	}
-	return e.WithServingSource(currentOnly{inner: holder, store: c.Storage})
+	return e.WithServingSource(currentOnly{inner: holder, store: store})
 }
 
 // exportK8sOnce runs a single reconcile, logging the outcome and reporting
@@ -235,7 +234,11 @@ func (c currentOnly) ServingMaterial(ctx context.Context) (certPEM, keyPEM []byt
 	}
 	storedPEM, err := c.store.GetServingCert(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading the stored serving certificate to compare against: %w", err)
+		// Without the backend's error text, for the reason internal/ca gives at
+		// this same call: a SQL driver's connection error can carry the DSN, and
+		// this reaches a Warn line every retry interval for as long as the
+		// backend is unhappy.
+		return nil, nil, errors.New("reading the stored serving certificate to compare against")
 	}
 	current, err := leafSerialOf(storedPEM)
 	if err != nil {

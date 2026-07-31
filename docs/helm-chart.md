@@ -202,7 +202,7 @@ the certificate. Note what the second
 half of that costs: **the exported key is written to the Secret in plaintext**,
 even when `tls_self_provision_encrypt_key` is set, because a TLS consumer
 cannot use an encrypted PEM. Export `serving_cert` alone unless
-something needs the key, and keep it in a Secret separate from your trust
+something needs the key. The server requires it in a Secret separate from your trust
 bundle. See
 [configuration](configuration.md#self-provisioned-serving-certificate) for
 renewal, revocation of superseded certificates, and the

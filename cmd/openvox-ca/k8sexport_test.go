@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -72,7 +74,7 @@ var _ = Describe("runK8sExporter", func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, exporter, exportResyncInterval)
+			runK8sExporter(ctx, c, exporter)
 			close(done)
 		}()
 
@@ -119,7 +121,7 @@ var _ = Describe("runK8sExporter serving-certificate wake-up", func() {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, exporter, exportResyncInterval)
+			runK8sExporter(ctx, c, exporter)
 			close(done)
 		}()
 
@@ -208,7 +210,7 @@ var _ = Describe("serving-certificate rotation, end to end", func() {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, exporter, exportResyncInterval)
+			runK8sExporter(ctx, c, exporter)
 			close(done)
 		}()
 
@@ -368,11 +370,11 @@ var _ = Describe("serving export wiring", func() {
 		newExporter := func() *k8sexport.Exporter {
 			return k8sexport.New(fake.NewClientset(), cfg.KubernetesExport, store, "ns", nil)
 		}
-		Expect(attachServingSource(newExporter(), cfg, holder, c).ExportAll(context.Background())).
+		Expect(attachServingSource(newExporter(), cfg, holder, store).ExportAll(context.Background())).
 			To(Succeed(), "with the holder attached the serving materials resolve")
 
 		cfg.TLSSelfProvision = false
-		Expect(attachServingSource(newExporter(), cfg, holder, c).ExportAll(context.Background())).
+		Expect(attachServingSource(newExporter(), cfg, holder, store).ExportAll(context.Background())).
 			To(MatchError(ContainSubstring("tls_self_provision")),
 				"without it the source must stay nil, so the failure names the cause")
 	})
@@ -394,8 +396,8 @@ var _ = Describe("nextExportInterval", func() {
 		// the alert's debounce; a successful one still needs a floor, because a
 		// replica that did not mint can apply a stale pair successfully and
 		// nothing else would ever correct it.
-		Expect(nextExportInterval(false, exportResyncInterval)).To(Equal(exportRetryInterval))
-		Expect(nextExportInterval(true, exportResyncInterval)).To(Equal(exportResyncInterval))
+		Expect(nextExportInterval(false)).To(Equal(exportRetryInterval))
+		Expect(nextExportInterval(true)).To(Equal(exportResyncInterval))
 		Expect(exportRetryInterval).To(BeNumerically("<", exportResyncInterval))
 	})
 })
@@ -435,7 +437,7 @@ var _ = Describe("runK8sExporter periodic reconcile", func() {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, k8sexport.New(client, cfg, store, "", nil), exportResyncInterval)
+			runK8sExporter(ctx, c, k8sexport.New(client, cfg, store, "", nil))
 			close(done)
 		}()
 
@@ -541,9 +543,55 @@ var _ = Describe("currentOnly", func() {
 		Expect(ensureServingCert(ctx, lagger,
 			&serverConfig{TLSSelfProvision: true, Hostname: host}, newServingCertHolder(nil))).To(Succeed())
 
+		// The fact that makes this a two-replica spec rather than a one-replica
+		// one: minter never saw lagger's revoke, so anything consulting its own
+		// CRL cache -- as the fence this replaced did -- answers "not revoked".
+		heldSerial, parseErr := leafSerialOf(mustServingCert(ctx, held))
+		Expect(parseErr).NotTo(HaveOccurred())
+		serial, ok := new(big.Int).SetString(heldSerial, 16)
+		Expect(ok).To(BeTrue())
+		Expect(minter.IsRevokedSerial(ctx, serial)).To(BeFalse(),
+			"minter's cached CRL cannot see lagger's revoke; the comparison must not depend on it")
+
 		_, _, err := currentOnly{inner: held, store: store}.ServingMaterial(ctx)
 		Expect(err).To(MatchError(k8sexport.ErrServingStale),
 			"a replica must not republish what the fleet has retired, whatever its own CRL cache says")
+	})
+
+	It("is what the production wiring installs", func() {
+		// The fence is attached at one line, and replacing it with the bare
+		// holder compiles and left the whole suite green -- restoring the
+		// defect four rounds chased. Driven through attachServingSource with a
+		// stale holder, so the wiring is asserted rather than read.
+		Expect(ensureServingCert(ctx, minter, &serverConfig{
+			TLSSelfProvision: true, Hostname: host,
+			TLSSelfProvisionNames: []string{"alt.example.test"},
+		}, newServingCertHolder(nil))).To(Succeed())
+
+		cfg := &serverConfig{TLSSelfProvision: true, Hostname: host}
+		client := fake.NewClientset()
+		exportCfg := k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving", Namespace: "ns1"},
+			Type: "kubernetes.io/tls", ServingCert: true, ServingKey: true,
+		}}}
+		Expect(exportCfg.Validate()).To(Succeed())
+
+		e := attachServingSource(k8sexport.New(client, exportCfg, store, "ns1", nil), cfg, held, store)
+		Expect(e.ExportAll(ctx)).To(Succeed(), "being behind is not an export failure")
+
+		_, err := client.CoreV1().Secrets("ns1").Get(ctx, "serving", metav1.GetOptions{})
+		Expect(err).To(HaveOccurred(),
+			"an unfenced source would have republished the superseded pair here")
+	})
+
+	It("passes the holder's own failure through as a failure, not staleness", func() {
+		// The opposite direction, and the one that would be silent: labelled as
+		// staleness, a replica whose holder never populates skips forever --
+		// no applies_total, no last_error, so neither arm of the export alert
+		// can fire and the only trace is a debug line.
+		_, _, err := currentOnly{inner: newServingCertHolder(nil), store: store}.ServingMaterial(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err).NotTo(MatchError(k8sexport.ErrServingStale))
 	})
 
 	It("reports a read failure as a failure, not as staleness", func() {
@@ -570,5 +618,50 @@ var _ = Describe("fatalExportStartupError", func() {
 	It("lets the CA serve on when the client will not initialise", func() {
 		Expect(fatalExportStartupError(errors.New("no ServiceAccount token"))).To(BeNil())
 		Expect(fatalExportStartupError(nil)).To(BeNil())
+	})
+})
+
+// mustServingCert returns the certificate PEM a holder is presenting.
+func mustServingCert(ctx context.Context, h *servingCertHolder) []byte {
+	GinkgoHelper()
+	certPEM, _, err := h.ServingMaterial(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	return certPEM
+}
+
+var _ = Describe("leafSerialOf", func() {
+	// The two call sites wrap its error differently, and those strings are the
+	// only way an operator tells "my holder is broken" from "storage is
+	// corrupt" -- one means restart this pod, the other means the fleet is
+	// about to re-mint. Transposing them left the suite green.
+	It("reads the serial of a real certificate", func() {
+		c, _ := newRefresherTestCA()
+		c.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		h := newServingCertHolder(nil)
+		Expect(ensureServingCert(context.Background(), c,
+			&serverConfig{TLSSelfProvision: true, Hostname: "puppet.test"}, h)).To(Succeed())
+
+		served, err := h.GetCertificate(nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(leafSerialOf(mustServingCert(context.Background(), h))).
+			To(Equal(served.Leaf.SerialNumber.Text(16)))
+	})
+
+	DescribeTable("refuses what it cannot read",
+		func(in []byte, want string) {
+			_, err := leafSerialOf(in)
+			Expect(err).To(MatchError(ContainSubstring(want)))
+		},
+		Entry("not PEM at all", []byte("nonsense\n"), "not PEM"),
+		Entry("a PEM block that is not a certificate",
+			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")}), "parsing"),
+	)
+})
+
+var _ = Describe("exportResyncInterval", func() {
+	It("is the ten minutes the documentation states", func() {
+		// docs/kubernetes-export.md and docs/metrics.md both name this figure,
+		// and neither is checked by anything. It has been wrong three times.
+		Expect(exportResyncInterval).To(Equal(10 * time.Minute))
 	})
 })
