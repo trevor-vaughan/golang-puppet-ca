@@ -113,9 +113,12 @@ type Target struct {
 	ServingKeyKey  string `yaml:"serving_key_key"`
 }
 
-// wantsServingKey reports whether any target publishes the serving private key.
+// WantsServingKey reports whether any target publishes the serving private key.
 // Used at startup to warn that it reaches the Secret in plaintext.
-func (c *Config) wantsServingKey() bool {
+func (c *Config) WantsServingKey() bool {
+	if c == nil {
+		return false
+	}
 	for i := range c.Targets {
 		if c.Targets[i].ServingKey {
 			return true
@@ -123,9 +126,6 @@ func (c *Config) wantsServingKey() bool {
 	}
 	return false
 }
-
-// WantsServingKey reports whether any target publishes the serving private key.
-func (c *Config) WantsServingKey() bool { return c != nil && c.wantsServingKey() }
 
 // WantsServingMaterial reports whether any target publishes either half of the
 // serving pair. Both halves come from the holder the listener presents, so both

@@ -153,23 +153,18 @@ consumer of one: it would look correct and fail at the first handshake. That is 
 The server logs a warning at startup whenever a `serving_key` target is
 configured. Restrict who can read that Secret.
 
-A rotated serving certificate is re-exported immediately by the replica that
-rotated it: it installs the new pair and *then* signals, so the export that
-signal triggers carries the new certificate rather than the one being replaced.
+**The exported Secret only ever holds the serving certificate the backend
+holds.** Before publishing, a replica compares the certificate it is presenting
+with the one in storage; if they differ it is behind — another replica has
+rotated — and it publishes nothing that cycle rather than writing its own copy
+back. That is a quiet skip, not a failure: it is normal, it clears when that
+replica's next maintenance pass catches it up, and the replica that rotated has
+already published the new pair. Nothing alerts, and nothing needs to.
 
-Other replicas lag. The signal is per-process, so a replica that did not mint
-learns of the rotation only when its own maintenance pass refreshes it — up to
-one `maintenance_interval_sec` — and republishes its previous pair up to one
-reconcile later, so the worst case is the two added together. Because that lag
-is gated by the maintenance pass, the reconcile floor for serving material is
-raised to `maintenance_interval_sec` when it is longer: resyncing faster cannot
-converge sooner and only republishes the stale pair more often.
-
-A pair the CA has *revoked* is never republished — the export refuses it and
-records a failure instead, so revoking after a key compromise is not undone by a
-lagging replica. `tls_self_provision_revoke_after_sec` (24 hours by default)
-bounds how long an ordinary superseded pair stays usable; keep it comfortably
-above `maintenance_interval_sec`.
+It follows that a revoked pair is never republished either — revoking replaces
+it in storage, so a replica still holding it fails the comparison. Revoking
+after a key compromise is not undone by a lagging replica, whatever that
+replica's own view of the CRL happens to be.
 
 ### Secret type
 
@@ -240,8 +235,8 @@ resources to the minimum above.
   resolved), the error is logged and the CA continues serving normally.
 - A failure applying one target is logged and does not prevent the other targets
   from being applied. A cycle with failures is retried after two minutes, and
-  cycles run on a ten-minute floor even when nothing has changed — a successful
-  apply can still have published material this replica had not caught up with.
+  cycles run on a ten-minute floor even when nothing has changed, which repairs
+  an object edited or deleted out from under the exporter.
 - Configuration is validated at startup; an invalid `kubernetes_export` block
   (bad `kind`, a `type` on a ConfigMap, none of `cert`, `crl`, `serving_cert` or
   `serving_key`, two targets naming the same object, `serving_key` on a

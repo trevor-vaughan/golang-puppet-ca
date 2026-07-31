@@ -292,10 +292,10 @@ callers below only ever ask about presence.
 {{- $config := include "openvox-ca.config" .ctx | fromYaml -}}
 {{- $v := dig .key "" $config -}}
 {{- range $name, $value := .ctx.Values.env -}}
-{{- if and (eq $name $.env) $value }}{{ $v = $value }}{{ end -}}
+{{- if and (eq $name $.env) (ne (toString $value) "") }}{{ $v = $value }}{{ end -}}
 {{- end -}}
 {{- range .ctx.Values.extraEnv -}}
-{{- if eq .name $.env }}{{ $v = "set" }}{{ end -}}
+{{- if and (eq .name $.env) (or (not (hasKey . "value")) (ne (toString .value) "")) }}{{ $v = "set" }}{{ end -}}
 {{- end -}}
 {{- $v -}}
 {{- end -}}
@@ -311,7 +311,7 @@ variable must not get a chart that renders as though TLS were off.
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 {{- $on := dig "tls_self_provision" false $config -}}
 {{- range $name, $value := .Values.env -}}
-{{- if and (eq $name "PUPPET_CA_TLS_SELF_PROVISION") $value }}{{ $on = $value }}{{ end -}}
+{{- if and (eq $name "PUPPET_CA_TLS_SELF_PROVISION") (ne (toString $value) "") }}{{ $on = $value }}{{ end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
 {{- if eq .name "PUPPET_CA_TLS_SELF_PROVISION" -}}
@@ -326,7 +326,7 @@ variable must not get a chart that renders as though TLS were off.
 {{- if has $on (list "1" "t" "T" "TRUE" "true" "True") -}}true
 {{- else if has $on (list "0" "f" "F" "FALSE" "false" "False") -}}false
 {{- else -}}
-{{- fail (printf "PUPPET_CA_TLS_SELF_PROVISION is %q, which the chart cannot read as a boolean: it is not a value Go's strconv.ParseBool does not accept -- and the server ignores an unparseable value, keeping the config-file setting, so the chart would render for one configuration and the server run another. Use one of: 1 t T TRUE true True 0 f F FALSE false False." $on) -}}
+{{- fail (printf "PUPPET_CA_TLS_SELF_PROVISION is %q, which the chart cannot read as a boolean: it is not a value Go's strconv.ParseBool accepts -- and the server ignores an unparseable value, keeping the config-file setting, so the chart would render for one configuration and the server run another. Use one of: 1 t T TRUE true True 0 f F FALSE false False." $on) -}}
 {{- end -}}
 {{- else -}}
 {{- ternary "true" "false" (not (not $on)) -}}
@@ -394,7 +394,7 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   it is. The chart does not set hostname by default, so this is the common
   mistake rather than an exotic one.
 */}}
-{{- if eq (include "openvox-ca.selfProvisionEnabled" .) "true" -}}
+{{- if and (eq (include "openvox-ca.selfProvisionEnabled" .) "true") (eq (include "openvox-ca.configFullyKnown" .) "true") -}}
 {{- if not (include "openvox-ca.effectiveConfig" (dict "ctx" . "key" "hostname" "env" "PUPPET_CA_HOSTNAME")) -}}
 {{- fail "config.tls_self_provision requires a hostname: it becomes the common name and first subject alternative name of the certificate agents verify. Without it the server refuses to start. Set config.hostname, or PUPPET_CA_HOSTNAME in .Values.env or .Values.extraEnv." -}}
 {{- end -}}

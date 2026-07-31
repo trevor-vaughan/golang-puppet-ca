@@ -1095,6 +1095,28 @@ func (Chart) Test() error {
 			wants: []string{"scheme: HTTPS"},
 		},
 		chartRenderCase{
+			name: "an empty extraEnv value does not count as set",
+			// The extraEnv arms had no empty-value guard, so value: "" counted
+			// as configured and tripped the mutual-exclusion precondition on an
+			// install the server accepts.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"extraEnv[0].name=PUPPET_CA_TLS_CERT", "extraEnv[0].value=",
+			},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
+			name: "a hostname supplied through envFrom is not second-guessed",
+			// envFrom is a route the chart cannot read by design. The two new
+			// preconditions consulted neither configFullyKnown nor it, so they
+			// refused an install that would have run.
+			sets: []string{
+				"config.tls_self_provision=true",
+				"envFrom[0].configMapRef.name=ca-settings",
+			},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
 			name: "an empty environment override does not mask the config value",
 			// applyServerEnv skips empty values; the chart used to overwrite
 			// with them, so it failed the install on a hostname the server
@@ -1270,6 +1292,19 @@ func (Chart) Test() error {
 				"env.PUPPET_CA_TLS_KEY=/tls/tls.key",
 			},
 			wantErr: "cannot be combined",
+		},
+		{
+			name: "an environment boolean the chart skips but the server honours",
+			// The regression the empty-value guard introduced: Go template
+			// truthiness skips boolean false and integer 0 as well as "", so an
+			// unquoted false was ignored by the chart and acted on by the
+			// server -- HTTPS probes rendered against a listener that never
+			// came up.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"env.PUPPET_CA_TLS_SELF_PROVISION=false",
+			},
+			wantErr: "no server TLS certificate is configured",
 		},
 		{
 			name:    "a mistyped value the schema should catch",

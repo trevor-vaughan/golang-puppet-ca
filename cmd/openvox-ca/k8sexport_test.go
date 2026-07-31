@@ -41,6 +41,7 @@ import (
 
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // runK8sExporter is the wiring that connects the CA's CRL-update notifications
@@ -475,58 +476,85 @@ var _ = Describe("servingCertHolder.Set", func() {
 	})
 })
 
-var _ = Describe("servingResyncInterval", func() {
-	// A replica that did not mint holds the previous pair until its own
-	// maintenance pass, so resyncing faster than that interval cannot converge
-	// any sooner -- it just republishes the stale pair more times, and whatever
-	// watches the Secret hot-reloads on each flip. At the shipped defaults (10m
-	// resync, 1h maintenance) that was six stale writes per rotation instead of
-	// one.
-	It("never resyncs serving material faster than the holder refreshes", func() {
-		Expect(servingResyncInterval(time.Hour)).To(Equal(time.Hour))
-		Expect(servingResyncInterval(30 * time.Minute)).To(Equal(30 * time.Minute))
-	})
-
-	It("keeps the plain floor when the maintenance interval is shorter", func() {
-		Expect(servingResyncInterval(time.Minute)).To(Equal(exportResyncInterval))
-	})
-})
-
-var _ = Describe("revocationFenced", func() {
-	// A revoked serving pair must never be republished. The documented remedy
-	// after a key compromise is to revoke; one replica then re-mints, and every
-	// other replica goes on holding the compromised pair until its own
-	// maintenance pass. Without this fence the reconcile writes that pair back
-	// into the Secret on every cycle in between -- so the operator's remedy is
-	// undone on a timer.
+var _ = Describe("currentOnly", func() {
+	// The first spec on this branch that builds two replicas. Every cross-replica
+	// claim before it was pinned by a single *ca.CA -- so a fence that consulted
+	// this process's own state looked correct, shipped, and could not work for
+	// the replica it was written for.
+	//
+	// Two CAs over one storage service is the shape internal/ca already uses for
+	// exactly this reason.
 	var (
 		ctx    context.Context
-		c      *ca.CA
-		holder *servingCertHolder
+		minter *ca.CA
+		lagger *ca.CA
+		store  *storage.StorageService
+		held   *servingCertHolder
 	)
+
+	const host = "puppet.test"
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		c, _ = newRefresherTestCA()
-		c.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		holder = newServingCertHolder(nil)
-		Expect(ensureServingCert(ctx, c,
-			&serverConfig{TLSSelfProvision: true, Hostname: "puppet.test"}, holder)).To(Succeed())
+		minter, store = newRefresherTestCA()
+		minter.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+
+		// A second process over the same backend, as a second pod would be.
+		lagger = ca.New(store, ca.AutosignConfig{Mode: "off"}, host)
+		lagger.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		lagger.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(lagger.Init(ctx)).To(Succeed())
+
+		held = newServingCertHolder(nil)
+		Expect(ensureServingCert(ctx, minter,
+			&serverConfig{TLSSelfProvision: true, Hostname: host}, held)).To(Succeed())
 	})
 
-	It("passes a live pair straight through", func() {
-		certPEM, keyPEM, err := revocationFenced{inner: holder, ca: c}.ServingMaterial(ctx)
+	It("publishes while what this replica holds is what storage holds", func() {
+		certPEM, keyPEM, err := currentOnly{inner: held, store: store}.ServingMaterial(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(certPEM).NotTo(BeEmpty())
 		Expect(keyPEM).NotTo(BeEmpty())
 	})
 
-	It("refuses once that pair is revoked", func() {
-		Expect(c.Revoke(ctx, "puppet.test")).To(Succeed())
+	It("declines once another replica has rotated underneath it", func() {
+		// The property four mechanisms were written for and none could observe:
+		// the minting replica moves storage on, and this replica -- still
+		// holding the previous pair until its own maintenance pass -- must not
+		// write it back over the new one.
+		fresh := newServingCertHolder(nil)
+		Expect(ensureServingCert(ctx, minter, &serverConfig{
+			TLSSelfProvision: true, Hostname: host,
+			TLSSelfProvisionNames: []string{"alt.example.test"},
+		}, fresh)).To(Succeed())
 
-		_, _, err := revocationFenced{inner: holder, ca: c}.ServingMaterial(ctx)
-		Expect(err).To(MatchError(ContainSubstring("revoked")),
-			"a revoked pair must fail the target, not be published")
+		_, _, err := currentOnly{inner: held, store: store}.ServingMaterial(ctx)
+		Expect(err).To(MatchError(k8sexport.ErrServingStale))
+	})
+
+	It("declines a pair another replica revoked and replaced", func() {
+		// Subsumes the revocation fence this replaces, and does it by reading
+		// shared state: the earlier version asked this process's cached CRL,
+		// which a replica that did not perform the revoke never updates -- so it
+		// answered "not revoked" for exactly the replica it existed to stop.
+		Expect(lagger.Revoke(ctx, host)).To(Succeed())
+		Expect(ensureServingCert(ctx, lagger,
+			&serverConfig{TLSSelfProvision: true, Hostname: host}, newServingCertHolder(nil))).To(Succeed())
+
+		_, _, err := currentOnly{inner: held, store: store}.ServingMaterial(ctx)
+		Expect(err).To(MatchError(k8sexport.ErrServingStale),
+			"a replica must not republish what the fleet has retired, whatever its own CRL cache says")
+	})
+
+	It("reports a read failure as a failure, not as staleness", func() {
+		// Opposite handling: nobody can publish, so it belongs in the metrics
+		// the alert watches rather than being skipped quietly.
+		dir := GinkgoT().TempDir()
+		blind := storage.NewWithBackend(
+			&failReadBackend{Backend: storage.NewFilesystemBackend(dir), failKey: storage.KeyServingCert}, dir)
+		_, _, err := currentOnly{inner: held, store: blind}.ServingMaterial(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err).NotTo(MatchError(k8sexport.ErrServingStale))
 	})
 })
 

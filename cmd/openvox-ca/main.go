@@ -626,7 +626,10 @@ func newRootCmd() *cobra.Command {
 			// the Kubernetes exporter can read the same pair the listener presents.
 			// Announcing is wired into the holder rather than done beside each
 			// Set, so a rotation cannot be announced before it is reachable.
-			// Only an issuance is a rotation; loading an unchanged pair is not.
+			// Every install announces, including one that merely loads what
+			// another replica minted: the consumer wants to know what is now
+			// being served, not why it changed, and an extra idempotent apply
+			// costs nothing.
 			servingCerts := newServingCertHolder(myCA.NotifyServingCertUpdated)
 
 			authCfg, err := serverAuthConfig(cfg, myCA)
@@ -811,12 +814,8 @@ func newRootCmd() *cobra.Command {
 					// Attached only when self-provisioning is on, which
 					// validateServingExport above has already established is the
 					// only way a serving target can be configured.
-					resync := exportResyncInterval
-					if cfg.KubernetesExport.WantsServingMaterial() {
-						resync = servingResyncInterval(cfg.maintenanceInterval())
-					}
 					go runK8sExporter(ctx, myCA,
-						attachServingSource(k8sExporter, cfg, servingCerts, myCA), resync)
+						attachServingSource(k8sExporter, cfg, servingCerts, myCA), exportResyncInterval)
 				}
 			}
 

@@ -182,9 +182,8 @@ configured target (cardinality is bounded by the configuration).
 | `puppetca_k8s_export_last_error_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last failed apply for each target. |
 
 > Exports run on every event (startup, CRL updates, serving-certificate
-> rotations) and on a periodic floor besides — ten minutes, or the maintenance
-> interval where serving material is published — so attempts are never sparse.
-> A failed cycle retries after two minutes. Alert by comparing
+> rotations) and on a ten-minute floor besides, so attempts are never sparse. A
+> failed cycle retries after two minutes. Alert by comparing
 > `last_error` against `last_success` (the mixin's
 > `PuppetCAKubernetesExportFailing` does this) rather than with rate windows or
 > staleness thresholds, which misbehave between sparse attempts.

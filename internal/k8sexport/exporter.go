@@ -111,6 +111,17 @@ func NewInCluster(cfg Config, src MaterialSource, m *Metrics) (*Exporter, error)
 	return newChecked(client, cfg, src, defaultNS, m)
 }
 
+// ErrServingStale marks serving material that this replica knows is out of
+// date, as distinct from material it could not read.
+//
+// The two need opposite handling. A read failure means nobody can publish and
+// belongs in the metrics the alert watches. Staleness means *this* replica has
+// nothing current to offer while another replica does, so the exported object is
+// already correct or about to be: skipping is right, and recording an error
+// would page for a condition that is normal, transient and self-correcting --
+// which is what an earlier revocation-based fence did.
+var ErrServingStale = errors.New("this replica's serving material is not the current one")
+
 // ErrInvalidConfig marks an error as a configuration mistake rather than an
 // environmental one.
 //
@@ -164,6 +175,15 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 	var errs []error
 	for i := range e.cfg.Targets {
 		t := &e.cfg.Targets[i]
+		if m.servingStale && (t.ServingCert || t.ServingKey) {
+			// Deliberately not an error and deliberately not an apply: this
+			// replica would overwrite the current pair with the one it is still
+			// holding. The replica that minted publishes the right thing, and
+			// this one catches up on its next maintenance pass.
+			slog.Debug("Skipping serving export: this replica is behind",
+				"kind", t.Kind, "name", t.Metadata.Name, "namespace", e.namespaceFor(t))
+			continue
+		}
 		err := matErrs.forTarget(t)
 		if err == nil {
 			err = e.applyTarget(ctx, t, m)
@@ -190,6 +210,10 @@ type materials struct {
 	crl         []byte
 	servingCert []byte
 	servingKey  []byte
+
+	// servingStale reports that this replica holds a superseded pair, so any
+	// target wanting serving material is skipped rather than applied or failed.
+	servingStale bool
 }
 
 // materialErrors records, per material, why it could not be read. A target is
@@ -255,7 +279,11 @@ func (e *Exporter) fetchMaterials(ctx context.Context) (materials, materialError
 			return m, errs
 		}
 		certPEM, keyPEM, err := e.serving.ServingMaterial(ctx)
-		if err != nil {
+		switch {
+		case errors.Is(err, ErrServingStale):
+			m.servingStale = true
+			return m, errs
+		case err != nil:
 			err = fmt.Errorf("reading serving material for export: %w", err)
 			errs.servingCert, errs.servingKey = err, err
 			return m, errs

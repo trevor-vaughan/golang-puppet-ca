@@ -20,6 +20,7 @@ package k8sexport_test
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -564,6 +565,49 @@ var _ = Describe("Material read failures", func() {
 		}
 		_, getErr := client.CoreV1().Secrets("ns1").Get(ctx, "wants-serving", metav1.GetOptions{})
 		Expect(getErr).To(HaveOccurred(), "the serving target must not be applied")
+	})
+
+	It("skips serving targets when the source says it is behind, without failing them", func() {
+		// A skip is not a failure. This replica has nothing current to publish,
+		// but another replica does, so the object is already right or about to
+		// be -- recording an error would page for a condition that is normal,
+		// transient and self-correcting. Cert and CRL targets are unaffected:
+		// staleness is a property of the serving pair alone.
+		cfg := twoTargets()
+		cfg.Targets = append(cfg.Targets, k8sexport.Target{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "wants-serving", Namespace: "ns1"},
+			Type: "kubernetes.io/tls", ServingCert: true, ServingKey: true,
+		})
+		Expect(cfg.Validate()).To(Succeed())
+
+		reg := prometheus.NewRegistry()
+		err := k8sexport.New(client, cfg, stubSource{cert: []byte("CA-PEM"), crl: []byte("CRL-PEM")},
+			"", k8sexport.NewMetrics(reg)).
+			WithServingSource(stubServing{err: fmt.Errorf("%w: behind", k8sexport.ErrServingStale)}).
+			ExportAll(ctx)
+		Expect(err).NotTo(HaveOccurred(), "being behind is not an export failure")
+
+		for _, name := range []string{"wants-cert", "wants-crl"} {
+			_, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, name, metav1.GetOptions{})
+			Expect(getErr).NotTo(HaveOccurred(), name+" must still be published")
+		}
+		_, getErr := client.CoreV1().Secrets("ns1").Get(ctx, "wants-serving", metav1.GetOptions{})
+		Expect(getErr).To(HaveOccurred(), "a stale replica must not write the serving Secret")
+
+		// And nothing recorded against it, so the alert stays quiet.
+		mfs, gatherErr := reg.Gather()
+		Expect(gatherErr).NotTo(HaveOccurred())
+		for _, mf := range mfs {
+			if mf.GetName() != "puppetca_k8s_export_last_error_timestamp_seconds" {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					Expect(lp.GetValue()).NotTo(Equal("wants-serving"),
+						"a skip must not be recorded as an error")
+				}
+			}
+		}
 	})
 
 	It("refuses to publish an empty serving certificate over a good one", func() {

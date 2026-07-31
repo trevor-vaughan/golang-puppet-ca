@@ -28,6 +28,7 @@ import (
 
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // runK8sExporter publishes the CA certificate, CRL and serving material into
@@ -111,48 +112,11 @@ var exportRetryInterval = 2 * time.Minute
 // periodic reconcile every controller needs, since an apply can succeed while
 // publishing material this replica has not yet caught up with.
 //
-// Ten minutes suits cert and CRL material, where every replica reads the same
-// storage and a resync only repairs drift. It is the wrong figure on its own for
-// serving material: a replica that did not mint holds the previous pair until
-// its own maintenance pass, so resyncing more often than that interval does not
-// converge any sooner and simply republishes the stale pair more times. See
-// servingResyncInterval.
+// It repairs drift -- an object edited or deleted out from under the exporter --
+// and nothing else: a replica that is behind publishes nothing at all rather
+// than publishing something stale more slowly, so this interval no longer has
+// to be reasoned about against the maintenance interval.
 var exportResyncInterval = 10 * time.Minute
-
-// servingResyncInterval is the floor to use when a target publishes serving
-// material, given how often this process refreshes its own holder.
-//
-// Convergence is gated by the maintenance interval, not by the resync, so
-// resyncing faster than that buys nothing and costs one stale republish per
-// cycle -- which a Gateway or Ingress watching the Secret hot-reloads on.
-func servingResyncInterval(maintenance time.Duration) time.Duration {
-	if maintenance > exportResyncInterval {
-		return maintenance
-	}
-	return exportResyncInterval
-}
-
-// stopTimer drains t so a later Reset cannot fire immediately on a stale value.
-func stopTimer(t *time.Timer) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-}
-
-// exportK8sOnce runs a single reconcile, logging the outcome and reporting
-// whether it fully succeeded. Per-target errors are already logged by ExportAll;
-// here we log only that the cycle had failures.
-func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) bool {
-	if err := exporter.ExportAll(ctx); err != nil {
-		slog.Warn("Kubernetes export cycle completed with errors", "error", err)
-		return false
-	}
-	slog.Debug("Kubernetes export cycle complete")
-	return true
-}
 
 // validateServingExport refuses a serving export that can never succeed.
 //
@@ -209,49 +173,93 @@ func attachServingSource(e *k8sexport.Exporter, cfg *serverConfig, holder *servi
 	if !cfg.TLSSelfProvision {
 		return e
 	}
-	return e.WithServingSource(revocationFenced{inner: holder, ca: c})
+	return e.WithServingSource(currentOnly{inner: holder, store: c.Storage})
 }
 
-// revocationFenced refuses to publish a serving pair the CA has revoked.
+// exportK8sOnce runs a single reconcile, logging the outcome and reporting
+// whether it fully succeeded. Per-target errors are already logged by ExportAll;
+// here we log only that the cycle had failures.
+func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) bool {
+	if err := exporter.ExportAll(ctx); err != nil {
+		slog.Warn("Kubernetes export cycle completed with errors", "error", err)
+		return false
+	}
+	slog.Debug("Kubernetes export cycle complete")
+	return true
+}
+
+// stopTimer drains t so a later Reset cannot fire immediately on a stale value.
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+// currentOnly refuses to publish a serving pair this replica knows is not the
+// current one.
 //
-// A replica that did not mint holds the previous pair until its own maintenance
-// pass, and the periodic reconcile republishes whatever it holds. That is
-// merely stale for an ordinary rotation, but it is a live exposure for the
-// documented remedy after a key compromise: the operator revokes, one replica
-// re-mints, and every other replica goes on writing the compromised pair back
-// into the Secret until it catches up.
+// Freshness cannot be answered from anything a single replica holds. Only the
+// replica that minted has the new pair; the others carry the previous one until
+// their own maintenance pass, and a periodic reconcile would otherwise write it
+// back over the correct one -- successfully, so nothing alerts. Three earlier
+// attempts bounded that with per-replica state (announcement ordering, a
+// reconcile floor, a revocation check) and each was wrong for the lagging
+// replica, because a replica cannot know from local state whether what it holds
+// is current.
 //
-// Revocation is shared state that every replica agrees about, so it is the one
-// freshness signal available here without a storage read per cycle. Refusing
-// turns "quietly republishes a revoked key" into a failed target, which records
-// an error and fires the export alert.
-type revocationFenced struct {
+// So it asks storage, which is the shared referent every replica agrees about.
+// The stored serving *certificate* is public material: no lock and no
+// decryption, unlike reading the pair itself, and the same call storedServingLeaf
+// already makes. Comparing its serial with the holder's answers the question
+// exactly, and it subsumes the revocation case -- a revoked pair has been
+// replaced in storage, so its serial no longer matches.
+//
+// A mismatch is a skip rather than a failure. It is normal, transient, and
+// another replica is publishing the right bytes meanwhile.
+type currentOnly struct {
 	inner k8sexport.ServingSource
-	ca    *ca.CA
+	store *storage.StorageService
 }
 
-func (f revocationFenced) ServingMaterial(ctx context.Context) (certPEM, keyPEM []byte, err error) {
-	certPEM, keyPEM, err = f.inner.ServingMaterial(ctx)
+func (c currentOnly) ServingMaterial(ctx context.Context) (certPEM, keyPEM []byte, err error) {
+	certPEM, keyPEM, err = c.inner.ServingMaterial(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	held, err := leafSerialOf(certPEM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading the serving certificate this replica holds: %w", err)
+	}
+	storedPEM, err := c.store.GetServingCert(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading the stored serving certificate to compare against: %w", err)
+	}
+	current, err := leafSerialOf(storedPEM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading the stored serving certificate: %w", err)
+	}
+	if held != current {
+		return nil, nil, fmt.Errorf("%w: holding %s, storage has %s",
+			k8sexport.ErrServingStale, held, current)
+	}
+	return certPEM, keyPEM, nil
+}
+
+// leafSerialOf returns the serial of a PEM-encoded certificate, normalised so
+// two encodings of the same serial compare equal.
+func leafSerialOf(certPEM []byte) (string, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		return nil, nil, fmt.Errorf("the serving certificate to export is not PEM")
+		return "", fmt.Errorf("not PEM")
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parsing the serving certificate to export: %w", err)
+		return "", fmt.Errorf("parsing: %w", err)
 	}
-	revoked, err := f.ca.IsRevokedSerial(ctx, leaf.SerialNumber)
-	if err != nil {
-		return nil, nil, fmt.Errorf("checking whether the serving certificate is revoked: %w", err)
-	}
-	if revoked {
-		return nil, nil, fmt.Errorf("refusing to publish serving certificate %s: it is revoked, so this "+
-			"replica has not yet picked up the replacement", leaf.SerialNumber.Text(16))
-	}
-	return certPEM, keyPEM, nil
+	return leaf.SerialNumber.Text(16), nil
 }
 
 // fatalExportStartupError reports which constructor failures must stop startup.

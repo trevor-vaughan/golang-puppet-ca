@@ -54,7 +54,6 @@ type servingCertHolder struct {
 	notify func()
 }
 
-// Set installs cert as the certificate served from the next handshake onward.
 // newServingCertHolder builds a holder that announces each installed pair.
 //
 // A constructor rather than a struct literal so there is one place the two are
@@ -64,6 +63,8 @@ func newServingCertHolder(notify func()) *servingCertHolder {
 	return &servingCertHolder{notify: notify}
 }
 
+// Set installs cert as the certificate served from the next handshake onward,
+// then announces it.
 func (h *servingCertHolder) Set(cert *tls.Certificate) {
 	h.current.Store(cert)
 	if h.notify != nil {

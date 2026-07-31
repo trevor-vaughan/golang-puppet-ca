@@ -205,8 +205,8 @@ func New(s *storage.StorageService, autosignCfg AutosignConfig, hostname string)
 	}
 }
 
-// NotifyServingCertUpdated announces that a newly issued serving certificate is
-// now the one being served.
+// NotifyServingCertUpdated announces that the serving certificate now installed
+// is the one being served.
 //
 // Deliberately not called from the mint. What a consumer republishes is whatever
 // the process is presenting, and that is installed by the caller after
@@ -303,10 +303,10 @@ func (c *CA) ServingRevocationFailureCount() uint64 {
 }
 
 // ServingCertUpdated returns a channel that receives a value each time a caller
-// announces, through NotifyServingCertUpdated, that a newly issued serving
-// certificate is now the one being served. Issuing alone does not send: what a
-// consumer republishes is what the process is presenting, and only the caller
-// knows when that is reachable. Coalesced the same way CRLUpdated is: buffered
+// announces, through NotifyServingCertUpdated, that a serving certificate has
+// been installed. Issuing alone does not send: what a consumer republishes is
+// what the process is presenting, and only the caller knows when that is
+// reachable. Coalesced the same way CRLUpdated is: buffered
 // to depth 1 and written non-blockingly, so an absent consumer never blocks the
 // announcer and a burst collapses to one notification.
 func (c *CA) ServingCertUpdated() <-chan struct{} {
