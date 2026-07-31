@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"net"
 	"sync/atomic"
 	"time"
@@ -304,6 +305,21 @@ var _ = Describe("serving certificate encrypted at rest", func() {
 	})
 })
 
+// failReadBackend fails Get for one key, so a storage read failure can be
+// driven from this layer. The CA package has its own copy; the two cannot be
+// shared because both are test-only.
+type failReadBackend struct {
+	storage.Backend
+	failKey string
+}
+
+func (b *failReadBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if key == b.failKey {
+		return nil, errors.New("backend unavailable")
+	}
+	return b.Backend.Get(ctx, key)
+}
+
 var _ = Describe("maintenance tasks", func() {
 	const hostname = "puppet.example.com"
 
@@ -362,6 +378,70 @@ var _ = Describe("maintenance tasks", func() {
 		})
 	})
 
+	Describe("servingConfigFrom", func() {
+		It("carries the configured renewal window through to the CA", func() {
+			// The sibling of the RevokeAfter assertion below, and the half that
+			// was missing: dropping the RenewBefore line from servingConfigFrom
+			// left the suite green, so an operator's configured window was
+			// silently replaced by the lifetime/3 default -- reissuing up to
+			// years earlier or later than they asked for, in either direction,
+			// with validateTLS still accepting the value.
+			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+			first, err := holder.GetCertificate(nil)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Just inside the window, by the same arithmetic the CA-layer spec
+			// uses: a fresh certificate is backdated 24h, so a window an hour
+			// under the lifetime already contains it.
+			lifetime := first.Leaf.NotAfter.Sub(first.Leaf.NotBefore)
+			cfg.TLSSelfProvisionRenewBeforeSec = int(lifetime.Seconds()) - 3600
+
+			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
+			second, err := holder.GetCertificate(nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(second.Leaf.SerialNumber.Cmp(first.Leaf.SerialNumber)).NotTo(BeZero(),
+				"a configured renewal window that contains the certificate must force a reissue")
+		})
+	})
+
+	Describe("reconcileAtStartup", func() {
+		It("counts a startup sweep that could not run", func() {
+			// The arm with no next pass: with tls_self_provision off no periodic
+			// task is registered, so this call is the only sweep the process
+			// runs. It lived inside RunE, which no spec can execute, so its
+			// increment was dead -- and this is the one arm the shipped runbook
+			// singles out as needing manual action.
+			dir := GinkgoT().TempDir()
+			seed := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, hostname)
+			seed.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			seed.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(seed.Init(ctx)).To(Succeed())
+
+			blind := ca.New(storage.NewWithBackend(&failReadBackend{
+				Backend: storage.NewFilesystemBackend(dir),
+				failKey: storage.KeyServingSuperseded,
+			}, dir), ca.AutosignConfig{Mode: "off"}, hostname)
+			blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(blind.Init(ctx)).To(Succeed())
+
+			// Deliberately with the feature off: this call is ungated, which is
+			// the whole reason it counts.
+			reconcileAtStartup(ctx, blind, &serverConfig{Hostname: hostname})
+
+			Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+		})
+
+		It("does nothing at all without a hostname", func() {
+			// ReconcileSuperseded rejects an empty subject, so without this
+			// guard every deployment that never enabled the feature would warn
+			// and count on every boot -- which is how operators learn to stop
+			// reading boot logs, and how an alert becomes noise.
+			reconcileAtStartup(ctx, myCA, &serverConfig{Hostname: ""})
+			Expect(myCA.ServingRevocationFailureCount()).To(BeZero())
+		})
+	})
+
 	Describe("supersededRevocationTask", func() {
 		It("passes a zero delay through, discarding the list without revoking", func() {
 			// Registered even when the delay is zero, so entries a previously
@@ -395,6 +475,33 @@ var _ = Describe("maintenance tasks", func() {
 			revoked, err := myCA.IsRevokedSerial(ctx, first.Leaf.SerialNumber)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(revoked).To(BeFalse(), "discarding must not revoke")
+		})
+
+		It("counts a sweep that could not run at all", func() {
+			// Distinct from the malformed-entry spec below: that one increments
+			// inside ReconcileSuperseded and the call returns nil, so it never
+			// reaches this task's own error branch. Nothing did -- deleting the
+			// increment here left the suite green, and with it gone a sweep that
+			// fails every pass moves no counter, so the alert whose runbook
+			// routes on this exact log line never fires.
+			dir := GinkgoT().TempDir()
+			seed := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, hostname)
+			seed.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			seed.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(seed.Init(ctx)).To(Succeed())
+
+			blind := ca.New(storage.NewWithBackend(&failReadBackend{
+				Backend: storage.NewFilesystemBackend(dir),
+				failKey: storage.KeyServingSuperseded,
+			}, dir), ca.AutosignConfig{Mode: "off"}, hostname)
+			blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(blind.Init(ctx)).To(Succeed())
+
+			cfg.TLSSelfProvisionRevokeAfterSec = 7200
+			supersededRevocationTask(blind, cfg).run(ctx)
+
+			Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
 		})
 
 		It("counts a failure and discards an entry that can never be revoked", func() {

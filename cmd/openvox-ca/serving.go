@@ -97,6 +97,39 @@ func toTLSCertificate(sc *ca.ServingCertificate) (*tls.Certificate, error) {
 	}, nil
 }
 
+// reconcileAtStartup drains any pending serving-certificate revocations before
+// the listener opens, and deliberately without regard to whether
+// tls_self_provision is on.
+//
+// Startup is the only moment a process reliably observes a configuration
+// change, and with self-provisioning switched off no periodic task runs at all
+// — so entries a previous configuration recorded would otherwise sit in storage
+// indefinitely and fire much later if the delay were re-enabled. A failure is
+// logged and not fatal: it is bookkeeping, and the CA can still serve.
+//
+// Skipped only when there is no hostname to reconcile under.
+// ReconcileSuperseded rejects an empty subject, and hostname is optional
+// whenever self-provisioning is off — so without this guard every such
+// deployment warns on every boot about a feature it has never used, which is
+// how operators learn to stop reading boot logs.
+//
+// Split out of the serve command rather than inlined there so a spec can reach
+// it: RunE is not reachable from one, and the increment below was dead to the
+// suite for exactly that reason.
+func reconcileAtStartup(ctx context.Context, myCA *ca.CA, cfg *serverConfig) {
+	if cfg.Hostname == "" {
+		return
+	}
+	if err := myCA.ReconcileSuperseded(ctx, servingConfigFrom(cfg)); err != nil {
+		// Counted as well as logged, matching supersededRevocationTask. With
+		// tls_self_provision off this call is the only sweep the process ever
+		// runs, so there is no next pass to clear it and nothing else would
+		// move the alert's counter.
+		myCA.IncServingRevocationFailures()
+		slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
+	}
+}
+
 // ensureServingCert resolves the serving certificate and installs it in holder.
 //
 // At startup a failure here is fatal: a server with no serving certificate

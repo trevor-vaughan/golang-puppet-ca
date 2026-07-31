@@ -70,6 +70,7 @@ tls_self_provision_renew_before_sec: 0   # 0 = one third of the leaf validity
 tls_self_provision_encrypt_key: false    # requires an explicit passphrase source
 tls_self_provision_revoke_after_sec: -1   # -1/unset = built-in default (24h); 0 = never revoke
 maintenance_interval_sec: 0           # shared maintenance loop; 0 = built-in default (1h)
+                                      # raising this needs a matching mixin change; see mixin/README.md
 puppet_server: puppet.example.com
 puppet_server_file: ""
 no_pp_cli_auth: false
@@ -138,10 +139,6 @@ Environment variables mirror the CLI flags:
 | `--tls-key` | `PUPPET_CA_TLS_KEY` |
 | `--tls-self-provision` | `PUPPET_CA_TLS_SELF_PROVISION` |
 | `--tls-self-provision-names` | `PUPPET_CA_TLS_SELF_PROVISION_NAMES` |
-| (file only) `tls_self_provision_renew_before_sec` | `PUPPET_CA_TLS_SELF_PROVISION_RENEW_BEFORE_SEC` |
-| (file only) `tls_self_provision_encrypt_key` | `PUPPET_CA_TLS_SELF_PROVISION_ENCRYPT_KEY` |
-| (file only) `tls_self_provision_revoke_after_sec` | `PUPPET_CA_TLS_SELF_PROVISION_REVOKE_AFTER_SEC` |
-| (file only) `maintenance_interval_sec` | `PUPPET_CA_MAINTENANCE_INTERVAL_SEC` |
 | `--puppet-server` | `PUPPET_CA_PUPPET_SERVER` |
 | `--puppet-server-file` | `PUPPET_CA_PUPPET_SERVER_FILE` |
 | `--no-pp-cli-auth` | `PUPPET_CA_NO_PP_CLI_AUTH` |
@@ -175,6 +172,10 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 
 | Config key | Environment variable |
 | --- | --- |
+| `tls_self_provision_renew_before_sec` | `PUPPET_CA_TLS_SELF_PROVISION_RENEW_BEFORE_SEC` |
+| `tls_self_provision_encrypt_key` | `PUPPET_CA_TLS_SELF_PROVISION_ENCRYPT_KEY` |
+| `tls_self_provision_revoke_after_sec` | `PUPPET_CA_TLS_SELF_PROVISION_REVOKE_AFTER_SEC` |
+| `maintenance_interval_sec` | `PUPPET_CA_MAINTENANCE_INTERVAL_SEC` |
 | `ca_key_algo` | `PUPPET_CA_CA_KEY_ALGO` |
 | `ca_key_size` | `PUPPET_CA_CA_KEY_SIZE` |
 | `leaf_key_algo` | `PUPPET_CA_LEAF_KEY_ALGO` |
@@ -260,7 +261,12 @@ share the name — choose a distinct one.
 A background maintenance loop re-checks the certificate every
 `maintenance_interval_sec` (default one hour) and reissues once remaining
 validity falls below `tls_self_provision_renew_before_sec` — by default a third
-of the leaf validity. Rotation takes effect on the next TLS handshake; no
+of the leaf validity. Zero *or negative* takes that default (unlike
+`tls_self_provision_revoke_after_sec`, where `-1` and `0` mean different
+things), and a value at or beyond the leaf validity is refused at startup. The
+window is also capped at half the certificate's effective lifetime — which
+shrinks as the CA certificate ages, since no leaf outlives its issuer — so a
+configured window larger than that yields renewal at half-life instead. Rotation takes effect on the next TLS handshake; no
 restart, and established connections are unaffected.
 
 A certificate is also reissued when it stops being usable for any other reason:
@@ -279,6 +285,15 @@ next pass then mints from the configured names alone:
 ```bash
 openvox-ca-ctl revoke --certname openvox-ca.example.com
 ```
+
+> **This costs an outage.** Revoking the CA's own hostname takes the certificate
+> the listener is presenting out of circulation immediately, with none of the
+> delay `tls_self_provision_revoke_after_sec` exists to give. Every client that
+> checks revocation fails its handshake against the CA until the next
+> maintenance pass mints the replacement — up to one `maintenance_interval_sec`,
+> an hour at the defaults. For anything that is not urgent, a rolling restart
+> reissues without the gap, because startup resolves the certificate too. The
+> same cost applies wherever this command appears below.
 
 A *rename* — adding one name and removing another in the same edit — briefly
 carries both while the fleet disagrees, and settles on the union until every
@@ -301,7 +316,9 @@ openvox-ca-ctl revoke --certname openvox-ca.example.com
 ```
 
 Revocation is one of the reuse conditions, so the next maintenance pass issues a
-replacement. The exposure is one maintenance interval.
+replacement. The exposure is one maintenance interval — and so is the outage:
+see the warning under [Renewal](#renewal). For a compromised key that is the
+right trade; for anything less urgent, prefer the rolling restart.
 
 ### Superseded certificates
 
@@ -344,9 +361,15 @@ the backend, and the key is plaintext unless
 for the CA's own hostname, so when migrating to an externally supplied
 certificate:
 
-1. Revoke it — `openvox-ca-ctl revoke --certname <hostname>` — so the credential
-   is dead even though the blobs remain.
-2. Switch to `tls_cert`/`tls_key` and restart.
+1. Switch to `tls_cert`/`tls_key` and restart.
+2. *Then* revoke it — `openvox-ca-ctl revoke --certname <hostname>` — so the
+   credential is dead even though the blobs remain.
+
+The order matters. While `tls_self_provision` is still on, revocation is a
+*reuse* condition, not a retirement: the next maintenance pass sees the
+revocation and mints a replacement. Revoking first would leave you with a fresh,
+valid, unrevoked serving certificate — exactly the credential this section
+exists to retire.
 
 There is no command to delete the stored blobs; remove them with your backend's
 own tooling if you want them gone.
@@ -374,7 +397,10 @@ If your CA key is already a backend blob — the default — that is the posture
 provider (`ca_key_provider: openbao`), behind an external signer, or pinned with
 `ca_key_file`, your backend holds no private key today and this changes that.**
 `ca_key_file` pins only the CA key; there is no serving-key equivalent, so
-`tls_self_provision_encrypt_key` is the protection available. See
+`tls_self_provision_encrypt_key` is the protection available — and it applies to
+the next key issued, not the one already stored, so enabling it on an existing
+deployment leaves the plaintext key in the backend until the certificate is
+reissued. See
 [CA key security](ca-key-security.md).
 
 ### Sharing a backend between replicas

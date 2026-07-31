@@ -69,6 +69,17 @@ key — the one its own HTTPS listener presents. It lives in the storage backend
 as `serving_key`, alongside `ca_key`, and `tls_self_provision_encrypt_key`
 encrypts it at rest using exactly the machinery described above.
 
+**It applies to the next key the CA issues, not to the one already stored.**
+Like `--encrypt-ca-key`, the setting is read when a key is written, and the
+serving key is only ever rewritten by a reissue. Turning it on and restarting
+therefore changes nothing: the existing plaintext key parses fine, the
+certificate is still usable, and it is reused. On default settings the next
+reissue is a third of the leaf validity away — years. To apply it now, force a
+reissue by revoking the serving certificate, and read
+[Turning it off](configuration.md#turning-it-off) first: doing that on a live
+CA interrupts every client that checks revocation until the next maintenance
+pass mints the replacement.
+
 Two things are worth stating plainly:
 
 - With encryption off and a SQL backend, that key is stored in your database in

@@ -398,12 +398,21 @@ SQLite ignores them.
 > **`sql_max_open_conns` has a floor.** On PostgreSQL and MySQL each held
 > distributed lock pins one pooled connection for its whole critical section,
 > because both dialects scope their locks to a session. The CA nests locks: a
-> signing request holds two (subject, then CRL) and needs a third for the work
-> inside, and with `tls_self_provision` on the superseded-certificate sweep
+> renewal or a clean holds two (subject, then CRL) and needs a third for the
+> work inside, and with `tls_self_provision` on the superseded-certificate sweep
 > holds three (serving, subject, CRL) and needs a fourth. Setting
 > `sql_max_open_conns` below **three** — or below **four** with
 > `tls_self_provision` — stalls the pool until the 60-second lock timeout
-> expires, on every pass. `0` (the default) means no limit and is always safe.
+> expires, on every pass.
+>
+> Those are floors for **one operation in isolation**, and the pool is
+> process-wide. A CA serving traffic runs the maintenance sweep, agent
+> renewals, the CRL refresher and the metrics collector concurrently, each
+> needing its own connections and none able to release a lock-pinned one until
+> its work completes — so a working setting is the floor multiplied by the
+> operations you expect in flight. `0` (the default) means no limit; leave it
+> there unless the database forces otherwise, and size any explicit value with
+> plenty of headroom.
 > SQLite is unaffected: it has no distributed locking and falls back to
 > process-local mutexes, which hold no connection.
 

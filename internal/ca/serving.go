@@ -82,6 +82,11 @@ type ServingConfig struct {
 // ServingCertificate is a serving certificate and its private key, ready to be
 // handed to crypto/tls.
 type ServingCertificate struct {
+	// CertPEM and KeyPEM are the stored encodings. Nothing in the running CA
+	// reads them -- toTLSCertificate builds from Leaf and Key instead, so that
+	// what is served is what was parsed and verified rather than a re-parse of
+	// the same bytes. They are kept for diagnostics and for tests that move
+	// material between CAs.
 	CertPEM []byte
 	KeyPEM  []byte
 	Leaf    *x509.Certificate
@@ -153,6 +158,11 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 		// Only the first justifies minting over what is there; the second is
 		// I/O to retry, and minting on it would replace a certificate that may
 		// be perfectly good.
+		// reasonRevocationCheck is defensive rather than reachable: IsRevokedSerial
+		// errors only on a nil cached CRL, and Init either populates that cache or
+		// fails outright, so no state that reaches here can produce it today. It is
+		// listed because it is a "could not look" condition and belongs on this
+		// side of the split the moment IsRevokedSerial reads storage instead.
 		if why.Code == reasonCertUnreadable || why.Code == reasonKeyUnreadable ||
 			why.Code == reasonRevocationCheck {
 			return fmt.Errorf("cannot confirm the stored serving certificate is usable: %s", why.Code)
@@ -309,8 +319,8 @@ func (r servingReason) LogValue() slog.Value {
 // logged, so a certificate churning between replicas is diagnosable from one
 // line rather than by comparing serials.
 //
-// The subject lock is held; c.mu must NOT be, because IsRevokedSerial takes it
-// for reading.
+// The serving and subject locks are held; c.mu must NOT be, because
+// IsRevokedSerial takes it for reading.
 func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*ServingCertificate, servingReason) {
 	certPEM, err := c.Storage.GetServingCert(ctx)
 	if err != nil {
@@ -430,8 +440,8 @@ func publicKeysEqual(a, b any) bool {
 
 // issueServingCertLocked mints and stores a serving certificate.
 //
-// The Locked suffix is load-bearing: the caller holds both the subject lock and
-// c.mu, and this function takes neither. It is unexported for the same reason —
+// The Locked suffix is load-bearing: the caller holds the serving lock, the
+// subject lock and c.mu, and this function takes none of them. It is unexported for the same reason —
 // it mirrors Generate, and Generate's siblings Sign and SignWithTTL take the
 // subject lock themselves. Copying either would deadlock every backend on the
 // startup path.
@@ -476,6 +486,13 @@ func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig, carr
 	// order would leave a certificate whose key is missing, which is the same
 	// outcome by a longer route — but this way the private material is never
 	// the thing left dangling.
+	// These two keep the backend's error text where readSuperseded and
+	// writeSuperseded drop it. The difference is deliberate: those two reach a
+	// Warn that recurs every maintenance pass and that an operator cannot act on,
+	// so the text is all risk and no value. A failed write here is fatal at
+	// startup and stops renewal thereafter, and the operator's next step depends
+	// on *why* -- credentials, permissions, disk, a dead backend. Sanitising it
+	// would trade a diagnosable outage for an undiagnosable one.
 	if err := c.Storage.SaveServingKey(ctx, keyPEM); err != nil {
 		return nil, fmt.Errorf("writing serving key: %w", err)
 	}
@@ -647,8 +664,8 @@ type supersededEntry struct {
 // recordSuperseded appends leaf to the pending-revocation list.
 //
 // Not named *Locked: in this package that suffix means c.mu is held, and this
-// runs with c.mu released. It needs only the subject lock, which the caller
-// holds.
+// runs with c.mu released. The caller holds both outer locks (withServingLocks)
+// and this takes neither.
 //
 // The list is durable and shared rather than held in memory: the replica that
 // minted the replacement may die before the delay elapses, and a restarted
@@ -656,17 +673,24 @@ type supersededEntry struct {
 // be derived from the inventory, because issueLeafLocked backdates NotBefore by
 // a fixed 24 hours, so the recorded timestamp is not the issue time.
 //
-// The subject lock is held by the caller, which is what serialises this against
-// concurrent mints.
+// What this must be serialised against is the *sweep*, not another mint: it runs
+// on the mint path and read-modify-writes the same list ReconcileSuperseded
+// rewrites, so a sweep landing between the read and the write erases the entry.
+// The caller's *serving* lock is what makes that mutual. The subject lock cannot
+// -- it is derived from each replica's hostname, and replicas are allowed to
+// disagree about that. See withServingLocks.
 func (c *CA) recordSuperseded(ctx context.Context, leaf *x509.Certificate, revokeAfter time.Duration) error {
 	if revokeAfter <= 0 || leaf == nil {
 		return nil
 	}
-	entries, err := c.readSuperseded(ctx)
+	entries, _, err := c.readSuperseded(ctx)
 	if err != nil {
 		// Appending to what we could not read would write a one-entry list over
 		// however many were pending, so every one of those certificates would
 		// stay valid with nothing recording that it should not be.
+		//
+		// Corrupt bytes need no such care: this appends to the empty slice and
+		// writes, which is the overwrite they need anyway.
 		return err
 	}
 	entries = append(entries, supersededEntry{
@@ -717,9 +741,17 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 	defer cancel()
 
 	return c.withServingLocks(ctx, cfg.Subject, func() error {
-		entries, err := c.readSuperseded(ctx)
+		entries, corrupt, err := c.readSuperseded(ctx)
 		if err != nil {
 			return err
+		}
+		if corrupt {
+			// Overwrite rather than fall through the empty-list return below.
+			// Those bytes will never parse, so leaving them re-warns and
+			// re-counts on every pass forever -- which latches the alert with
+			// nothing an operator can do to clear it, and the realistic response
+			// to a permanently firing warning is to silence it.
+			return c.writeSuperseded(ctx, nil)
 		}
 		if len(entries) == 0 {
 			return nil
@@ -806,23 +838,38 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 // warning: those bytes are already unusable, nothing can be recovered from
 // them, and failing closed on a corrupt blob would take the listener down over
 // a certificate that at worst stays valid until it expires.
-func (c *CA) readSuperseded(ctx context.Context) ([]supersededEntry, error) {
+//
+// The corrupt return says the bytes were unusable, as distinct from absent. The
+// caller must overwrite them: an unparseable blob is not self-clearing, and
+// left alone it re-warns on every pass forever.
+func (c *CA) readSuperseded(ctx context.Context) (entries []supersededEntry, corrupt bool, err error) {
 	data, err := c.Storage.GetServingSuperseded(ctx)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
+			return nil, false, nil
 		}
 		// Without the backend's error text, for the reason storedServingLeaf
 		// gives: a SQL driver's connection error can carry the DSN, and this
 		// error reaches a Warn line on the mint path.
-		return nil, errors.New("reading pending serving-certificate revocations")
+		return nil, false, errors.New("reading pending serving-certificate revocations")
 	}
-	var entries []supersededEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
-		slog.Warn("Discarding unparseable pending serving-certificate revocations", "error", err)
-		return nil, nil
+		// Counted, and for the same reason as the mint-path arms: however many
+		// entries these bytes named, they are gone. Nothing can rediscover them
+		// -- the mints that recorded them have long since overwritten
+		// serving_cert -- so those certificates stay valid for their full
+		// remaining life with nothing recording that they should not be. Left
+		// uncounted, the one alert that bounds that exposure could not fire.
+		//
+		// Still not fatal: nothing is recoverable from unparseable bytes, and
+		// failing closed would take the listener down over a certificate that
+		// at worst stays valid until it expires.
+		c.IncServingRevocationFailures()
+		slog.Warn("Discarding unparseable pending serving-certificate revocations; whatever they "+
+			"named will not be scheduled for revocation", "error", err)
+		return nil, true, nil
 	}
-	return entries, nil
+	return entries, false, nil
 }
 
 // writeSuperseded persists the pending-revocation list.

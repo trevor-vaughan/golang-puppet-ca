@@ -606,16 +606,7 @@ func newRootCmd() *cobra.Command {
 			// guard every such deployment warns on every boot about a feature
 			// it has never used, which is how operators learn to stop reading
 			// boot logs.
-			if cfg.Hostname != "" {
-				if err := myCA.ReconcileSuperseded(ctx, servingConfigFrom(cfg)); err != nil {
-					// Counted as well as logged, matching supersededRevocationTask.
-					// With tls_self_provision off this call is the only sweep the
-					// process ever runs, so there is no next pass to clear it and
-					// nothing else would move the alert's counter.
-					myCA.IncServingRevocationFailures()
-					slog.Warn("Could not reconcile superseded serving certificates at startup", "error", err)
-				}
-			}
+			reconcileAtStartup(ctx, myCA, cfg)
 
 			// SECURITY: Warn if any private key files have overly permissive modes.
 			// The server does not modify existing file permissions; operators should

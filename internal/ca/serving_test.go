@@ -498,8 +498,21 @@ var _ = Describe("Superseded serving certificates", func() {
 	It("survives an unparseable list rather than refusing to serve", func() {
 		// Worst case is a superseded certificate staying valid until it
 		// expires; failing closed would take the listener down instead.
+		//
+		// But it is a loss, and the least recoverable one on this path: nothing
+		// can rediscover what those bytes named. So it must be counted like the
+		// other unrecoverable arms, and the bytes must actually be overwritten
+		// -- treating them as merely "empty" took the early return below, left
+		// them in place, and re-warned on every pass forever while the one
+		// counter that bounds the exposure stayed at zero.
 		Expect(store.SaveServingSuperseded(ctx, []byte("{not json"))).To(Succeed())
 		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
+
+		Expect(myCA.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+		after, err := store.GetServingSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(after)).To(Equal("[]"),
+			"bytes that will never parse must be cleared, not re-read every pass")
 	})
 })
 
@@ -519,9 +532,30 @@ type failReadBackend struct {
 
 func (b *failReadBackend) Get(ctx context.Context, key string) ([]byte, error) {
 	if key == b.failKey {
-		return nil, errors.New("backend unavailable")
+		return nil, errors.New(backendErrText)
 	}
 	return b.Backend.Get(ctx, key)
+}
+
+// backendErrText stands in for what a real backend error carries. The specs
+// that assert it does not reach the caller are checking a security property:
+// on a SQL backend this text is the driver's, and a driver's connection error
+// carries the DSN, which carries a password.
+const backendErrText = "backend unavailable dsn=postgres://user:hunter2@db/ca"
+
+// failWriteBackend fails Put for one key. The twin of failReadBackend, and the
+// reason every write-failure branch on this path went unexercised until it
+// existed.
+type failWriteBackend struct {
+	storage.Backend
+	failKey string
+}
+
+func (b *failWriteBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
+	if key == b.failKey {
+		return errors.New(backendErrText)
+	}
+	return b.Backend.Put(ctx, key, data, kind)
 }
 
 var _ = Describe("Renewing a node that has taken the CA's hostname", func() {
@@ -828,7 +862,7 @@ var _ = Describe("Serving certificate read failures", func() {
 		cfg := ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour}
 		Expect(blind.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
 		Expect(blind.ServingRevocationFailureCount()).To(BeZero(),
-			"the first mint supersedes nothing, so it reads no pending list")
+			"the seeded certificate is still usable, and the reuse path reads no pending list")
 
 		cfg.ExtraNames = []string{"alt.example.com"}
 		reissued, err := blind.EnsureServingCert(ctx, cfg)
@@ -837,6 +871,78 @@ var _ = Describe("Serving certificate read failures", func() {
 			"failing to schedule the revocation must not stop the CA serving")
 		Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
 	})
+
+	It("writes the serving private key readable only by its owner", func() {
+		// BlobPrivate is the only thing selecting 0600 here, and flipping it to
+		// BlobPublic left the whole suite green -- the migration spec that does
+		// assert FilePermPrivate takes its mode from migratableSingletons, a
+		// separate list, so it does not cover the mint. A world-readable private
+		// key in a shared cadir volume is the deployment shape this feature
+		// targets, and docs/development/storage-internals.md states 0600.
+		fresh := GinkgoT().TempDir()
+		minter := ca.New(storage.New(fresh), ca.AutosignConfig{Mode: "off"}, subject)
+		minter.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		minter.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(minter.Init(ctx)).To(Succeed())
+		Expect(minter.EnsureServingCert(ctx, ca.ServingConfig{Subject: subject})).
+			Error().NotTo(HaveOccurred())
+
+		info, err := os.Stat(filepath.Join(fresh, "private", "serving_key.pem"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info.Mode().Perm()).To(Equal(os.FileMode(0o600)))
+	})
+
+	It("counts a revocation failure when it cannot persist the supersession", func() {
+		// The write-side twin of the arm above, and the one no double could
+		// reach: returning nil from writeSuperseded instead of the error made
+		// recordSuperseded report success on a write that never landed, so the
+		// mint path counted nothing and the superseded certificate stayed a
+		// valid credential for its full remaining life.
+		store := storage.NewWithBackend(
+			&failWriteBackend{Backend: base, failKey: storage.KeyServingSuperseded}, dir)
+		blind := ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(blind.Init(ctx)).To(Succeed())
+
+		cfg := ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour, ExtraNames: []string{"alt.example.com"}}
+		reissued, err := blind.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reissued.Issued).To(BeTrue(),
+			"failing to schedule the revocation must not stop the CA serving")
+		Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+	})
+
+	DescribeTable("keeps the backend's error text out of the supersession errors",
+		// A security property, and the one round 7 fixed with nothing behind
+		// it: reverting either arm to fmt.Errorf("...: %w", err) puts the text
+		// into a Warn on the mint path and an Error on the sweep path. On a SQL
+		// backend that text is the driver's, and carries the DSN.
+		func(newStore func() *storage.StorageService) {
+			blind := ca.New(newStore(), ca.AutosignConfig{Mode: "off"}, subject)
+			blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(blind.Init(ctx)).To(Succeed())
+
+			// Something must be pending, or the sweep returns before it writes.
+			Expect(storage.New(dir).SaveServingSuperseded(ctx,
+				[]byte(`[{"serial":"AB","revoke_at":"2020-01-01T00:00:00Z"}]`))).To(Succeed())
+
+			err := blind.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).NotTo(ContainSubstring("hunter2"),
+				"the backend's error text must not reach the caller, or the log")
+			Expect(err.Error()).NotTo(ContainSubstring("dsn="))
+		},
+		Entry("on the read", func() *storage.StorageService {
+			return storage.NewWithBackend(
+				&failReadBackend{Backend: base, failKey: storage.KeyServingSuperseded}, dir)
+		}),
+		Entry("on the write-back", func() *storage.StorageService {
+			return storage.NewWithBackend(
+				&failWriteBackend{Backend: base, failKey: storage.KeyServingSuperseded}, dir)
+		}),
+	)
 
 	It("does not count a revocation failure for bytes that do not parse", func() {
 		// Those are not a credential in circulation, so counting them would
@@ -960,8 +1066,9 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 
 		code, detail := reasonFor()
 		Expect(code).To(Equal("key-unusable"))
-		Expect(detail).To(BeEmpty())
-		Expect(detail).NotTo(ContainSubstring(secret), "the configured path must not reach the log")
+		Expect(detail).To(BeEmpty(),
+			"empty is the only safe answer: this is the flow CodeQL traced, and the "+
+				"configured passphrase path must not reach the log through it")
 	})
 
 	It("carries only operator-supplied detail for a missing name", func() {
