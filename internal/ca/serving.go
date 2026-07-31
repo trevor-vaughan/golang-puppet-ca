@@ -34,6 +34,25 @@ import (
 	"time"
 )
 
+// withServingLocks runs fn under the serving lock and then the subject lock.
+//
+// Both are needed and they are not interchangeable. The serving blobs are
+// singletons -- one serving_cert, serving_key and serving_superseded per store
+// -- while the subject lock is derived from each replica's own hostname, and
+// the configured-name handling explicitly assumes replicas can disagree about
+// that, since configuration is read once at startup. Two replicas with
+// different hostnames would take different subject locks and so serialise
+// nothing on exactly the read-modify-write that needs it. The subject lock is
+// still taken because the mint also writes cert/<subject> and an inventory row,
+// which Sign, Renew and Clean contend for.
+//
+// Order is serving -> subject -> CRL -> c.mu everywhere.
+func (c *CA) withServingLocks(ctx context.Context, subject string, fn func() error) error {
+	return c.Storage.WithLock(ctx, lockNameServing, func() error {
+		return c.Storage.WithLock(ctx, subjectLockName(subject), fn)
+	})
+}
+
 // ServingConfig governs the CA's own serving certificate: the one the API
 // listener presents when tls_self_provision is on.
 //
@@ -122,7 +141,7 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 	defer cancel()
 
 	var result *ServingCertificate
-	err := c.Storage.WithLock(ctx, subjectLockName(cfg.Subject), func() error {
+	err := c.withServingLocks(ctx, cfg.Subject, func() error {
 		existing, why := c.loadUsableServingCert(ctx, cfg)
 		if existing != nil {
 			result = existing
@@ -360,21 +379,30 @@ func (c *CA) loadUsableServingCert(ctx context.Context, cfg ServingConfig) (*Ser
 		}
 	}
 
-	if missing := missingNames(leaf, servingNames(cfg)); missing != "" {
-		// Detail is a configured name, which the operator supplied and which
-		// is already in the certificate this process serves.
-		return nil, servingReason{Code: reasonMissingName, Detail: missing}
-	}
-
+	// Revocation is checked before the configured names, and the order is
+	// load-bearing. Only reasonMissingName carries the stored certificate's
+	// names forward, so a certificate that is both revoked *and* missing a
+	// configured name would take the union arm, carry the withdrawn name back
+	// in, and consume the revocation without shrinking anything -- which is
+	// exactly the rename case: withdraw one name, add another, revoke to apply.
+	//
+	// Revocation is shared state that every replica agrees about; a configured
+	// name list is local and they may not. The shared signal wins.
 	revoked, err := c.IsRevokedSerial(ctx, leaf.SerialNumber)
 	if err != nil {
 		return nil, servingReason{Code: reasonRevocationCheck}
 	}
 	if revoked {
-		// This is the recovery route after `openvox-ca-ctl revoke` on the CA's
-		// own hostname, which is the documented way to replace a compromised
-		// serving key.
+		// The recovery route after `openvox-ca-ctl revoke` on the CA's own
+		// hostname: the documented way to replace a compromised serving key,
+		// and to apply a withdrawn name.
 		return nil, servingReason{Code: reasonRevoked}
+	}
+
+	if missing := missingNames(leaf, servingNames(cfg)); missing != "" {
+		// Detail is a configured name, which the operator supplied and which
+		// is already in the certificate this process serves.
+		return nil, servingReason{Code: reasonMissingName, Detail: missing}
 	}
 
 	return &ServingCertificate{CertPEM: certPEM, KeyPEM: keyPEM, Leaf: leaf, Key: key}, servingReason{}
@@ -401,8 +429,9 @@ func publicKeysEqual(a, b any) bool {
 // it mirrors Generate, and Generate's siblings Sign and SignWithTTL take the
 // subject lock themselves. Copying either would deadlock every backend on the
 // startup path.
+//
 // carryNames, when non-empty, is unioned with the configured names. Only the
-// name-drift path passes it; see EnsureServingCert.
+// missing-name path passes it; see EnsureServingCert.
 func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig, carryNames []string) (*ServingCertificate, error) {
 	// The serving key follows the leaf key configuration. No separate setting
 	// selects its algorithm: nothing distinguishes the CA's own serving
@@ -668,8 +697,10 @@ func (c *CA) recordSuperseded(ctx context.Context, leaf *x509.Certificate, revok
 // etcd, Redis or SQL — the multi-replica deployment this feature exists for —
 // it is real.
 //
-// Subject lock → CRL lock → c.mu, the order Clean and AutoRenew already use.
-// Taking them in any other order risks deadlocking against them.
+// Serving lock → subject lock → CRL lock → c.mu. The serving lock is the one
+// that makes the read-modify-write safe between replicas (see withServingLocks);
+// the rest of the order is what Clean and AutoRenew already use, and taking
+// them in any other order risks deadlocking against them.
 func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 	if cfg.Subject == "" {
 		return fmt.Errorf("serving certificate subject is required")
@@ -680,7 +711,7 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
 	defer cancel()
 
-	return c.Storage.WithLock(ctx, subjectLockName(cfg.Subject), func() error {
+	return c.withServingLocks(ctx, cfg.Subject, func() error {
 		entries, err := c.readSuperseded(ctx)
 		if err != nil {
 			return err
@@ -708,18 +739,33 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 			return nil
 		}
 
-		// Per entry, not all-or-nothing. Aborting the loop on the first error
-		// and leaving the whole list is right for a transient failure, but a
-		// malformed serial never parses -- so one bad entry would stall every
-		// other due revocation on every pass, indefinitely, and every
-		// superseded certificate behind it would stay a valid credential.
-		// Entries that fail are carried forward and retried; only the ones
-		// actually revoked are dropped.
-		var failed []supersededEntry
+		// Per entry, not all-or-nothing: one failure must not stall the other
+		// due revocations, which would leave every certificate behind it a
+		// valid credential indefinitely.
+		//
+		// Retrying is right for a transient failure and wrong for a permanent
+		// one. A serial that is not parseable hex can never be revoked, so
+		// carrying it forward would retry it on every pass forever, latching
+		// both this counter's alert and the CRL one with nothing an operator
+		// could do to clear them -- and the realistic response to a permanently
+		// firing warning is to silence it, which then hides the transient
+		// failures the counter exists for. Those entries are discarded, loudly,
+		// and never reach revokeSerialLocked so they do not count as CRL
+		// failures either. Only entries that might yet succeed are retried.
+		var (
+			failed    []supersededEntry
+			discarded int
+		)
 		err = c.Storage.WithLock(ctx, lockNameCRL, func() error {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			for _, e := range due {
+				if _, ok := new(big.Int).SetString(e.Serial, 16); !ok {
+					slog.Error("Discarding superseded serving-certificate entry with a "+
+						"malformed serial; it can never be revoked", "serial", e.Serial)
+					discarded++
+					continue
+				}
 				if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
 					slog.Warn("Could not revoke superseded serving certificate; will retry",
 						"serial", e.Serial, "error", err)
@@ -736,7 +782,7 @@ func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 			// in circulation with nothing recording that fact.
 			return err
 		}
-		if len(failed) > 0 {
+		if len(failed) > 0 || discarded > 0 {
 			c.IncServingRevocationFailures()
 		}
 		return c.writeSuperseded(ctx, append(pending, failed...))

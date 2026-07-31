@@ -397,35 +397,30 @@ var _ = Describe("maintenance tasks", func() {
 			Expect(revoked).To(BeFalse(), "discarding must not revoke")
 		})
 
-		It("counts a failure and leaves the pending list intact", func() {
+		It("counts a failure and discards an entry that can never be revoked", func() {
 			// The sibling of the renewal-failure spec above, and for the same
 			// reason: this counter is what bounds how long a superseded
 			// certificate stays a valid credential, and without a spec its
 			// branch is dead to the suite.
+			//
+			// A malformed serial fails inside the sweep rather than before it
+			// -- an empty hostname would return before touching storage,
+			// leaving any assertion here trivially true. It is discarded rather
+			// than carried, because retrying it forever would latch this
+			// counter's alert with nothing an operator could do about it. The
+			// carry-forward path is for transient failures and is covered at
+			// the CA layer.
 			cfg.TLSSelfProvisionRevokeAfterSec = 7200
-			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
-			Expect(myCA.Storage.SaveServingKey(ctx, []byte("not a key\n"))).To(Succeed())
-			Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
-			before, err := myCA.Storage.GetServingSuperseded(ctx)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(string(before)).NotTo(Equal("[]"))
-
-			// A malformed serial makes revokeSerialLocked fail *after* the list
-			// has been read, which is the branch that must not write the
-			// pruned list back. An empty hostname would return before touching
-			// storage, leaving the assertion below trivially true.
 			Expect(myCA.Storage.SaveServingSuperseded(ctx,
 				[]byte(`[{"serial":"zz","revoke_at":"2020-01-01T00:00:00Z"}]`))).To(Succeed())
-			before, err = myCA.Storage.GetServingSuperseded(ctx)
-			Expect(err).NotTo(HaveOccurred())
 
 			supersededRevocationTask(myCA, cfg).run(ctx)
 
 			Expect(myCA.ServingRevocationFailureCount()).To(Equal(uint64(1)))
 			after, err := myCA.Storage.GetServingSuperseded(ctx)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(after)).To(Equal(string(before)),
-				"a failed sweep must not drop what it could not revoke")
+			Expect(string(after)).NotTo(ContainSubstring("zz"),
+				"an entry that can never be revoked must not be retried forever")
 		})
 	})
 })

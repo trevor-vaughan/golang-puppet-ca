@@ -226,11 +226,19 @@ func (c *CA) ServingRenewalFailureCount() uint64 {
 }
 
 // IncServingRevocationFailures records a failure to record or to complete a
-// supersession. Three arms: a maintenance pass that could not reconcile the
-// pending list; a mint that could not read the certificate it was replacing;
-// and a mint that read it but could not persist the pending list. Only the
-// first is self-healing — the other two leave a serial nothing can rediscover,
-// because the mint has already overwritten what named it.
+// supersession. Four arms, and they differ in whether they clear themselves:
+//
+//   - a maintenance pass that could not reconcile the pending list, and a
+//     single entry whose revocation failed — both retried on the next pass;
+//   - a mint that could not read the certificate it was replacing, or read it
+//     and could not persist the pending list — neither is recoverable, because
+//     the mint has already overwritten what named that serial, so no later
+//     sweep can find it;
+//   - an entry discarded for a malformed serial, which is unrevokable by
+//     construction and will not recur.
+//
+// The log line says which: "will retry" for the first, "will not be scheduled
+// for revocation" for the second, "can never be revoked" for the third.
 //
 // Counted separately from crlUpdateFailures because the failures this path hits
 // first are not CRL amendments at all — a lock timeout, or a storage error on

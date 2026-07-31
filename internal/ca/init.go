@@ -41,6 +41,18 @@ const (
 	lockNameBootstrap = "bootstrap"
 	lockNameCRL       = "crl"
 	lockSubjectPrefix = "subject:"
+
+	// lockNameServing guards the serving_cert, serving_key and
+	// serving_superseded blobs.
+	//
+	// A fixed name, not one derived from the subject: those three blobs are
+	// singletons, one set per store, while the subject lock is derived from
+	// each replica's own hostname. Replicas that disagree about hostname --
+	// which the configured-name handling explicitly assumes can happen, since
+	// configuration is read once at startup -- would take different subject
+	// locks and so exclude each other from nothing, on exactly the
+	// read-modify-write the lock exists to serialise.
+	lockNameServing = "serving"
 )
 
 // lockTimeout bounds how long Init/Sign/Revoke will wait to acquire a

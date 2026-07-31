@@ -44,9 +44,14 @@ jobs:
           PROMETHEUS_VERSION: 3.13.2
         run: |
           go install github.com/google/go-jsonnet/cmd/jsonnet@v0.21.0
-          # Verified, not just pinned: a release asset can be replaced without
-          # the tag moving, and this is the only binary in CI covered by neither
-          # a commit SHA nor the Go checksum database.
+          # Checksum-verified against the release's own sha256sums.txt. That
+          # covers a truncated or corrupted download, not asset substitution --
+          # anyone able to replace the tarball could replace the sums beside it.
+          # Pinning the digest inline would close that, at the cost of a second
+          # value for Renovate to keep in step. promtool cannot be `go install`ed
+          # (the Prometheus module carries replace directives), so it is the one
+          # binary here that neither a commit SHA nor the Go checksum database
+          # covers.
           curl -sSfL --retry 3 -o "${RUNNER_TEMP}/prometheus.tar.gz" \
             "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
           curl -sSfL --retry 3 -o "${RUNNER_TEMP}/sha256sums.txt" \

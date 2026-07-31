@@ -238,7 +238,7 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'Puppet CA is failing to revoke superseded serving certificates.',
-              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). The replaced certificate remains a valid credential. A failed sweep ("Could not reconcile superseded serving certificates") retries on the next pass and clears itself. A failure while *recording* the supersession does not: the log line contains "will not be scheduled for revocation", the serial was never written down, and no future sweep can find it -- revoke that serial by hand. Check the CA logs and its storage backend.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not revoke a serving certificate it has replaced (puppetca_serving_cert_revocation_failures_total is rising). The replaced certificate remains a valid credential. The log line says which case it is. "Could not reconcile superseded serving certificates" or "will retry": transient, and the next pass clears it. "will not be scheduled for revocation": the serial was never written down and no sweep can find it -- revoke that serial by hand. "can never be revoked": a malformed entry was discarded, which needs no action but means something wrote a bad serial. Check the CA logs and its storage backend.',
             },
           },
           {
