@@ -73,6 +73,18 @@ func (b *sharedLockBackend) acquiredLocks() []string {
 	return append([]string(nil), b.acquired...)
 }
 
+// lockIndex is the position of a lock name in an acquisition record, or -1.
+// Order matters as much as presence: the two paths must take the pair the same
+// way round or they deadlock against each other.
+func lockIndex(acquired []string, name string) int {
+	for i, got := range acquired {
+		if got == name {
+			return i
+		}
+	}
+	return -1
+}
+
 // resetLocks forgets the record, so a spec can scope its assertion to one call.
 func (b *sharedLockBackend) resetLocks() {
 	b.mu.Lock()
@@ -230,8 +242,49 @@ var _ = Describe("Serving certificate across replicas", func() {
 		backend.resetLocks()
 		Expect(newReplica().ReconcileSuperseded(ctx, base)).To(Succeed())
 
-		Expect(backend.acquiredLocks()).To(ContainElement("subject:"+subject),
-			"the sweep must serialise on the subject lock, as the mint path does")
+		acquired := backend.acquiredLocks()
+		Expect(acquired).To(ContainElements("serving", "subject:"+subject),
+			"the sweep must serialise on both locks the mint path takes")
+		Expect(lockIndex(acquired, "serving")).To(
+			BeNumerically("<", lockIndex(acquired, "subject:"+subject)),
+			"serving outside subject, or this deadlocks against a mint holding them the other way")
+	})
+
+	It("takes a fixed serving lock outside the per-subject one on both paths", func() {
+		// The lock that actually makes the read-modify-write mutual between
+		// replicas, and the one nothing else in the suite would miss. The
+		// per-subject lock cannot do this job: it is derived from each
+		// replica's own hostname, and replicas are explicitly allowed to
+		// disagree about that, so two of them take different subject locks and
+		// exclude each other from nothing. Both multi-replica specs above give
+		// every replica the same subject, so they pass either way -- which is
+		// why the guarantee is asserted here by name rather than inferred from
+		// them.
+		//
+		// Both paths, because the guarantee is mutual exclusion *between* them:
+		// the mint appends to the pending list and the sweep rewrites it, and
+		// one of them holding a lock the other does not take serialises nothing.
+		cfg := ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour}
+
+		backend.resetLocks()
+		_, err := newReplica().EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		minted := backend.acquiredLocks()
+
+		backend.resetLocks()
+		Expect(newReplica().ReconcileSuperseded(ctx, cfg)).To(Succeed())
+		swept := backend.acquiredLocks()
+
+		for _, acquired := range []struct {
+			path  string
+			locks []string
+		}{{"the mint", minted}, {"the sweep", swept}} {
+			Expect(acquired.locks).To(ContainElements("serving", "subject:"+subject),
+				acquired.path+" must take the fixed serving lock as well as the subject one")
+			Expect(lockIndex(acquired.locks, "serving")).To(
+				BeNumerically("<", lockIndex(acquired.locks, "subject:"+subject)),
+				acquired.path+" must take them serving-first, or the two paths deadlock")
+		}
 	})
 
 	It("prunes what is due and keeps what is not", func() {

@@ -99,13 +99,15 @@ type ServingCertificate struct {
 // This is the authoritative statement; getting it wrong deadlocks startup with
 // no deadline to break it, presenting as a listener that never opens.
 //
-//	Holder                          Subject lock   c.mu
-//	EnsureServingCert, whole body   acquires       —
-//	  …evaluating reuse             held           must NOT hold
-//	  …around the mint call only    held           acquires, releases
-//	issueServingCertLocked          caller's       caller's — takes neither
+//	Holder                          Serving lock   Subject lock   c.mu
+//	EnsureServingCert, whole body   acquires       acquires       —
+//	  …evaluating reuse             held           held           must NOT hold
+//	  …around the mint call only    held           held           acquires, releases
+//	issueServingCertLocked          caller's       caller's       caller's — takes none
 //
-// Two independent non-reentrancy hazards force this. The reuse predicate calls
+// Both outer locks come from withServingLocks, in that order; see its comment
+// for why the subject lock alone does not serialise replicas. Two independent
+// non-reentrancy hazards force the rest. The reuse predicate calls
 // IsRevokedSerial, which takes c.mu.RLock(); an RLock taken while the same
 // goroutine holds the write lock deadlocks. And StorageService.WithLock hands
 // out either an advisory lock or a bare sync.Mutex, neither reentrant, so
@@ -179,9 +181,13 @@ func (c *CA) EnsureServingCert(ctx context.Context, cfg ServingConfig) (*Serving
 			carry = superseded.DNSNames
 		}
 
-		c.mu.Lock()
-		minted, err := c.issueServingCertLocked(ctx, cfg, carry)
-		c.mu.Unlock()
+		// The closure keeps the unlock panic-safe, as Renew and AutoRenew do:
+		// a panic mid-mint frees c.mu instead of wedging every later caller.
+		minted, err := func() (*ServingCertificate, error) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return c.issueServingCertLocked(ctx, cfg, carry)
+		}()
 		if err != nil {
 			return err
 		}
@@ -687,20 +693,19 @@ func (c *CA) recordSuperseded(ctx context.Context, leaf *x509.Certificate, revok
 //
 // # Lock discipline
 //
-// The whole read-modify-write runs under the *subject* lock, which is the same
-// lock EnsureServingCert holds while it appends. That is the point: without it
-// the two serialise on different locks and so do not exclude each other, and a
-// replica minting between this function's read and its write has its new entry
-// erased by the write — leaving a superseded certificate valid for its full
-// remaining life with nothing recording that it should not be. On a filesystem
-// or SQLite backend WithLock is process-local and the window is invisible; on
-// etcd, Redis or SQL — the multi-replica deployment this feature exists for —
-// it is real.
+// The whole read-modify-write runs under withServingLocks, the same pair
+// EnsureServingCert holds while it appends. The *serving* lock is what makes
+// that mutual: it is a fixed name, so replicas exclude each other however their
+// hostnames differ. Without it a replica minting between this function's read
+// and its write has its new entry erased by the write — leaving a superseded
+// certificate valid for its full remaining life with nothing recording that it
+// should not be. On a filesystem or SQLite backend WithLock is process-local
+// and the window is invisible; on etcd, Redis or SQL — the multi-replica
+// deployment this feature exists for — it is real.
 //
-// Serving lock → subject lock → CRL lock → c.mu. The serving lock is the one
-// that makes the read-modify-write safe between replicas (see withServingLocks);
-// the rest of the order is what Clean and AutoRenew already use, and taking
-// them in any other order risks deadlocking against them.
+// Serving lock → subject lock → CRL lock → c.mu. The tail of that order is what
+// Clean and AutoRenew already use, and taking them in any other order risks
+// deadlocking against them.
 func (c *CA) ReconcileSuperseded(ctx context.Context, cfg ServingConfig) error {
 	if cfg.Subject == "" {
 		return fmt.Errorf("serving certificate subject is required")
@@ -829,7 +834,13 @@ func (c *CA) writeSuperseded(ctx context.Context, entries []supersededEntry) err
 	if err != nil {
 		return fmt.Errorf("encoding pending serving-certificate revocations: %w", err)
 	}
-	return c.Storage.SaveServingSuperseded(ctx, data)
+	if err := c.Storage.SaveServingSuperseded(ctx, data); err != nil {
+		// Without the backend's error text, for the reason readSuperseded
+		// gives: both errors reach the same Warn line on the mint path, and a
+		// SQL driver's write error carries the DSN just as a read error does.
+		return errors.New("saving pending serving-certificate revocations")
+	}
+	return nil
 }
 
 // servingSerialMatches reports whether serial might be the one in the
