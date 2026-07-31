@@ -191,8 +191,8 @@ The certificate lives in the storage backend, not in `cadir`, so every replica
 serves the same one and an ephemeral `cadir` loses nothing.
 
 You can publish it with a [`serving_cert`/`serving_key` export
-target](kubernetes-export.md#serving-certificate-and-key) — but read the next
-section first. **This is not a way to terminate TLS at an Ingress for the
+target](kubernetes-export.md#serving-certificate-and-key). **This is not a way
+to terminate TLS at an Ingress for the
 agent-facing hostname.** A controller that terminates strips the client
 certificate, and every mTLS endpoint stops authenticating; the CA must be
 reached through a passthrough controller. The exported pair is for SNI routing

@@ -19,6 +19,9 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -36,13 +39,11 @@ import (
 //
 // Both signals are needed. A serving-certificate rotation does not touch the
 // CRL, so waiting only on CRLUpdated would leave a rotated certificate
-// unexported until something else moved the CRL. How long that is depends on
-// configuration and is worth stating accurately rather than dramatically: with
-// the default tls_self_provision_revoke_after_sec, the rotation itself produces
-// a CRL update roughly a day later, so the fallback is ~24 hours. With
-// revocation disabled it is the CRL refresh interval — about 20 days on a
-// low-churn CA. Neither is "months", which is what the design said and what an
-// earlier version of this comment repeated.
+// unexported until the periodic reconcile below came round. What the signal buys
+// is promptness — the Secret follows the rotation within a cycle rather than
+// within a reconcile interval — not rescue from an unbounded stall, which is
+// what the floor is for. Earlier versions of this comment claimed "months" and
+// then "~24 hours / ~20 days"; both predate the floor.
 //
 // It runs in the frontend process, reading the cert/CRL through the storage
 // service. Export failures are logged and swallowed: the export is auxiliary
@@ -60,13 +61,13 @@ import (
 //     maintenance pass refreshes its holder — and any CRL event in that window
 //     has it republish its old pair over the correct one, successfully, with
 //     nothing to alert on. Server-side apply makes the extra cycles idempotent.
-func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter) {
+func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter, resync time.Duration) {
 	slog.Info("Starting Kubernetes export job")
 
 	retry := time.NewTimer(exportRetryInterval)
 	defer retry.Stop()
 	stopTimer(retry)
-	retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter)))
+	retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter), resync))
 
 	for {
 		var reason string
@@ -84,14 +85,14 @@ func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter)
 
 		slog.Debug("Re-exporting to Kubernetes", "reason", reason)
 		stopTimer(retry)
-		retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter)))
+		retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter), resync))
 	}
 }
 
 // nextExportInterval picks how long to wait before the next unprompted cycle.
-func nextExportInterval(ok bool) time.Duration {
+func nextExportInterval(ok bool, resync time.Duration) time.Duration {
 	if ok {
-		return exportResyncInterval
+		return resync
 	}
 	return exportRetryInterval
 }
@@ -109,7 +110,27 @@ var exportRetryInterval = 2 * time.Minute
 // exportResyncInterval is the floor for cycles that had no failures — the
 // periodic reconcile every controller needs, since an apply can succeed while
 // publishing material this replica has not yet caught up with.
+//
+// Ten minutes suits cert and CRL material, where every replica reads the same
+// storage and a resync only repairs drift. It is the wrong figure on its own for
+// serving material: a replica that did not mint holds the previous pair until
+// its own maintenance pass, so resyncing more often than that interval does not
+// converge any sooner and simply republishes the stale pair more times. See
+// servingResyncInterval.
 var exportResyncInterval = 10 * time.Minute
+
+// servingResyncInterval is the floor to use when a target publishes serving
+// material, given how often this process refreshes its own holder.
+//
+// Convergence is gated by the maintenance interval, not by the resync, so
+// resyncing faster than that buys nothing and costs one stale republish per
+// cycle -- which a Gateway or Ingress watching the Secret hot-reloads on.
+func servingResyncInterval(maintenance time.Duration) time.Duration {
+	if maintenance > exportResyncInterval {
+		return maintenance
+	}
+	return exportResyncInterval
+}
 
 // stopTimer drains t so a later Reset cannot fire immediately on a stale value.
 func stopTimer(t *time.Timer) {
@@ -151,7 +172,8 @@ func validateServingExport(cfg *serverConfig) error {
 	return fmt.Errorf("a kubernetes_export target requests serving_cert or serving_key, but " +
 		"tls_self_provision is off: the serving certificate and key only exist when the CA " +
 		"issues them itself, so every export cycle would fail. Enable tls_self_provision, or " +
-		"remove the serving material from the target")
+		"remove the serving material from the target -- and delete the Secret it was publishing " +
+		"to, which still holds the key in plaintext")
 }
 
 // servingExportWarnings returns what an operator should be told at startup about
@@ -183,9 +205,69 @@ func servingExportWarnings(cfg *serverConfig) []string {
 // Separated from the serve command so that "the exporter reads the same pair the
 // listener serves" is a proposition a spec can check: inline, pointing it at a
 // different or empty holder compiled and passed.
-func attachServingSource(e *k8sexport.Exporter, cfg *serverConfig, holder *servingCertHolder) *k8sexport.Exporter {
+func attachServingSource(e *k8sexport.Exporter, cfg *serverConfig, holder *servingCertHolder, c *ca.CA) *k8sexport.Exporter {
 	if !cfg.TLSSelfProvision {
 		return e
 	}
-	return e.WithServingSource(holder)
+	return e.WithServingSource(revocationFenced{inner: holder, ca: c})
+}
+
+// revocationFenced refuses to publish a serving pair the CA has revoked.
+//
+// A replica that did not mint holds the previous pair until its own maintenance
+// pass, and the periodic reconcile republishes whatever it holds. That is
+// merely stale for an ordinary rotation, but it is a live exposure for the
+// documented remedy after a key compromise: the operator revokes, one replica
+// re-mints, and every other replica goes on writing the compromised pair back
+// into the Secret until it catches up.
+//
+// Revocation is shared state that every replica agrees about, so it is the one
+// freshness signal available here without a storage read per cycle. Refusing
+// turns "quietly republishes a revoked key" into a failed target, which records
+// an error and fires the export alert.
+type revocationFenced struct {
+	inner k8sexport.ServingSource
+	ca    *ca.CA
+}
+
+func (f revocationFenced) ServingMaterial(ctx context.Context) (certPEM, keyPEM []byte, err error) {
+	certPEM, keyPEM, err = f.inner.ServingMaterial(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return nil, nil, fmt.Errorf("the serving certificate to export is not PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing the serving certificate to export: %w", err)
+	}
+	revoked, err := f.ca.IsRevokedSerial(ctx, leaf.SerialNumber)
+	if err != nil {
+		return nil, nil, fmt.Errorf("checking whether the serving certificate is revoked: %w", err)
+	}
+	if revoked {
+		return nil, nil, fmt.Errorf("refusing to publish serving certificate %s: it is revoked, so this "+
+			"replica has not yet picked up the replacement", leaf.SerialNumber.Text(16))
+	}
+	return certPEM, keyPEM, nil
+}
+
+// fatalExportStartupError reports which constructor failures must stop startup.
+//
+// The two kinds are handled oppositely and the distinction is easy to lose: a
+// client that will not initialise is environmental and the CA carries on
+// serving without export, but a configuration mistake belongs with every other
+// one, at startup. Routing both to a log line disabled the export for the life
+// of the process while writing no metric series at all -- so the alert that owns
+// it could not fire, and the only trace was one boot line blaming the client.
+//
+// Split out of the serve command because RunE cannot be reached from a spec,
+// and this is the decision worth pinning rather than the plumbing around it.
+func fatalExportStartupError(err error) error {
+	if errors.Is(err, k8sexport.ErrInvalidConfig) {
+		return err
+	}
+	return nil
 }

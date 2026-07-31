@@ -41,11 +41,34 @@ import (
 // a superseded certificate has to be delayed rather than immediate.
 type servingCertHolder struct {
 	current atomic.Pointer[tls.Certificate]
+
+	// notify, when set, is called after -- never before -- the new pair is
+	// reachable through current.
+	//
+	// It exists to make the ordering unrepresentable rather than commented. A
+	// consumer woken by the announcement immediately reads this holder, so
+	// announcing first publishes the certificate being replaced; that was the
+	// original defect, and moving the send from the mint to the caller only
+	// narrowed the window rather than closing it. Set is the one place that can
+	// get this right, so it is the only place that does it.
+	notify func()
 }
 
 // Set installs cert as the certificate served from the next handshake onward.
+// newServingCertHolder builds a holder that announces each installed pair.
+//
+// A constructor rather than a struct literal so there is one place the two are
+// tied together: a holder built without its announcement is a holder whose
+// rotations no consumer hears about.
+func newServingCertHolder(notify func()) *servingCertHolder {
+	return &servingCertHolder{notify: notify}
+}
+
 func (h *servingCertHolder) Set(cert *tls.Certificate) {
 	h.current.Store(cert)
+	if h.notify != nil {
+		h.notify()
+	}
 }
 
 // GetCertificate satisfies tls.Config.GetCertificate.
@@ -222,10 +245,6 @@ func ensureServingCert(ctx context.Context, myCA *ca.CA, cfg *serverConfig, hold
 	}
 	holder.Set(pair)
 	if sc.Issued {
-		// After the holder, never before: a consumer woken by this reads the
-		// holder, so announcing the rotation any earlier publishes the
-		// certificate being replaced.
-		myCA.NotifyServingCertUpdated()
 		slog.Info("Serving certificate issued",
 			"subject", sc.Leaf.Subject.CommonName,
 			"serial", sc.Leaf.SerialNumber.Text(16),

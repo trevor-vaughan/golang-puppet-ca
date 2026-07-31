@@ -292,7 +292,7 @@ callers below only ever ask about presence.
 {{- $config := include "openvox-ca.config" .ctx | fromYaml -}}
 {{- $v := dig .key "" $config -}}
 {{- range $name, $value := .ctx.Values.env -}}
-{{- if eq $name $.env }}{{ $v = $value }}{{ end -}}
+{{- if and (eq $name $.env) $value }}{{ $v = $value }}{{ end -}}
 {{- end -}}
 {{- range .ctx.Values.extraEnv -}}
 {{- if eq .name $.env }}{{ $v = "set" }}{{ end -}}
@@ -311,7 +311,7 @@ variable must not get a chart that renders as though TLS were off.
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 {{- $on := dig "tls_self_provision" false $config -}}
 {{- range $name, $value := .Values.env -}}
-{{- if eq $name "PUPPET_CA_TLS_SELF_PROVISION" }}{{ $on = $value }}{{ end -}}
+{{- if and (eq $name "PUPPET_CA_TLS_SELF_PROVISION") $value }}{{ $on = $value }}{{ end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
 {{- if eq .name "PUPPET_CA_TLS_SELF_PROVISION" -}}
@@ -323,10 +323,10 @@ variable must not get a chart that renders as though TLS were off.
 {{- end -}}
 {{- end -}}
 {{- if kindIs "string" $on -}}
-{{- if has (lower $on) (list "true" "t" "1") -}}true
-{{- else if has (lower $on) (list "false" "f" "0") -}}false
+{{- if has $on (list "1" "t" "T" "TRUE" "true" "True") -}}true
+{{- else if has $on (list "0" "f" "F" "FALSE" "false" "False") -}}false
 {{- else -}}
-{{- fail (printf "PUPPET_CA_TLS_SELF_PROVISION is %q, which the chart cannot read as a boolean. The server parses it with Go's strconv.ParseBool and ignores an unparseable value, keeping the config-file setting -- so the chart would render for one configuration and the server run another. Use true or false." $on) -}}
+{{- fail (printf "PUPPET_CA_TLS_SELF_PROVISION is %q, which the chart cannot read as a boolean: it is not a value Go's strconv.ParseBool does not accept -- and the server ignores an unparseable value, keeping the config-file setting, so the chart would render for one configuration and the server run another. Use one of: 1 t T TRUE true True 0 f F FALSE false False." $on) -}}
 {{- end -}}
 {{- else -}}
 {{- ternary "true" "false" (not (not $on)) -}}

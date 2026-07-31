@@ -170,7 +170,7 @@ var _ = Describe("self-provisioned serving certificate", func() {
 		Expect(myCA.ServingCertIssued()).To(Equal(uint64(1)))
 	})
 
-	It("stores the certificate where the exporter and a restart will find it", func() {
+	It("stores the certificate where a restart will find it", func() {
 		Expect(ensureServingCert(ctx, myCA, cfg, holder)).To(Succeed())
 
 		certPEM, err := store.GetServingCert(ctx)

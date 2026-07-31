@@ -372,8 +372,11 @@ the backend, and the key is plaintext unless
 for the CA's own hostname, so when migrating to an externally supplied
 certificate:
 
-1. Switch to `tls_cert`/`tls_key` and restart.
-2. *Then* revoke it — `openvox-ca-ctl revoke --certname <hostname>` — so the
+1. Remove any `serving_cert`/`serving_key` target from `kubernetes_export`. The
+   server refuses to start with one configured while `tls_self_provision` is
+   off, so leaving it in place turns the next step into a crash loop.
+2. Switch to `tls_cert`/`tls_key` and restart.
+3. *Then* revoke it — `openvox-ca-ctl revoke --certname <hostname>` — so the
    credential is dead even though the blobs remain.
 
 Step 2 assumes the replacement certificate was **not** issued by this CA under
@@ -394,10 +397,9 @@ There is no command to delete the stored blobs; remove them with your backend's
 own tooling if you want them gone.
 
 **If you exported the serving material to Kubernetes, delete that Secret too.**
-Nothing removes it, and a published `tls.key` is a plaintext CA-chained private
-key that outlives the feature. Remove the `serving_cert`/`serving_key` target
-from `kubernetes_export` first — the server refuses to start with one configured
-while `tls_self_provision` is off — then `kubectl delete secret <name>`.
+Removing the target (step 1) stops the CA maintaining it but does not remove it,
+and a published `tls.key` is a plaintext CA-chained private key that outlives the
+feature: `kubectl delete secret <name>`.
 
 Related: rotating `ca_key_passphrase_file` across a rolling update leaves
 replicas briefly unable to decrypt each other's stored key, so each reissues its

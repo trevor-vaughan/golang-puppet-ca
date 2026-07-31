@@ -54,6 +54,12 @@ var _ = Describe("newChecked", func() {
 
 		_, err := newChecked(nil, cfg, nil, "ns1", nil)
 		Expect(err).To(MatchError(ContainSubstring("both resolve to")))
+
+		// Marked as a configuration error, not an environmental one: the caller
+		// routes on that, and without the marking a collision is logged as a
+		// client-init failure and the whole export is silently disabled for the
+		// life of the process, writing no series for the alert to fire on.
+		Expect(err).To(MatchError(ErrInvalidConfig))
 	})
 
 	It("builds an exporter when the objects are genuinely distinct", func() {

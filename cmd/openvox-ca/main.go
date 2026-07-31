@@ -624,7 +624,10 @@ func newRootCmd() *cobra.Command {
 			//
 			// The holder is declared here rather than inside the TLS block below so
 			// the Kubernetes exporter can read the same pair the listener presents.
-			servingCerts := &servingCertHolder{}
+			// Announcing is wired into the holder rather than done beside each
+			// Set, so a rotation cannot be announced before it is reachable.
+			// Only an issuance is a rotation; loading an unchanged pair is not.
+			servingCerts := newServingCertHolder(myCA.NotifyServingCertUpdated)
 
 			authCfg, err := serverAuthConfig(cfg, myCA)
 			if err != nil {
@@ -791,9 +794,13 @@ func newRootCmd() *cobra.Command {
 					slog.Warn(w)
 				}
 				k8sExporter, err := k8sexport.NewInCluster(cfg.KubernetesExport, store, k8sMetrics)
-				if err != nil {
+				if fatal := fatalExportStartupError(err); fatal != nil {
+					return fatal
+				}
+				switch {
+				case err != nil:
 					slog.Error("Kubernetes export disabled: failed to initialise client", "error", err)
-				} else {
+				default:
 					// The holder, not the CA or the storage service, supplies
 					// serving material: it swaps the certificate and its key as
 					// one atomic pointer, so an export can never publish a
@@ -804,7 +811,12 @@ func newRootCmd() *cobra.Command {
 					// Attached only when self-provisioning is on, which
 					// validateServingExport above has already established is the
 					// only way a serving target can be configured.
-					go runK8sExporter(ctx, myCA, attachServingSource(k8sExporter, cfg, servingCerts))
+					resync := exportResyncInterval
+					if cfg.KubernetesExport.WantsServingMaterial() {
+						resync = servingResyncInterval(cfg.maintenanceInterval())
+					}
+					go runK8sExporter(ctx, myCA,
+						attachServingSource(k8sExporter, cfg, servingCerts, myCA), resync)
 				}
 			}
 

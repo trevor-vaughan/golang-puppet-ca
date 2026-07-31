@@ -1084,6 +1084,28 @@ func (Chart) Test() error {
 			wants: []string{"scheme: HTTPS"},
 		},
 		chartRenderCase{
+			name: "a hostname supplied through extraEnv satisfies the precondition",
+			// The extraEnv arm of effectiveConfig, which no case reached:
+			// deleting it left all 50 assertions passing while the chart
+			// refused an install the server accepts.
+			sets: []string{
+				"config.tls_self_provision=true",
+				"extraEnv[0].name=PUPPET_CA_HOSTNAME", "extraEnv[0].value=ca.example.com",
+			},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
+			name: "an empty environment override does not mask the config value",
+			// applyServerEnv skips empty values; the chart used to overwrite
+			// with them, so it failed the install on a hostname the server
+			// keeps from the config file.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"env.PUPPET_CA_HOSTNAME=",
+			},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
 			name: "a hostname supplied by environment variable satisfies the precondition",
 			// The other direction of the same bug: the precondition read only
 			// the config file, so it refused an install the server accepts --
@@ -1224,6 +1246,30 @@ func (Chart) Test() error {
 				"extraEnv[0].valueFrom.secretKeyRef.key=self-provision",
 			},
 			wantErr: "cannot read at render time",
+		},
+		{
+			name: "self-provisioning alongside a certificate path set through extraEnv",
+			// The arm effectiveConfig was written for and the one no case
+			// reached: ci/self-provision-values.yaml already uses this
+			// valueFrom shape for the SQL DSN, so it is the idiomatic route.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"extraEnv[0].name=PUPPET_CA_TLS_CERT",
+				"extraEnv[0].valueFrom.secretKeyRef.name=tls",
+				"extraEnv[0].valueFrom.secretKeyRef.key=crt",
+			},
+			wantErr: "cannot be combined",
+		},
+		{
+			name: "self-provisioning alongside a key path alone",
+			// The other half of the mutual-exclusion or: every existing case set
+			// both, so $mxCert satisfied it and $mxKey was never exercised. The
+			// server refuses on either.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"env.PUPPET_CA_TLS_KEY=/tls/tls.key",
+			},
+			wantErr: "cannot be combined",
 		},
 		{
 			name:    "a mistyped value the schema should catch",

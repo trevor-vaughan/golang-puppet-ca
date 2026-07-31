@@ -196,6 +196,21 @@ var _ = Describe("Config", func() {
 	})
 })
 
+var _ = Describe("Target key collisions", func() {
+	// The serving_key_key row of checkDistinctKeys had no case: deleting it left
+	// the suite green while serving_key_key: tls.crt put the private key under
+	// tls.crt, overwriting the certificate. With type kubernetes.io/tls the API
+	// server then rejects every apply forever; without it the apply succeeds and
+	// the Secret quietly carries the key where consumers expect the certificate.
+	It("refuses a serving pair that collides on one data key", func() {
+		cfg := k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving", Namespace: "ns1"},
+			ServingCert: true, ServingKey: true, ServingKeyKey: "tls.crt",
+		}}}
+		Expect(cfg.Validate()).To(MatchError(ContainSubstring("must differ")))
+	})
+})
+
 var _ = Describe("Config.CheckDistinctObjects", func() {
 	// Validate cannot see this collision: it runs before the pod's namespace is
 	// known, so it compares namespaces as written. A target with none and one

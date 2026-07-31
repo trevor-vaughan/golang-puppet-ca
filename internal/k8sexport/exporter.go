@@ -81,7 +81,9 @@ func (e *Exporter) WithServingSource(s ServingSource) *Exporter {
 }
 
 // New constructs an Exporter from an existing clientset. cfg must already have
-// been validated (Config.Validate). defaultNS is the namespace used for targets
+// been validated (Config.Validate) and, once the default namespace is known,
+// checked for resolved-namespace collisions (Config.CheckDistinctObjects) --
+// NewInCluster does both; a caller using this directly owns the second. defaultNS is the namespace used for targets
 // that do not set their own; it may be empty if every target sets a namespace.
 // m may be nil to disable instrumentation.
 func New(client kubernetes.Interface, cfg Config, src MaterialSource, defaultNS string, m *Metrics) *Exporter {
@@ -109,6 +111,17 @@ func NewInCluster(cfg Config, src MaterialSource, m *Metrics) (*Exporter, error)
 	return newChecked(client, cfg, src, defaultNS, m)
 }
 
+// ErrInvalidConfig marks an error as a configuration mistake rather than an
+// environmental one.
+//
+// The two have opposite handling: a client that will not initialise is
+// auxiliary and the CA carries on serving without export, but a configuration
+// mistake must stop startup like every other one. Without this distinction the
+// caller logged "failed to initialise client" for both, and a duplicate-target
+// collision silently disabled the entire export -- writing no metric series, so
+// the alert that owns it could not fire either.
+var ErrInvalidConfig = errors.New("invalid kubernetes_export config")
+
 // newChecked is NewInCluster's tail, split out because NewInCluster itself needs
 // a real ServiceAccount mount and so cannot be reached from a spec.
 //
@@ -117,7 +130,7 @@ func NewInCluster(cfg Config, src MaterialSource, m *Metrics) (*Exporter, error)
 // Config.CheckDistinctObjects.
 func newChecked(client kubernetes.Interface, cfg Config, src MaterialSource, defaultNS string, m *Metrics) (*Exporter, error) {
 	if err := cfg.CheckDistinctObjects(defaultNS); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	return New(client, cfg, src, defaultNS, m), nil
 }

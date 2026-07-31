@@ -23,6 +23,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -69,7 +71,7 @@ var _ = Describe("runK8sExporter", func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, exporter)
+			runK8sExporter(ctx, c, exporter, exportResyncInterval)
 			close(done)
 		}()
 
@@ -94,9 +96,7 @@ var _ = Describe("runK8sExporter serving-certificate wake-up", func() {
 	It("re-exports when the serving certificate rotates, with no CRL change", func() {
 		// The reason the loop selects on two channels. A rotation does not touch
 		// the CRL, so with only the CRL case the rotated certificate would sit
-		// unexported until something else moved it — ~24 hours with the default
-		// revoke-after, ~20 days with revocation disabled. Deleting the
-		// ServingCertUpdated case from the select leaves every other spec green.
+		// unexported until the periodic reconcile came round.
 		c, store := newRefresherTestCA()
 		c.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 
@@ -118,7 +118,7 @@ var _ = Describe("runK8sExporter serving-certificate wake-up", func() {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, exporter)
+			runK8sExporter(ctx, c, exporter, exportResyncInterval)
 			close(done)
 		}()
 
@@ -149,13 +149,17 @@ var _ = Describe("runK8sExporter serving-certificate wake-up", func() {
 // channel was drained before the new pair arrived.
 //
 // What this spec adds is the assertion nobody made: that the bytes applied are
-// the certificate now being served. It does NOT pin the ordering -- the window
-// is a storage round trip wide, and on a filesystem backend the test goroutine
-// usually wins it, so this passes with the signal restored to the mint. The
-// ordering is pinned deterministically one layer down, by "stays silent until
-// the caller announces an installed certificate" in internal/ca/serving_test.go:
-// the CA must not signal at all, so there is no race left to lose. Do not
-// rewrite that spec as a timing test here.
+// the certificate now being served. It does NOT pin the ordering, and cannot be
+// made to -- with RevokeAfter unset recordSuperseded returns immediately and the
+// filesystem backend's WithLock is a process-local mutex, so there is no I/O in
+// the window at all and the test goroutine wins it essentially always.
+//
+// The ordering is pinned structurally instead: servingCertHolder.Set stores
+// before it calls notify, so "announce before install" cannot be written. See
+// "stores the pair before it announces it" below, and "stays silent until the
+// caller announces an installed certificate" in internal/ca/serving_test.go for
+// the half that keeps the mint out of it. Do not rewrite either as a timing
+// test here.
 var _ = Describe("serving-certificate rotation, end to end", func() {
 	It("publishes the certificate the CA is now serving, not the one it replaced", func() {
 		c, store := newRefresherTestCA()
@@ -191,7 +195,7 @@ var _ = Describe("serving-certificate rotation, end to end", func() {
 		}}}
 		Expect(cfg.Validate()).To(Succeed())
 
-		holder := &servingCertHolder{}
+		holder := newServingCertHolder(c.NotifyServingCertUpdated)
 		exporter := k8sexport.New(client, cfg, store, "", nil).WithServingSource(holder)
 
 		srvCfg := &serverConfig{TLSSelfProvision: true, Hostname: "puppet.test"}
@@ -203,7 +207,7 @@ var _ = Describe("serving-certificate rotation, end to end", func() {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, exporter)
+			runK8sExporter(ctx, c, exporter, exportResyncInterval)
 			close(done)
 		}()
 
@@ -252,9 +256,12 @@ var _ = Describe("servingCertHolder.ServingMaterial", func() {
 		certPEM, keyPEM, err := holder.ServingMaterial(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 
-		// One assertion, three regressions: it fails if the two are swapped, if
-		// the key carries the wrong PEM label, and if the pair is ever sourced
-		// from two reads that could straddle a rotation.
+		// Catches the transposition: X509KeyPair parses the certificate and the
+		// key and checks the public keys match, so returning them the wrong way
+		// round fails here. It does NOT catch a wrong PEM label -- Go accepts
+		// any block whose type ends "PRIVATE KEY" and tries PKCS#1, PKCS#8 and
+		// SEC1 regardless -- so the label is pinned by the sibling spec below,
+		// which asserts block.Type directly. Neither pins atomicity.
 		pair, err := tls.X509KeyPair(certPEM, keyPEM)
 		Expect(err).NotTo(HaveOccurred(),
 			"the exported pair must load as a kubernetes.io/tls Secret's consumer would load it")
@@ -360,24 +367,34 @@ var _ = Describe("serving export wiring", func() {
 		newExporter := func() *k8sexport.Exporter {
 			return k8sexport.New(fake.NewClientset(), cfg.KubernetesExport, store, "ns", nil)
 		}
-		Expect(attachServingSource(newExporter(), cfg, holder).ExportAll(context.Background())).
+		Expect(attachServingSource(newExporter(), cfg, holder, c).ExportAll(context.Background())).
 			To(Succeed(), "with the holder attached the serving materials resolve")
 
 		cfg.TLSSelfProvision = false
-		Expect(attachServingSource(newExporter(), cfg, holder).ExportAll(context.Background())).
+		Expect(attachServingSource(newExporter(), cfg, holder, c).ExportAll(context.Background())).
 			To(MatchError(ContainSubstring("tls_self_provision")),
 				"without it the source must stay nil, so the failure names the cause")
 	})
 })
 
 var _ = Describe("nextExportInterval", func() {
+	It("keeps the retry inside the alert's debounce", func() {
+		// exportRetryInterval's whole justification is that a transient failure
+		// is corrected before PuppetCAKubernetesExportFailing pages. That
+		// coupling is to k8sExportFailingFor in mixin/config.libsonnet, which no
+		// Go code reads -- so it is asserted here or nowhere, and raising the
+		// interval past it would otherwise be invisible.
+		Expect(exportRetryInterval).To(BeNumerically("<", 15*time.Minute),
+			"must stay inside k8sExportFailingFor (15m) so a retry lands before the page")
+	})
+
 	It("retries sooner after a failure than it resyncs after a success", func() {
 		// The timer is always armed. A failed cycle needs to be retried inside
 		// the alert's debounce; a successful one still needs a floor, because a
 		// replica that did not mint can apply a stale pair successfully and
 		// nothing else would ever correct it.
-		Expect(nextExportInterval(false)).To(Equal(exportRetryInterval))
-		Expect(nextExportInterval(true)).To(Equal(exportResyncInterval))
+		Expect(nextExportInterval(false, exportResyncInterval)).To(Equal(exportRetryInterval))
+		Expect(nextExportInterval(true, exportResyncInterval)).To(Equal(exportResyncInterval))
 		Expect(exportRetryInterval).To(BeNumerically("<", exportResyncInterval))
 	})
 })
@@ -390,7 +407,10 @@ var _ = Describe("runK8sExporter periodic reconcile", func() {
 	BeforeEach(func() {
 		retry, resync := exportRetryInterval, exportResyncInterval
 		DeferCleanup(func() { exportRetryInterval, exportResyncInterval = retry, resync })
-		exportRetryInterval = 20 * time.Millisecond
+		// Distinct, so a cycle driven by the resync arm cannot be mistaken for
+		// one driven by the retry arm: the reconcile spec below succeeds every
+		// time, so only the resync value can produce its repeats.
+		exportRetryInterval = 5 * time.Second
 		exportResyncInterval = 20 * time.Millisecond
 	})
 
@@ -414,7 +434,7 @@ var _ = Describe("runK8sExporter periodic reconcile", func() {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runK8sExporter(ctx, c, k8sexport.New(client, cfg, store, "", nil))
+			runK8sExporter(ctx, c, k8sexport.New(client, cfg, store, "", nil), exportResyncInterval)
 			close(done)
 		}()
 
@@ -423,5 +443,104 @@ var _ = Describe("runK8sExporter periodic reconcile", func() {
 
 		cancel()
 		Eventually(done).WithTimeout(2 * time.Second).Should(BeClosed())
+	})
+})
+
+var _ = Describe("servingCertHolder.Set", func() {
+	// The ordering the whole rotation mechanism turns on, pinned without any
+	// timing: a consumer woken by the announcement immediately reads the holder,
+	// so announcing before storing publishes the certificate being replaced.
+	//
+	// Round 1 moved the announcement out of the mint and into ensureServingCert,
+	// which narrowed the window to two adjacent statements but left it open --
+	// swapping them kept the whole suite green. Making the announcement a side
+	// effect of Set removes the class: there is no longer a place to write the
+	// wrong order. The callback runs synchronously on the setter's goroutine, so
+	// what it observes is exactly what a woken consumer would.
+	It("stores the pair before it announces it", func() {
+		h := &servingCertHolder{}
+		pair := &tls.Certificate{Certificate: [][]byte{{0x01}}}
+
+		var seen *tls.Certificate
+		h.notify = func() { seen, _ = h.GetCertificate(nil) }
+		h.Set(pair)
+
+		Expect(seen).To(BeIdenticalTo(pair),
+			"the announcement must not precede the installation")
+	})
+
+	It("is usable without an announcement, for the file route", func() {
+		h := newServingCertHolder(nil)
+		Expect(func() { h.Set(&tls.Certificate{Certificate: [][]byte{{0x01}}}) }).NotTo(Panic())
+	})
+})
+
+var _ = Describe("servingResyncInterval", func() {
+	// A replica that did not mint holds the previous pair until its own
+	// maintenance pass, so resyncing faster than that interval cannot converge
+	// any sooner -- it just republishes the stale pair more times, and whatever
+	// watches the Secret hot-reloads on each flip. At the shipped defaults (10m
+	// resync, 1h maintenance) that was six stale writes per rotation instead of
+	// one.
+	It("never resyncs serving material faster than the holder refreshes", func() {
+		Expect(servingResyncInterval(time.Hour)).To(Equal(time.Hour))
+		Expect(servingResyncInterval(30 * time.Minute)).To(Equal(30 * time.Minute))
+	})
+
+	It("keeps the plain floor when the maintenance interval is shorter", func() {
+		Expect(servingResyncInterval(time.Minute)).To(Equal(exportResyncInterval))
+	})
+})
+
+var _ = Describe("revocationFenced", func() {
+	// A revoked serving pair must never be republished. The documented remedy
+	// after a key compromise is to revoke; one replica then re-mints, and every
+	// other replica goes on holding the compromised pair until its own
+	// maintenance pass. Without this fence the reconcile writes that pair back
+	// into the Secret on every cycle in between -- so the operator's remedy is
+	// undone on a timer.
+	var (
+		ctx    context.Context
+		c      *ca.CA
+		holder *servingCertHolder
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		c, _ = newRefresherTestCA()
+		c.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		holder = newServingCertHolder(nil)
+		Expect(ensureServingCert(ctx, c,
+			&serverConfig{TLSSelfProvision: true, Hostname: "puppet.test"}, holder)).To(Succeed())
+	})
+
+	It("passes a live pair straight through", func() {
+		certPEM, keyPEM, err := revocationFenced{inner: holder, ca: c}.ServingMaterial(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(certPEM).NotTo(BeEmpty())
+		Expect(keyPEM).NotTo(BeEmpty())
+	})
+
+	It("refuses once that pair is revoked", func() {
+		Expect(c.Revoke(ctx, "puppet.test")).To(Succeed())
+
+		_, _, err := revocationFenced{inner: holder, ca: c}.ServingMaterial(ctx)
+		Expect(err).To(MatchError(ContainSubstring("revoked")),
+			"a revoked pair must fail the target, not be published")
+	})
+})
+
+var _ = Describe("fatalExportStartupError", func() {
+	// A configuration mistake must stop startup; an environmental one must not.
+	// Collapsing the two disabled the export permanently and silently -- no
+	// series written, so the alert that owns it could not fire either.
+	It("stops startup for a configuration mistake", func() {
+		err := fmt.Errorf("%w: targets 0 and 1 both resolve to Secret", k8sexport.ErrInvalidConfig)
+		Expect(fatalExportStartupError(err)).To(HaveOccurred())
+	})
+
+	It("lets the CA serve on when the client will not initialise", func() {
+		Expect(fatalExportStartupError(errors.New("no ServiceAccount token"))).To(BeNil())
+		Expect(fatalExportStartupError(nil)).To(BeNil())
 	})
 })

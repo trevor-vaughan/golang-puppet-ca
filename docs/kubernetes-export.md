@@ -115,13 +115,6 @@ such a controller, for an edge serving only the anonymous endpoints (CRL, OCSP,
 health), or for anything else in the cluster that needs the certificate. See
 [Ingress and TLS passthrough](helm-chart.md#ingress).
 
-**Not for the agent-facing hostname.** A controller that terminates TLS strips
-the client certificate, so every mTLS endpoint stops authenticating; the CA has
-to be reached through a passthrough controller. This pair is for SNI routing at
-such a controller, for an edge serving only the anonymous endpoints (CRL, OCSP,
-health), or for anything else in the cluster that needs the certificate. See
-[Ingress and TLS passthrough](helm-chart.md#ingress).
-
 ```yaml
 kubernetes_export:
   targets:
@@ -166,10 +159,16 @@ signal triggers carries the new certificate rather than the one being replaced.
 
 Other replicas lag. The signal is per-process, so a replica that did not mint
 learns of the rotation only when its own maintenance pass refreshes it — up to
-one `maintenance_interval_sec` — and until then any export it runs republishes
-its previous pair. The ten-minute reconcile floor and the next rotation both
-correct it, and `tls_self_provision_revoke_after_sec` (24 hours by default)
-bounds how long a superseded pair stays usable. Keep that delay comfortably
+one `maintenance_interval_sec` — and republishes its previous pair up to one
+reconcile later, so the worst case is the two added together. Because that lag
+is gated by the maintenance pass, the reconcile floor for serving material is
+raised to `maintenance_interval_sec` when it is longer: resyncing faster cannot
+converge sooner and only republishes the stale pair more often.
+
+A pair the CA has *revoked* is never republished — the export refuses it and
+records a failure instead, so revoking after a key compromise is not undone by a
+lagging replica. `tls_self_provision_revoke_after_sec` (24 hours by default)
+bounds how long an ordinary superseded pair stays usable; keep it comfortably
 above `maintenance_interval_sec`.
 
 ### Secret type

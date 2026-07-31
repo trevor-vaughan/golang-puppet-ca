@@ -183,10 +183,10 @@ type CA struct {
 	// certificate has been *installed*, mirroring crlNotify. It exists because
 	// the Kubernetes exporter reconciles on CRLUpdated(), which a
 	// serving-certificate rotation does not fire: without a second channel an
-	// exported serving certificate would sit stale until the next CRL change --
-	// about 24 hours at the default revocation delay, and about 20 days with
-	// revocation disabled. Sent by NotifyServingCertUpdated, consumed via
-	// ServingCertUpdated().
+	// exported serving certificate would not be republished until the exporter's
+	// own periodic reconcile came round. This buys promptness -- seconds rather
+	// than one reconcile interval -- not rescue from an unbounded stall. Sent by
+	// NotifyServingCertUpdated, consumed via ServingCertUpdated().
 	servingNotify chan struct{}
 }
 
@@ -302,10 +302,13 @@ func (c *CA) ServingRevocationFailureCount() uint64 {
 	return c.servingRevocationFailures.Load()
 }
 
-// ServingCertUpdated returns a channel that receives a value each time this
-// process issues a serving certificate. Coalesced the same way CRLUpdated is:
-// buffered to depth 1 and written non-blockingly, so an absent consumer never
-// blocks issuance and a burst collapses to one notification.
+// ServingCertUpdated returns a channel that receives a value each time a caller
+// announces, through NotifyServingCertUpdated, that a newly issued serving
+// certificate is now the one being served. Issuing alone does not send: what a
+// consumer republishes is what the process is presenting, and only the caller
+// knows when that is reachable. Coalesced the same way CRLUpdated is: buffered
+// to depth 1 and written non-blockingly, so an absent consumer never blocks the
+// announcer and a burst collapses to one notification.
 func (c *CA) ServingCertUpdated() <-chan struct{} {
 	return c.servingNotify
 }
