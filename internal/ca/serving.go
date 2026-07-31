@@ -508,15 +508,13 @@ func (c *CA) issueServingCertLocked(ctx context.Context, cfg ServingConfig, carr
 
 	c.servingCertIssued.Add(1)
 
-	// Wake any consumer that republishes the certificate — notably the
-	// Kubernetes exporter, which otherwise reconciles only on CRL updates and
-	// would leave a rotated certificate stale for months. Non-blocking, so an
-	// absent consumer never stalls issuance.
-	select {
-	case c.servingNotify <- struct{}{}:
-	default:
-	}
-
+	// Deliberately no notification here. Consumers republish what the *holder*
+	// carries, and the holder is installed by the caller after this returns --
+	// after recordSuperseded's storage round trip and the lock unwind. Signalling
+	// at mint time woke the exporter into an atomic load it would win every time,
+	// so it published the certificate being replaced, recorded success (no alert,
+	// no retry armed), and the depth-1 channel was drained before the new pair
+	// arrived. See CA.NotifyServingCertUpdated.
 	return &ServingCertificate{CertPEM: certPEM, KeyPEM: keyPEM, Leaf: leaf, Key: key, Issued: true}, nil
 }
 

@@ -277,6 +277,30 @@ false
 {{- end -}}
 
 {{/*
+A config value, resolved through both environment layers.
+
+Call as: include "openvox-ca.effectiveConfig" (dict "ctx" . "key" "hostname" "env" "PUPPET_CA_HOSTNAME")
+
+The preconditions below need this for the same reason tlsConfigured and
+selfProvisionEnabled scan those layers themselves: a chart that refuses a
+configuration the server accepts, or accepts one the server refuses, is worse
+than no precondition. An extraEnv entry using valueFrom is unreadable at render
+time, so it is reported as "set" -- enough for a presence check, and the two
+callers below only ever ask about presence.
+*/}}
+{{- define "openvox-ca.effectiveConfig" -}}
+{{- $config := include "openvox-ca.config" .ctx | fromYaml -}}
+{{- $v := dig .key "" $config -}}
+{{- range $name, $value := .ctx.Values.env -}}
+{{- if eq $name $.env }}{{ $v = $value }}{{ end -}}
+{{- end -}}
+{{- range .ctx.Values.extraEnv -}}
+{{- if eq .name $.env }}{{ $v = "set" }}{{ end -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}
+
+{{/*
 Whether the CA issues its own serving certificate.
 
 Read from the merged config and from both environment layers, for the same
@@ -299,7 +323,11 @@ variable must not get a chart that renders as though TLS were off.
 {{- end -}}
 {{- end -}}
 {{- if kindIs "string" $on -}}
-{{- if or (eq (lower $on) "true") (eq $on "1") -}}true{{- else -}}false{{- end -}}
+{{- if has (lower $on) (list "true" "t" "1") -}}true
+{{- else if has (lower $on) (list "false" "f" "0") -}}false
+{{- else -}}
+{{- fail (printf "PUPPET_CA_TLS_SELF_PROVISION is %q, which the chart cannot read as a boolean. The server parses it with Go's strconv.ParseBool and ignores an unparseable value, keeping the config-file setting -- so the chart would render for one configuration and the server run another. Use true or false." $on) -}}
+{{- end -}}
 {{- else -}}
 {{- ternary "true" "false" (not (not $on)) -}}
 {{- end -}}
@@ -367,8 +395,8 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   mistake rather than an exotic one.
 */}}
 {{- if eq (include "openvox-ca.selfProvisionEnabled" .) "true" -}}
-{{- if not (dig "hostname" "" $config) -}}
-{{- fail "config.tls_self_provision requires config.hostname: it becomes the common name and first subject alternative name of the certificate agents verify. Without it the server refuses to start." -}}
+{{- if not (include "openvox-ca.effectiveConfig" (dict "ctx" . "key" "hostname" "env" "PUPPET_CA_HOSTNAME")) -}}
+{{- fail "config.tls_self_provision requires a hostname: it becomes the common name and first subject alternative name of the certificate agents verify. Without it the server refuses to start. Set config.hostname, or PUPPET_CA_HOSTNAME in .Values.env or .Values.extraEnv." -}}
 {{- end -}}
 
 {{/*
@@ -376,8 +404,10 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   renders both produces a Deployment that cannot start. tls.existingSecret is
   the chart's own wiring for the file route, so it counts as tls_cert here.
 */}}
-{{- if or .Values.tls.existingSecret (dig "tls_cert" "" $config) (dig "tls_key" "" $config) -}}
-{{- fail "config.tls_self_provision cannot be combined with tls.existingSecret or config.tls_cert/tls_key: the CA either issues its own serving certificate or loads one from disk, not both. The server refuses to start with both configured." -}}
+{{- $mxCert := include "openvox-ca.effectiveConfig" (dict "ctx" . "key" "tls_cert" "env" "PUPPET_CA_TLS_CERT") -}}
+{{- $mxKey := include "openvox-ca.effectiveConfig" (dict "ctx" . "key" "tls_key" "env" "PUPPET_CA_TLS_KEY") -}}
+{{- if or .Values.tls.existingSecret $mxCert $mxKey -}}
+{{- fail "config.tls_self_provision cannot be combined with tls.existingSecret or tls_cert/tls_key: the CA either issues its own serving certificate or loads one from disk, not both. The server refuses to start with both configured. This applies however the file route is set -- config, .Values.env or .Values.extraEnv." -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

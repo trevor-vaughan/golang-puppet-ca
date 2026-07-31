@@ -778,23 +778,17 @@ func newRootCmd() *cobra.Command {
 				if err := cfg.KubernetesExport.Validate(); err != nil {
 					return fmt.Errorf("invalid kubernetes_export config: %w", err)
 				}
+				if err := validateServingExport(cfg); err != nil {
+					return err
+				}
 				// Instrument the export only when the Prometheus exporter is
 				// enabled; a nil Metrics disables recording.
 				var k8sMetrics *k8sexport.Metrics
 				if exporter != nil {
 					k8sMetrics = k8sexport.NewMetrics(exporter.Registry())
 				}
-				if cfg.KubernetesExport.WantsServingKey() {
-					// SECURITY: the exported key is always plaintext, because a
-					// kubernetes.io/tls Secret holding an encrypted PEM is
-					// useless to every consumer of one. Say so plainly: with
-					// tls_self_provision_encrypt_key on, the operator has asked
-					// for encryption at rest and is nonetheless publishing the
-					// key in the clear to etcd.
-					slog.Warn("A kubernetes_export target publishes the serving private key. " +
-						"It is written to the Secret in plaintext even when " +
-						"tls_self_provision_encrypt_key is set, because TLS consumers cannot use " +
-						"an encrypted key. Restrict who can read that Secret.")
+				for _, w := range servingExportWarnings(cfg) {
+					slog.Warn(w)
 				}
 				k8sExporter, err := k8sexport.NewInCluster(cfg.KubernetesExport, store, k8sMetrics)
 				if err != nil {
@@ -807,15 +801,10 @@ func newRootCmd() *cobra.Command {
 					// already holds the decrypted signer, so encryption at rest
 					// costs the export path nothing.
 					//
-					// Attached only when self-provisioning is on. Without it the
-					// holder is empty, and leaving the source nil lets
-					// fetchMaterials say why — "serving_cert and serving_key
-					// require tls_self_provision" — rather than reporting a
-					// missing certificate.
-					if cfg.TLSSelfProvision {
-						k8sExporter = k8sExporter.WithServingSource(servingCerts)
-					}
-					go runK8sExporter(ctx, myCA, k8sExporter)
+					// Attached only when self-provisioning is on, which
+					// validateServingExport above has already established is the
+					// only way a serving target can be configured.
+					go runK8sExporter(ctx, myCA, attachServingSource(k8sExporter, cfg, servingCerts))
 				}
 			}
 

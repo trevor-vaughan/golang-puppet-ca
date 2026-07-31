@@ -294,7 +294,7 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'A Kubernetes export target is failing to apply.',
-              description: 'The most recent apply of {{ $labels.kind }}/{{ $labels.name }} in namespace {{ $labels.namespace }} from {{ $labels.instance }} failed; the exported object may hold a stale CA certificate or CRL until the next successful export. Check the CA logs, RBAC, and API server connectivity.',
+              description: 'The most recent apply of {{ $labels.kind }}/{{ $labels.name }} in namespace {{ $labels.namespace }} from {{ $labels.instance }} failed; the exported object may hold a stale CA certificate, CRL, or serving certificate and key until the next successful export. A stale trust bundle is benign for a while; a stale serving pair means whatever terminates against it presents a certificate the CA has superseded and will revoke. Check the CA logs, RBAC, and API server connectivity.',
             },
           },
         ],

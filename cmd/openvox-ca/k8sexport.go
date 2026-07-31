@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -45,20 +46,27 @@ import (
 //
 // It runs in the frontend process, reading the cert/CRL through the storage
 // service. Export failures are logged and swallowed: the export is auxiliary
-// and must never take down the CA. A failed cycle is retried on a bounded
-// backoff rather than waiting for the next wake-up, because the wake-ups are
-// edge-triggered: without a retry, a target that failed once stays stale until
-// something unrelated moves the CRL. It returns when ctx is cancelled.
+// and must never take down the CA. It returns when ctx is cancelled. Retries are
+// on a fixed interval, not a backoff -- see exportRetryInterval.
+//
+// The timer is always armed, at one of two intervals, because both wake-ups are
+// edge-triggered and neither covers everything:
+//
+//   - after a failure, exportRetryInterval, so a target that failed once is not
+//     stale until something unrelated moves the CRL;
+//   - after a success, exportResyncInterval, because a *successful* apply can
+//     still have published stale material. servingNotify is per-process, so a
+//     replica that did not mint never learns of a rotation until its own hourly
+//     maintenance pass refreshes its holder — and any CRL event in that window
+//     has it republish its old pair over the correct one, successfully, with
+//     nothing to alert on. Server-side apply makes the extra cycles idempotent.
 func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter) {
 	slog.Info("Starting Kubernetes export job")
 
 	retry := time.NewTimer(exportRetryInterval)
 	defer retry.Stop()
-	if !exportK8sOnce(ctx, exporter) {
-		retry.Reset(exportRetryInterval)
-	} else {
-		stopTimer(retry)
-	}
+	stopTimer(retry)
+	retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter)))
 
 	for {
 		var reason string
@@ -71,27 +79,37 @@ func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter)
 		case <-c.ServingCertUpdated():
 			reason = "serving certificate rotated"
 		case <-retry.C:
-			reason = "retrying a failed export"
+			reason = "periodic reconcile"
 		}
 
 		slog.Debug("Re-exporting to Kubernetes", "reason", reason)
 		stopTimer(retry)
-		if !exportK8sOnce(ctx, exporter) {
-			// Both wake-ups are edge-triggered, so without this a target that
-			// failed once stays stale until something unrelated moves the CRL.
-			// A fixed interval rather than a backoff: the failures this sees are
-			// API-server or RBAC problems that an operator fixes, the work is
-			// one apply per target, and a predictable retry is easier to reason
-			// about against the alert's own debounce.
-			retry.Reset(exportRetryInterval)
-		}
+		retry.Reset(nextExportInterval(exportK8sOnce(ctx, exporter)))
 	}
+}
+
+// nextExportInterval picks how long to wait before the next unprompted cycle.
+func nextExportInterval(ok bool) time.Duration {
+	if ok {
+		return exportResyncInterval
+	}
+	return exportRetryInterval
 }
 
 // exportRetryInterval is how long to wait before retrying a cycle that had
 // failures. Comfortably inside the alert's 15-minute debounce, so a transient
 // failure is corrected before it pages.
-const exportRetryInterval = 2 * time.Minute
+//
+// A fixed interval rather than a backoff: the failures this sees are API-server
+// or RBAC problems that an operator fixes, the work is one apply per target, and
+// a predictable retry is easier to reason about against that debounce. Both are
+// vars rather than consts so a spec can shorten them.
+var exportRetryInterval = 2 * time.Minute
+
+// exportResyncInterval is the floor for cycles that had no failures — the
+// periodic reconcile every controller needs, since an apply can succeed while
+// publishing material this replica has not yet caught up with.
+var exportResyncInterval = 10 * time.Minute
 
 // stopTimer drains t so a later Reset cannot fire immediately on a stale value.
 func stopTimer(t *time.Timer) {
@@ -113,4 +131,61 @@ func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) bool {
 	}
 	slog.Debug("Kubernetes export cycle complete")
 	return true
+}
+
+// validateServingExport refuses a serving export that can never succeed.
+//
+// serving_cert and serving_key come from the holder the listener presents, and
+// that holder is only ever populated under tls_self_provision. Without it every
+// cycle fails for the life of the process — and, worse, quietly leaves whatever
+// was last published in place: a plaintext CA-chained private key sitting in a
+// Secret that nothing will now refresh or remove.
+//
+// Refused at startup rather than reported per cycle, matching validateTLS: the
+// operator has asked for something the configuration cannot deliver, and the
+// remedy is a config change, not a retry.
+func validateServingExport(cfg *serverConfig) error {
+	if cfg.TLSSelfProvision || !cfg.KubernetesExport.WantsServingMaterial() {
+		return nil
+	}
+	return fmt.Errorf("a kubernetes_export target requests serving_cert or serving_key, but " +
+		"tls_self_provision is off: the serving certificate and key only exist when the CA " +
+		"issues them itself, so every export cycle would fail. Enable tls_self_provision, or " +
+		"remove the serving material from the target")
+}
+
+// servingExportWarnings returns what an operator should be told at startup about
+// a serving export, or nothing when none is configured.
+//
+// Split out of the serve command so a spec can reach it, and gated on
+// tls_self_provision so it cannot warn about publishing a key that this
+// configuration never publishes.
+func servingExportWarnings(cfg *serverConfig) []string {
+	if !cfg.TLSSelfProvision || !cfg.KubernetesExport.WantsServingKey() {
+		return nil
+	}
+	// SECURITY: the exported key is always plaintext, because a
+	// kubernetes.io/tls Secret holding an encrypted PEM is useless to every
+	// consumer of one. Say so plainly: with tls_self_provision_encrypt_key on,
+	// the operator has asked for encryption at rest and is nonetheless
+	// publishing the key in the clear to etcd.
+	return []string{
+		"A kubernetes_export target publishes the serving private key. " +
+			"It is written to the Secret in plaintext even when " +
+			"tls_self_provision_encrypt_key is set, because TLS consumers cannot use " +
+			"an encrypted key. Restrict who can read that Secret.",
+	}
+}
+
+// attachServingSource points the exporter at the holder the listener presents,
+// when there is one to point at.
+//
+// Separated from the serve command so that "the exporter reads the same pair the
+// listener serves" is a proposition a spec can check: inline, pointing it at a
+// different or empty holder compiled and passed.
+func attachServingSource(e *k8sexport.Exporter, cfg *serverConfig, holder *servingCertHolder) *k8sexport.Exporter {
+	if !cfg.TLSSelfProvision {
+		return e
+	}
+	return e.WithServingSource(holder)
 }

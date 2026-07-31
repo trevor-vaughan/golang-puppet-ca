@@ -1261,10 +1261,13 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 })
 
 var _ = Describe("ServingCertUpdated", func() {
-	It("signals a consumer when a certificate is issued, and not when one is reused", func() {
-		// The Kubernetes exporter reconciles on CRL updates, which a serving
-		// rotation does not fire; without this an exported certificate would
-		// sit stale until the next revocation.
+	It("stays silent until the caller announces an installed certificate", func() {
+		// The mint deliberately does not signal. A consumer republishes what the
+		// process is *serving*, and that is installed by the caller after
+		// EnsureServingCert returns -- so a signal from inside the mint announces
+		// a certificate the consumer cannot yet see, and it publishes the one
+		// being replaced instead. Restoring the send to issueServingCertLocked
+		// makes the first assertion here fail.
 		ctx := context.Background()
 		store := storage.New(GinkgoT().TempDir())
 		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
@@ -1274,38 +1277,26 @@ var _ = Describe("ServingCertUpdated", func() {
 		cfg := ca.ServingConfig{Subject: "puppet.example.com"}
 
 		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
-		Eventually(myCA.ServingCertUpdated()).Should(Receive())
+		Consistently(myCA.ServingCertUpdated()).ShouldNot(Receive(),
+			"issuing is not installing; only the caller knows when the pair is reachable")
 
-		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
-		Consistently(myCA.ServingCertUpdated()).ShouldNot(Receive(), "a reuse is not a rotation")
+		myCA.NotifyServingCertUpdated()
+		Eventually(myCA.ServingCertUpdated()).Should(Receive())
 	})
 
-	It("never blocks issuance when nobody is listening", func() {
+	It("never blocks the announcer when nobody is listening", func() {
 		// Buffered to depth 1 and written non-blockingly, so a burst collapses
-		// to one pending notification.
-		ctx := context.Background()
+		// to one pending notification and a rotation is never held up by an
+		// absent consumer. Three sends are what makes this mean anything -- with
+		// one, the buffered send always succeeds and the default arm is never
+		// reached, so removing it would still pass.
 		store := storage.New(GinkgoT().TempDir())
 		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
-		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		Expect(myCA.Init(ctx)).To(Succeed())
 
-		// Each pass is forced by widening the name set, so the stored
-		// certificate no longer covers the configuration. An over-large
-		// RenewBefore would not: servingRenewBefore clamps it, precisely so a
-		// window at or beyond the lifetime cannot make every certificate
-		// permanently due. Three real issuances are what makes this spec mean
-		// anything — with one, the buffered send always succeeds and the
-		// non-blocking default arm is never reached.
-		cfg := ca.ServingConfig{Subject: "puppet.example.com"}
-		for i := 0; i < 3; i++ {
-			cfg.ExtraNames = append(cfg.ExtraNames, fmt.Sprintf("alt%d.example.com", i))
-			Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		for range 3 {
+			myCA.NotifyServingCertUpdated()
 		}
-		Expect(myCA.ServingCertIssued()).To(BeNumerically(">=", 3))
 
-		// Exactly one notification survives the burst, which is the property
-		// the depth-1 buffer exists for.
 		Eventually(myCA.ServingCertUpdated()).Should(Receive())
 		Consistently(myCA.ServingCertUpdated()).ShouldNot(Receive())
 	})

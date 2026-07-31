@@ -1084,6 +1084,15 @@ func (Chart) Test() error {
 			wants: []string{"scheme: HTTPS"},
 		},
 		chartRenderCase{
+			name: "a hostname supplied by environment variable satisfies the precondition",
+			// The other direction of the same bug: the precondition read only
+			// the config file, so it refused an install the server accepts --
+			// PUPPET_CA_HOSTNAME is a supported override, and with extraEnv
+			// (valueFrom) there is no workaround but duplicating the value.
+			sets:  []string{"config.tls_self_provision=true", "env.PUPPET_CA_HOSTNAME=ca.example.com"},
+			wants: []string{"scheme: HTTPS"},
+		},
+		chartRenderCase{
 			name:  "the startup budget covers two lock timeouts",
 			sets:  []string{tls},
 			wants: []string{"failureThreshold: 90"},
@@ -1165,7 +1174,31 @@ func (Chart) Test() error {
 		{
 			name:    "self-provisioning with no hostname to put in the certificate",
 			sets:    []string{"config.tls_self_provision=true"},
-			wantErr: "requires config.hostname",
+			wantErr: "requires a hostname",
+		},
+		{
+			name: "self-provisioning alongside a certificate path set by environment variable",
+			// The env route is supported and the chart's own tlsConfigured
+			// helper reads it, so a precondition that consults only the config
+			// file lets through an install the server refuses at startup --
+			// a crash-loop instead of the install-time failure this exists for.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"env.PUPPET_CA_TLS_CERT=/tls/tls.crt", "env.PUPPET_CA_TLS_KEY=/tls/tls.key",
+			},
+			wantErr: "cannot be combined",
+		},
+		{
+			name: "an environment value the chart cannot read as a boolean",
+			// The server parses this with strconv.ParseBool and keeps the
+			// config-file value when it fails; the chart used to overwrite it
+			// and read anything unrecognised as off, so the two would render and
+			// run different configurations.
+			sets: []string{
+				"config.tls_self_provision=true", "config.hostname=ca.example.com",
+				"env.PUPPET_CA_TLS_SELF_PROVISION=yes",
+			},
+			wantErr: "cannot read as a boolean",
 		},
 		{
 			name:    "self-provisioning alongside the Secret that supplies a certificate",

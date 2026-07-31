@@ -106,6 +106,19 @@ func NewInCluster(cfg Config, src MaterialSource, m *Metrics) (*Exporter, error)
 		}
 		defaultNS = ns
 	}
+	return newChecked(client, cfg, src, defaultNS, m)
+}
+
+// newChecked is NewInCluster's tail, split out because NewInCluster itself needs
+// a real ServiceAccount mount and so cannot be reached from a spec.
+//
+// The duplicate-object check belongs here rather than in Validate: only now is
+// the namespace an omitted target resolves to actually known. See
+// Config.CheckDistinctObjects.
+func newChecked(client kubernetes.Interface, cfg Config, src MaterialSource, defaultNS string, m *Metrics) (*Exporter, error) {
+	if err := cfg.CheckDistinctObjects(defaultNS); err != nil {
+		return nil, err
+	}
 	return New(client, cfg, src, defaultNS, m), nil
 }
 

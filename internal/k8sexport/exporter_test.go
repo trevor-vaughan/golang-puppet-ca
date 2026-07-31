@@ -79,8 +79,9 @@ func (s stubSource) GetCACert(context.Context) ([]byte, error) { return s.cert, 
 func (s stubSource) GetCRL(context.Context) ([]byte, error)    { return s.crl, s.crlErr }
 
 // stubServing is a ServingSource returning fixed PEM bytes. It stands in for
-// the CA, which is the real implementation because the private key must be
-// decrypted before publication and only the CA holds the passphrase.
+// servingCertHolder, the real implementation, which hands over the pair the
+// listener is presenting -- already decrypted, and swapped atomically so the
+// two halves can never straddle a rotation.
 type stubServing struct {
 	cert, key []byte
 	err       error
@@ -539,6 +540,49 @@ var _ = Describe("Material read failures", func() {
 			},
 		}}
 	}
+
+	It("fails only the serving targets when the serving material is unreadable", func() {
+		// The serving arm of the same property. twoTargets configures no serving
+		// material, so widening errs to cert and CRL on a serving read failure
+		// left the suite green -- and that strands the trust bundle every agent
+		// depends on over a transient holder read.
+		cfg := twoTargets()
+		cfg.Targets = append(cfg.Targets, k8sexport.Target{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "wants-serving", Namespace: "ns1"},
+			Type: "kubernetes.io/tls", ServingCert: true, ServingKey: true,
+		})
+		Expect(cfg.Validate()).To(Succeed())
+		src := stubSource{cert: []byte("CA-PEM"), crl: []byte("CRL-PEM")}
+
+		err := k8sexport.New(client, cfg, src, "", nil).
+			WithServingSource(stubServing{err: errors.New("holder empty")}).ExportAll(ctx)
+		Expect(err).To(MatchError(ContainSubstring("holder empty")))
+
+		for _, name := range []string{"wants-cert", "wants-crl"} {
+			_, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, name, metav1.GetOptions{})
+			Expect(getErr).NotTo(HaveOccurred(), name+" must still be published")
+		}
+		_, getErr := client.CoreV1().Secrets("ns1").Get(ctx, "wants-serving", metav1.GetOptions{})
+		Expect(getErr).To(HaveOccurred(), "the serving target must not be applied")
+	})
+
+	It("refuses to publish an empty serving certificate over a good one", func() {
+		// The fourth guard in the block, and the only one with no spec: the
+		// other three (empty CRL, empty cert, empty serving key) have theirs.
+		// Without it a source returning an empty certificate clobbers a working
+		// kubernetes.io/tls Secret with tls.crt: "".
+		cfg := k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "serving", Namespace: "ns1"},
+			Type: "kubernetes.io/tls", ServingCert: true, ServingKey: true,
+		}}}
+		Expect(cfg.Validate()).To(Succeed())
+
+		err := k8sexport.New(client, cfg, stubSource{}, "", nil).
+			WithServingSource(stubServing{cert: nil, key: []byte("KEY-PEM")}).ExportAll(ctx)
+		Expect(err).To(MatchError(ContainSubstring("serving")))
+		_, getErr := client.CoreV1().Secrets("ns1").Get(ctx, "serving", metav1.GetOptions{})
+		Expect(getErr).To(HaveOccurred(), "an empty certificate must not be published")
+	})
 
 	It("fails only the targets that wanted the unreadable material", func() {
 		// The whole cycle used to abort, so recordApply never ran and no

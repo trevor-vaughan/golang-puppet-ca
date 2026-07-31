@@ -179,11 +179,13 @@ type CA struct {
 	// absent consumer never blocks signing. Consume it via CRLUpdated().
 	crlNotify chan struct{}
 
-	// servingNotify carries a coalesced signal each time a serving certificate
-	// is issued, mirroring crlNotify. It exists because the Kubernetes exporter
-	// reconciles on CRLUpdated(), which a serving-certificate rotation does not
-	// fire: without a second channel an exported serving certificate would sit
-	// stale until the next CRL change, potentially months. Consume it via
+	// servingNotify carries a coalesced signal each time a newly issued serving
+	// certificate has been *installed*, mirroring crlNotify. It exists because
+	// the Kubernetes exporter reconciles on CRLUpdated(), which a
+	// serving-certificate rotation does not fire: without a second channel an
+	// exported serving certificate would sit stale until the next CRL change --
+	// about 24 hours at the default revocation delay, and about 20 days with
+	// revocation disabled. Sent by NotifyServingCertUpdated, consumed via
 	// ServingCertUpdated().
 	servingNotify chan struct{}
 }
@@ -200,6 +202,24 @@ func New(s *storage.StorageService, autosignCfg AutosignConfig, hostname string)
 		ocspCache:         make(map[string]ocspCacheEntry),
 		crlNotify:         make(chan struct{}, 1),
 		servingNotify:     make(chan struct{}, 1),
+	}
+}
+
+// NotifyServingCertUpdated announces that a newly issued serving certificate is
+// now the one being served.
+//
+// Deliberately not called from the mint. What a consumer republishes is whatever
+// the process is presenting, and that is installed by the caller after
+// EnsureServingCert returns; signalling from inside the mint announced a
+// certificate that was not yet reachable, so the consumer read and published the
+// one being replaced. The caller owns the ordering, so the caller sends.
+//
+// Non-blocking with a depth-1 buffer: an absent consumer never stalls issuance,
+// and a burst coalesces into one wake-up.
+func (c *CA) NotifyServingCertUpdated() {
+	select {
+	case c.servingNotify <- struct{}{}:
+	default:
 	}
 }
 

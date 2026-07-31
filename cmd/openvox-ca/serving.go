@@ -222,6 +222,10 @@ func ensureServingCert(ctx context.Context, myCA *ca.CA, cfg *serverConfig, hold
 	}
 	holder.Set(pair)
 	if sc.Issued {
+		// After the holder, never before: a consumer woken by this reads the
+		// holder, so announcing the rotation any earlier publishes the
+		// certificate being replaced.
+		myCA.NotifyServingCertUpdated()
 		slog.Info("Serving certificate issued",
 			"subject", sc.Leaf.Subject.CommonName,
 			"serial", sc.Leaf.SerialNumber.Text(16),

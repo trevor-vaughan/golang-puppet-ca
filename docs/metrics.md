@@ -189,7 +189,9 @@ configured target (cardinality is bounded by the configuration).
 >
 > A material that cannot be read from storage fails only the targets that
 > requested it, and each of those records an error here — so the alert fires on
-> exactly the targets that went stale. A failed cycle is also retried on a
+> exactly the targets that were attempted. A Kubernetes client that fails to
+> initialise disables the exporter entirely and writes no series at all, which
+> is visible only in the log. A failed cycle is also retried on a
 > bounded interval rather than waiting for the next wake-up.
 
 ## Example queries

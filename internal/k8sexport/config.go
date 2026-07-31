@@ -114,7 +114,7 @@ type Target struct {
 }
 
 // wantsServingKey reports whether any target publishes the serving private key.
-// Used at startup to warn that an encrypted key is decrypted before publishing.
+// Used at startup to warn that it reaches the Secret in plaintext.
 func (c *Config) wantsServingKey() bool {
 	for i := range c.Targets {
 		if c.Targets[i].ServingKey {
@@ -126,6 +126,21 @@ func (c *Config) wantsServingKey() bool {
 
 // WantsServingKey reports whether any target publishes the serving private key.
 func (c *Config) WantsServingKey() bool { return c != nil && c.wantsServingKey() }
+
+// WantsServingMaterial reports whether any target publishes either half of the
+// serving pair. Both halves come from the holder the listener presents, so both
+// require tls_self_provision.
+func (c *Config) WantsServingMaterial() bool {
+	if c == nil {
+		return false
+	}
+	for i := range c.Targets {
+		if c.Targets[i].ServingCert || c.Targets[i].ServingKey {
+			return true
+		}
+	}
+	return false
+}
 
 // Enabled reports whether any export target is configured.
 func (c *Config) Enabled() bool {
@@ -151,6 +166,13 @@ func (c *Config) Validate() error {
 		// is an easy mistake to make from the "use two targets" advice for
 		// keeping the private key out of a widely-read Secret — that advice
 		// means two *different* Secrets.
+		// Keyed on the namespace as written. An omitted namespace resolves at
+		// runtime to the pod's own, which Validate cannot see -- so this catches
+		// only collisions that are already textually identical, and
+		// CheckDistinctObjects repeats it against the resolved namespace once
+		// the exporter knows it. Both are needed: this one fails at startup with
+		// a config-file line number, that one covers the case where "" and an
+		// explicit namespace name the same object.
 		t := &c.Targets[i]
 		id := t.Kind + "/" + t.Metadata.Namespace + "/" + t.Metadata.Name
 		if first, dup := seen[id]; dup {
@@ -158,6 +180,37 @@ func (c *Config) Validate() error {
 				"each apply replaces the other's data, so they would overwrite each other on every "+
 				"export. Merge them into one target, or give them different names",
 				first, i, t.Kind, t.Metadata.Name, t.Metadata.Namespace)
+		}
+		seen[id] = i
+	}
+	return nil
+}
+
+// CheckDistinctObjects repeats the duplicate-target check against the namespace
+// each target actually resolves to.
+//
+// Validate runs before the pod's namespace is known, so it compares namespaces
+// as written: a target with no namespace and one naming the pod's own namespace
+// explicitly look different there and collide here. Both applies then succeed
+// and record success, so nothing alerts -- the object simply loses whichever
+// fields the other target does not set, on every cycle. A trust bundle sharing
+// an object with a serving-key target that way would carry the private key to
+// every workload mounting it, which is what the per-target refusals exist to
+// stop.
+func (c *Config) CheckDistinctObjects(defaultNS string) error {
+	seen := map[string]int{}
+	for i := range c.Targets {
+		t := &c.Targets[i]
+		ns := t.Metadata.Namespace
+		if ns == "" {
+			ns = defaultNS
+		}
+		id := t.Kind + "/" + ns + "/" + t.Metadata.Name
+		if first, dup := seen[id]; dup {
+			return fmt.Errorf("kubernetes_export targets %d and %d both resolve to %s %q in "+
+				"namespace %q: each apply replaces the other's data, so they would overwrite each "+
+				"other on every export. Merge them into one target, or give them different names",
+				first, i, t.Kind, t.Metadata.Name, ns)
 		}
 		seen[id] = i
 	}

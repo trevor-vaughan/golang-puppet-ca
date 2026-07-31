@@ -108,6 +108,20 @@ the CA issues its own serving certificate. Exporting it produces a
 is why these two default to `tls.crt` and `tls.key` rather than the
 trust-bundle convention the other materials use.
 
+**Not for the agent-facing hostname.** A controller that terminates TLS strips
+the client certificate, so every mTLS endpoint stops authenticating; the CA has
+to be reached through a passthrough controller. This pair is for SNI routing at
+such a controller, for an edge serving only the anonymous endpoints (CRL, OCSP,
+health), or for anything else in the cluster that needs the certificate. See
+[Ingress and TLS passthrough](helm-chart.md#ingress).
+
+**Not for the agent-facing hostname.** A controller that terminates TLS strips
+the client certificate, so every mTLS endpoint stops authenticating; the CA has
+to be reached through a passthrough controller. This pair is for SNI routing at
+such a controller, for an edge serving only the anonymous endpoints (CRL, OCSP,
+health), or for anything else in the cluster that needs the certificate. See
+[Ingress and TLS passthrough](helm-chart.md#ingress).
+
 ```yaml
 kubernetes_export:
   targets:
@@ -133,7 +147,9 @@ Two rules apply to `serving_key`, both about blast radius:
 - **It cannot share a target with `cert` or `crl`.** A Secret holding `ca.crt`
   is public trust material and gets mounted across the cluster; letting it
   quietly acquire a `tls.key` entry would extend the serving key's reach to
-  every workload that reads it. Two targets cost nothing. The serving
+  every workload that reads it. Two targets cost nothing — but give them different
+*names* as well: two targets naming the same object overwrite each other on
+every cycle, and the server refuses that at startup. The serving
   *certificate* is public and may share a target with anything.
 
 **The exported key is always plaintext**, even when
@@ -144,9 +160,17 @@ consumer of one: it would look correct and fail at the first handshake. That is 
 The server logs a warning at startup whenever a `serving_key` target is
 configured. Restrict who can read that Secret.
 
-A rotated serving certificate is re-exported immediately: the exporter wakes on
-certificate rotation as well as on CRL updates, so a Secret never lags behind
-the certificate the CA is actually serving.
+A rotated serving certificate is re-exported immediately by the replica that
+rotated it: it installs the new pair and *then* signals, so the export that
+signal triggers carries the new certificate rather than the one being replaced.
+
+Other replicas lag. The signal is per-process, so a replica that did not mint
+learns of the rotation only when its own maintenance pass refreshes it — up to
+one `maintenance_interval_sec` — and until then any export it runs republishes
+its previous pair. The ten-minute reconcile floor and the next rotation both
+correct it, and `tls_self_provision_revoke_after_sec` (24 hours by default)
+bounds how long a superseded pair stays usable. Keep that delay comfortably
+above `maintenance_interval_sec`.
 
 ### Secret type
 
@@ -158,8 +182,8 @@ for example a `kubernetes.io/tls` Secret whose `tls.crt`/`tls.key` are pushed by
 Flux — by applying only the CRL (or cert) into a data key of its own and leaving
 the type, and the other manager's keys, alone. Do not set `type:
 kubernetes.io/tls` on a target that only carries the CA cert/CRL: such a Secret
-must also contain `tls.crt` and `tls.key`, so the API server would reject the
-apply.
+must also contain `tls.crt` and `tls.key`, so the server refuses to start rather
+than letting the apply fail.
 
 Secret data is written under `data` (base64-encoded by the client), and
 ConfigMap data as plain text under `data`. Using `data` rather than the
@@ -182,7 +206,14 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets", "configmaps"]
-    verbs: ["create", "patch"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["patch"]
+    # Named, so this cannot patch any other workload's Secret — which matters
+    # more now the CA publishes a private key. The chart does the same.
+    # `create` cannot be narrowed this way: at admission the object has no name.
+    resourceNames: ["openvox-ca-trust", "openvox-ca-serving"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -209,10 +240,15 @@ resources to the minimum above.
   (e.g. openvox-ca is not running in a cluster, or the namespace cannot be
   resolved), the error is logged and the CA continues serving normally.
 - A failure applying one target is logged and does not prevent the other targets
-  from being applied. Transient failures are retried on the next CRL update, or
-  on the next restart.
+  from being applied. A cycle with failures is retried after two minutes, and
+  cycles run on a ten-minute floor even when nothing has changed — a successful
+  apply can still have published material this replica had not caught up with.
 - Configuration is validated at startup; an invalid `kubernetes_export` block
-  (bad `kind`, a `type` on a ConfigMap, neither `cert` nor `crl`, colliding
+  (bad `kind`, a `type` on a ConfigMap, none of `cert`, `crl`, `serving_cert` or
+  `serving_key`, two targets naming the same object, `serving_key` on a
+  ConfigMap or sharing a target with `cert`/`crl`, `kubernetes.io/tls` without
+  both serving materials, a serving target without `tls_self_provision`,
+  colliding
   keys, …) stops the server with a clear error.
 
 ## Metrics

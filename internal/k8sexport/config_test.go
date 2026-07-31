@@ -195,3 +195,42 @@ var _ = Describe("Config", func() {
 		})
 	})
 })
+
+var _ = Describe("Config.CheckDistinctObjects", func() {
+	// Validate cannot see this collision: it runs before the pod's namespace is
+	// known, so it compares namespaces as written. A target with none and one
+	// naming the pod's own namespace explicitly look different there and resolve
+	// to the same object at runtime -- and both applies then *succeed*, so
+	// nothing alerts while the object loses whatever fields the other target
+	// does not set, every cycle.
+	sameName := func(nsA, nsB string) k8sexport.Config {
+		return k8sexport.Config{Targets: []k8sexport.Target{
+			{
+				Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: nsA},
+				Cert: true,
+			},
+			{
+				Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: nsB},
+				CRL: true,
+			},
+		}}
+	}
+
+	It("refuses an omitted namespace that resolves onto an explicit one", func() {
+		cfg := sameName("", "ns1")
+		Expect(cfg.Validate()).To(Succeed(), "Validate cannot know what the empty one resolves to")
+		Expect(cfg.CheckDistinctObjects("ns1")).To(MatchError(ContainSubstring("both resolve to")))
+	})
+
+	It("refuses it in the other order too", func() {
+		cfg := sameName("ns1", "")
+		Expect(cfg.CheckDistinctObjects("ns1")).To(HaveOccurred())
+	})
+
+	It("allows the same name when the namespaces genuinely differ", func() {
+		a := sameName("", "ns2")
+		Expect(a.CheckDistinctObjects("ns1")).To(Succeed())
+		b := sameName("ns1", "ns2")
+		Expect(b.CheckDistinctObjects("ns1")).To(Succeed())
+	})
+})

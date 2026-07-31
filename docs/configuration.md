@@ -393,6 +393,12 @@ exists to retire.
 There is no command to delete the stored blobs; remove them with your backend's
 own tooling if you want them gone.
 
+**If you exported the serving material to Kubernetes, delete that Secret too.**
+Nothing removes it, and a published `tls.key` is a plaintext CA-chained private
+key that outlives the feature. Remove the `serving_cert`/`serving_key` target
+from `kubernetes_export` first — the server refuses to start with one configured
+while `tls_self_provision` is off — then `kubectl delete secret <name>`.
+
 Related: rotating `ca_key_passphrase_file` across a rolling update leaves
 replicas briefly unable to decrypt each other's stored key, so each reissues its
 own until every replica is on the new passphrase. That churn is harmless — the
@@ -409,8 +415,9 @@ each replica would encrypt under a different one and none could read the shared
 key after a restart.
 
 > **A `serving_key` export target undoes this.** A TLS consumer cannot use an
-> encrypted PEM, so the export decrypts the key and writes it to the Secret in
-> plaintext. Encryption at rest then protects the copy in your storage backend
+> encrypted PEM, so the key reaches the Secret in plaintext: the exporter
+> publishes the key the listener is already using, which the CA decrypted when
+> it loaded it. Encryption at rest then protects the copy in your storage backend
 > and not the copy in etcd. Under `ca_key_provider: openbao` that exported key
 > is the only CA-chained private key in the cluster. Export `serving_cert`
 > alone unless something genuinely needs the key, and restrict who can read
