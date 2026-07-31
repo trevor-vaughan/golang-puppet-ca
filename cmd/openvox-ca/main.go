@@ -591,23 +591,8 @@ func newRootCmd() *cobra.Command {
 				return fmt.Errorf("failed to initialise CA: %w", err)
 			}
 
-			// Reconcile pending serving-certificate revocations before the
-			// listener opens, and deliberately without regard to whether
-			// tls_self_provision is on.
-			//
-			// Startup is the only moment a process reliably observes a
-			// configuration change, and with self-provisioning switched off no
-			// periodic task runs at all — so entries a previous configuration
-			// recorded would otherwise sit in storage indefinitely and fire much
-			// later if the delay were re-enabled. A failure here is logged and
-			// not fatal: it is bookkeeping, and the CA can still serve.
-			//
-			// Skipped only when there is no hostname to reconcile under.
-			// ReconcileSuperseded rejects an empty subject, and hostname is
-			// optional whenever self-provisioning is off — so without this
-			// guard every such deployment warns on every boot about a feature
-			// it has never used, which is how operators learn to stop reading
-			// boot logs.
+			// Before the listener opens, and deliberately ungated on
+			// tls_self_provision. See reconcileAtStartup for why.
 			reconcileAtStartup(ctx, myCA, cfg)
 
 			// SECURITY: Warn if any private key files have overly permissive modes.
@@ -633,14 +618,14 @@ func newRootCmd() *cobra.Command {
 
 			// Wire mTLS auth middleware when TLS is configured. Leaving
 			// srv.AuthConfig nil disables the authorisation middleware for every
-			// route, so this branch and cfg.tlsEnabled() must never disagree.
-			if tlsConfigured {
-				authCfg, err := buildAuthConfig(cfg, myCA)
-				if err != nil {
-					return err
-				}
-				srv.AuthConfig = authCfg
+			// route, so the decision is taken by serverAuthConfig against
+			// cfg.tlsEnabled() rather than by a second condition here that could
+			// drift from it.
+			authCfg, err := serverAuthConfig(cfg, myCA)
+			if err != nil {
+				return err
 			}
+			srv.AuthConfig = authCfg
 
 			addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 			slog.Info("Listening", "address", addr)
@@ -742,12 +727,11 @@ func newRootCmd() *cobra.Command {
 
 				if cfg.TLSSelfProvision {
 					slog.Info("TLS enabled", "certificate", "self-provisioned", "subject", cfg.Hostname)
-					maintenanceTasks = append(maintenanceTasks,
-						servingRenewalTask(myCA, cfg, servingCerts),
-						supersededRevocationTask(myCA, cfg))
 				} else {
 					slog.Info("TLS enabled", "cert", cfg.TLSCert)
 				}
+				maintenanceTasks = append(maintenanceTasks,
+					servingMaintenanceTasks(myCA, cfg, servingCerts)...)
 			}
 
 			// Background CRL refresh: keeps the CRL's NextUpdate from lapsing on a

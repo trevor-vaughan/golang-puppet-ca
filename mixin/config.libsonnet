@@ -56,9 +56,17 @@
     servingRevocationWindow: '1h',
     servingRevocationFor: '15m',
 
+    // Where the alert sends a paged responder. The cases differ in what can be
+    // recovered and how, which is more than an annotation should carry -- and
+    // keeping it here means one place to correct rather than two.
+    servingRevocationRunbook:
+      'https://github.com/voxpupuli/openvox-ca/blob/main/docs/metrics.md#superseded-serving-certificates',
+
     // Sustained reissue churn. One reissue per renewal period is normal; more
     // than a handful in six hours means replicas are minting over each other.
     //
+    // Stated for operators in mixin/README.md, which is where anyone overriding
+    // these will look; keep the two in step.
     // All three windows above are calibrated to the CA's maintenance_interval_sec,
     // which defaults to 1h and is operator-configurable. Raise them in step if
     // you raise that: the two 1h windows are knife-edge at the default (a

@@ -265,9 +265,12 @@ validity falls below `tls_self_provision_renew_before_sec` — by default a thir
 of the leaf validity. Zero *or negative* takes that default (unlike
 `tls_self_provision_revoke_after_sec`, where `-1` and `0` mean different
 things), and a value at or beyond the leaf validity is refused at startup. The
-window is also capped at half the certificate's effective lifetime — which
-shrinks as the CA certificate ages, since no leaf outlives its issuer — so a
-configured window larger than that yields renewal at half-life instead. Rotation takes effect on the next TLS handshake; no
+window is also clamped: a certificate's effective lifetime shrinks as the CA
+certificate ages, since no leaf outlives its issuer, so a window that was
+comfortably inside the configured validity can grow to exceed the real one. When
+it reaches or passes that, the CA renews at half-life instead of reissuing on
+every pass. Below that it is used exactly as configured — so a window close to
+the effective lifetime still means renewing very soon after each issuance. Rotation takes effect on the next TLS handshake; no
 restart, and established connections are unaffected.
 
 A certificate is also reissued when it stops being usable for any other reason:
@@ -292,9 +295,16 @@ openvox-ca-ctl revoke --certname openvox-ca.example.com
 > delay `tls_self_provision_revoke_after_sec` exists to give. Every client that
 > checks revocation fails its handshake against the CA until the next
 > maintenance pass mints the replacement — up to one `maintenance_interval_sec`,
-> an hour at the defaults. For anything that is not urgent, a rolling restart
-> reissues without the gap, because startup resolves the certificate too. The
-> same cost applies wherever this command appears below.
+> an hour at the defaults.
+>
+> Rolling the fleet immediately after the revoke shortens that gap, because
+> startup resolves the certificate too, so each replica mints as it comes back
+> instead of waiting for its next tick. It is not an alternative to revoking: a
+> restart alone reissues nothing, since a certificate that still parses,
+> verifies and covers the configured names is reused.
+>
+> The same cost applies under *Replacing a compromised serving key* below. It
+> does not apply under *Turning it off*, where the switch-over happens first.
 
 A *rename* — adding one name and removing another in the same edit — briefly
 carries both while the fleet disagrees, and settles on the union until every
@@ -318,8 +328,8 @@ openvox-ca-ctl revoke --certname openvox-ca.example.com
 
 Revocation is one of the reuse conditions, so the next maintenance pass issues a
 replacement. The exposure is one maintenance interval — and so is the outage:
-see the warning under [Renewal](#renewal). For a compromised key that is the
-right trade; for anything less urgent, prefer the rolling restart.
+see the warning under [Renewal](#renewal). Roll the fleet straight after the
+revoke to shorten it.
 
 ### Superseded certificates
 
@@ -365,6 +375,14 @@ certificate:
 1. Switch to `tls_cert`/`tls_key` and restart.
 2. *Then* revoke it — `openvox-ca-ctl revoke --certname <hostname>` — so the
    credential is dead even though the blobs remain.
+
+Step 2 assumes the replacement certificate was **not** issued by this CA under
+the same name. `revoke --certname` resolves to the newest serial for that
+subject, so if you replaced the self-provisioned certificate with one this CA
+issued for the same hostname, it would revoke the replacement and leave the
+self-provisioned one valid — both the outage and the retained credential. There
+is no by-serial revoke ([#177](https://github.com/voxpupuli/openvox-ca/issues/177)),
+so take the replacement from a different issuer, or give it a different name.
 
 The order matters. While `tls_self_provision` is still on, revocation is a
 *reuse* condition, not a retirement: the next maintenance pass sees the

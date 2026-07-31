@@ -16,6 +16,7 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | `mage build:all` | Build `openvox-ca` and `openvox-ca-ctl` binaries |
 | `mage test:unit` | Run the unit suite (all packages, coverage to `coverage.out`) |
 | `mage dev:lint` | Run `golangci-lint` (gate; see `.golangci.yml`) |
+| `mage dev:mixin` | Render the Prometheus mixin and check the rules with `promtool` (gate; skips when the tools are absent) |
 | `mage test:backendsPostgres` | SQL backend integration suite against PostgreSQL |
 | `mage test:backendsMySQL` | SQL backend integration suite against MySQL |
 | `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd) |

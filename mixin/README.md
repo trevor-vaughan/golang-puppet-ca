@@ -19,9 +19,11 @@ alerting rules for the openvox-ca exporter. It alerts on:
   agent handshake fails at once. *Revocation failing*: a superseded certificate was
   not revoked, so it stays a valid credential past the bound
   `tls_self_provision_revoke_after_sec` is meant to enforce. The log line
-  distinguishes the cases: a failed sweep or a failed single revocation retries
-  and clears itself; a mint that could not read or write down what it replaced
-  never scheduled that serial at all and needs revoking by hand. *Churning*: replicas reissuing over each other, which grows
+  distinguishes the cases: a failed sweep or a failed single revocation retries,
+  so a firing alert means the retries are not clearing it; a mint that could not
+  read or write down what it replaced never scheduled that serial at all, and
+  since there is no by-serial revoke it cannot be retired — see
+  [the metric's notes](../docs/metrics.md#self-provisioned-serving-certificate). *Churning*: replicas reissuing over each other, which grows
   the inventory and the CRL for no reason.
 - **Kubernetes export** targets whose applies keep failing (only when the
   [Kubernetes export](../docs/kubernetes-export.md) feature is in use).

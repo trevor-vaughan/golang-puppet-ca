@@ -74,11 +74,11 @@ Like `--encrypt-ca-key`, the setting is read when a key is written, and the
 serving key is only ever rewritten by a reissue. Turning it on and restarting
 therefore changes nothing: the existing plaintext key parses fine, the
 certificate is still usable, and it is reused. On default settings the next
-reissue is a third of the leaf validity away — years. To apply it now, force a
-reissue by revoking the serving certificate, and read
-[Turning it off](configuration.md#turning-it-off) first: doing that on a live
-CA interrupts every client that checks revocation until the next maintenance
-pass mints the replacement.
+reissue is up to two thirds of the leaf validity away — years. To apply it now, force a
+reissue by revoking the serving certificate, and read the
+warning under [Renewal](configuration.md#renewal) first: doing that on a live CA
+interrupts every client that checks revocation until the next maintenance pass
+mints the replacement.
 
 Two things are worth stating plainly:
 

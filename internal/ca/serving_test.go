@@ -495,6 +495,57 @@ var _ = Describe("Superseded serving certificates", func() {
 		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
 	})
 
+	It("keeps the entries a corrupt list still yields", func() {
+		// encoding/json fills the slice as it decodes, so a blob with one bad
+		// field still names real, revocable serials before it. Discarding them
+		// and writing nil made those permanently unrevokable -- and hand-editing
+		// this blob is a realistic thing to do precisely because there is no
+		// by-serial revoke.
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		good := fmt.Sprintf("%X", issued.Leaf.SerialNumber)
+
+		partial := fmt.Sprintf(
+			`[{"serial":%q,"revoke_at":"2020-01-01T00:00:00Z"},`+
+				`{"serial":"CD","revoke_at":"soon"}]`, good)
+		Expect(store.SaveServingSuperseded(ctx, []byte(partial))).To(Succeed())
+
+		Expect(myCA.ReconcileSuperseded(ctx, revokeCfg(subject, time.Hour))).To(Succeed())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, issued.Leaf.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue(),
+			"a serial that decoded before the corruption is still revocable")
+	})
+
+	It("schedules a revocation even when the pending list is corrupt", func() {
+		// The mint path's half: recordSuperseded discards the corrupt flag on
+		// purpose, because appending to what decoded and writing is the
+		// overwrite those bytes need. Refusing instead would leave the
+		// certificate it just replaced with nothing scheduling its revocation,
+		// on top of whatever the corrupt bytes already lost.
+		Expect(store.SaveServingSuperseded(ctx, []byte("{not json"))).To(Succeed())
+
+		first, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		cfg.ExtraNames = []string{"alt.example.com"}
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		pending, err := store.GetServingSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(pending)).To(ContainSubstring(fmt.Sprintf("%X", first.Leaf.SerialNumber)),
+			"the replaced certificate must still be scheduled for revocation")
+	})
+
+	It("requires a subject", func() {
+		// The twin of EnsureServingCert's own guard. Without it an empty subject
+		// takes the lock named "subject:", finds nothing pending and returns
+		// nil -- so the caller-side guard in reconcileAtStartup would be the
+		// only thing standing between a misconfiguration and a silent no-op.
+		Expect(myCA.ReconcileSuperseded(ctx, ca.ServingConfig{})).To(
+			MatchError(ContainSubstring("subject is required")))
+	})
+
 	It("survives an unparseable list rather than refusing to serve", func() {
 		// Worst case is a superseded certificate staying valid until it
 		// expires; failing closed would take the listener down instead.
@@ -913,6 +964,30 @@ var _ = Describe("Serving certificate read failures", func() {
 		Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
 	})
 
+	DescribeTable("refuses to report a mint whose material it could not store",
+		// Discarding either error left EnsureServingCert returning Issued: true
+		// for a certificate whose key or body was never persisted -- so the
+		// process serves normally, every restart mints again, and the only
+		// symptom is a rising issuance counter.
+		func(failKey string) {
+			blind := ca.New(storage.NewWithBackend(
+				&failWriteBackend{Backend: base, failKey: failKey}, dir),
+				ca.AutosignConfig{Mode: "off"}, subject)
+			blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(blind.Init(ctx)).To(Succeed())
+
+			before := blind.ServingCertIssued()
+			_, err := blind.EnsureServingCert(ctx,
+				ca.ServingConfig{Subject: subject, ExtraNames: []string{"alt.example.com"}})
+			Expect(err).To(HaveOccurred())
+			Expect(blind.ServingCertIssued()).To(Equal(before),
+				"a mint that could not be stored must not be counted as issued")
+		},
+		Entry("the key", storage.KeyServingKey),
+		Entry("the certificate", storage.KeyServingCert),
+	)
+
 	DescribeTable("keeps the backend's error text out of the supersession errors",
 		// A security property, and the one round 7 fixed with nothing behind
 		// it: reverting either arm to fmt.Errorf("...: %w", err) puts the text
@@ -944,19 +1019,26 @@ var _ = Describe("Serving certificate read failures", func() {
 		}),
 	)
 
-	It("does not count a revocation failure for bytes that do not parse", func() {
+	DescribeTable("does not count a revocation failure for bytes that do not parse",
 		// Those are not a credential in circulation, so counting them would
 		// fire an alert telling the operator a replaced certificate is still
-		// valid when none exists.
-		good := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, subject)
-		good.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		good.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		Expect(good.Init(ctx)).To(Succeed())
-		Expect(storage.New(dir).SaveServingCert(ctx, []byte("not a certificate\n"))).To(Succeed())
+		// valid when none exists. The policy comment covers both parse arms;
+		// only the first had a spec, so adding the increment to the second
+		// passed.
+		func(stored []byte) {
+			good := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, subject)
+			good.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			good.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(good.Init(ctx)).To(Succeed())
+			Expect(storage.New(dir).SaveServingCert(ctx, stored)).To(Succeed())
 
-		good.StoredServingLeafForTest(ctx)
-		Expect(good.ServingRevocationFailureCount()).To(BeZero())
-	})
+			good.StoredServingLeafForTest(ctx)
+			Expect(good.ServingRevocationFailureCount()).To(BeZero())
+		},
+		Entry("not PEM at all", []byte("not a certificate\n")),
+		Entry("a PEM block that is not a certificate",
+			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("this is not DER")})),
+	)
 
 	DescribeTable("surfaces the failure instead of minting over the stored certificate",
 		func(failKey, wantReason string) {

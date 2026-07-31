@@ -64,6 +64,44 @@ var _ = Describe("serverConfig.tlsEnabled", func() {
 	})
 })
 
+var _ = Describe("serverAuthConfig", func() {
+	// The gate that decides whether the authorisation middleware exists at all.
+	// It lived as a second condition beside cfg.tlsEnabled() inside RunE, which
+	// no spec can execute, so reverting it to the old tls_cert/tls_key test left
+	// AuthConfig nil under self-provisioning -- every route unauthenticated over
+	// TLS -- with the whole suite green.
+	var myCA *ca.CA
+
+	BeforeEach(func() {
+		store := storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(context.Background())).To(Succeed())
+	})
+
+	It("authorises a self-provisioned listener, which sets no cert or key", func() {
+		authCfg, err := serverAuthConfig(
+			&serverConfig{TLSSelfProvision: true, Hostname: "puppet.example.com"}, myCA)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(authCfg).NotTo(BeNil(),
+			"a nil AuthConfig disables authorisation for every route")
+	})
+
+	It("authorises a manually configured listener", func() {
+		authCfg, err := serverAuthConfig(&serverConfig{TLSCert: "c.pem", TLSKey: "k.pem"}, myCA)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(authCfg).NotTo(BeNil())
+	})
+
+	It("leaves it nil when TLS is off", func() {
+		// The precision half: there is no mTLS identity to authorise against
+		// without TLS, so this must not manufacture one.
+		authCfg, err := serverAuthConfig(&serverConfig{}, myCA)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(authCfg).To(BeNil())
+	})
+})
+
 var _ = Describe("buildAuthConfig", func() {
 	var (
 		myCA *ca.CA
@@ -138,6 +176,33 @@ var _ = Describe("serverConfig.validateTLS", func() {
 		// Everything below is scoped to self-provision; the file route keeps
 		// its long-standing behaviour of accepting whatever it is given.
 		Expect((&serverConfig{TLSCert: "c.pem"}).validateTLS()).To(Succeed())
+	})
+
+	It("rejects a SQL pool too small for the sweep's nested locks", func() {
+		// PostgreSQL and MySQL pin a pooled connection per held lock, and this
+		// feature adds a third nested one. Three was a working value before it;
+		// with the feature on the sweep blocks in the pool until lockTimeout
+		// expires, on every pass, reporting a failure indistinguishable from a
+		// backend outage. Rejected at startup like every other bound here.
+		cfg.StorageBackend = "postgres"
+		cfg.SQLMaxOpenConns = 3
+		Expect(cfg.validateTLS()).To(MatchError(ContainSubstring("sql_max_open_conns")))
+	})
+
+	It("accepts an unlimited SQL pool, and one at the floor", func() {
+		cfg.StorageBackend = "postgres"
+		cfg.SQLMaxOpenConns = 0
+		Expect(cfg.validateTLS()).To(Succeed(), "0 means unlimited")
+		cfg.SQLMaxOpenConns = 4
+		Expect(cfg.validateTLS()).To(Succeed())
+	})
+
+	It("does not impose the floor on backends whose locks pin no connection", func() {
+		// SQLite has no distributed locking at all and falls back to
+		// process-local mutexes, so the nesting costs it nothing.
+		cfg.StorageBackend = "sqlite"
+		cfg.SQLMaxOpenConns = 1
+		Expect(cfg.validateTLS()).To(Succeed())
 	})
 
 	It("rejects a hostname that is also a puppet_server CN", func() {

@@ -393,7 +393,37 @@ func (c *serverConfig) validateTLS() error {
 		}
 	}
 
+	// PostgreSQL and MySQL scope their locks to a session, so each held lock
+	// pins one pooled connection for its whole critical section. This feature
+	// adds a third nested lock -- the superseded sweep holds serving, subject
+	// and CRL at once -- and then needs a fourth connection for the work inside,
+	// where nothing else in the CA nests deeper than two.
+	//
+	// Rejected rather than warned about, because the symptom is
+	// indistinguishable from a backend outage: the sweep blocks in the pool
+	// until lockTimeout expires, on every pass, and reports a failure that looks
+	// transient and never clears. Three was a working value before this feature;
+	// an operator who set it has no reason to revisit it.
+	if isSessionLockedSQL(c.StorageBackend) && c.SQLMaxOpenConns > 0 && c.SQLMaxOpenConns < servingSQLConnFloor {
+		return fmt.Errorf("sql_max_open_conns (%d) is below the floor of %d that tls_self_provision needs "+
+			"on %s: the superseded-certificate sweep holds three nested locks, each pinning a pooled "+
+			"connection, and needs a fourth for its own work -- set it to 0 (unlimited) or to at least %d",
+			c.SQLMaxOpenConns, servingSQLConnFloor, c.StorageBackend, servingSQLConnFloor)
+	}
+
 	return nil
+}
+
+// servingSQLConnFloor is the smallest sql_max_open_conns that lets the
+// superseded-certificate sweep complete: three nested locks, each pinning a
+// connection, plus one for the CRL read-modify-write inside them.
+const servingSQLConnFloor = 4
+
+// isSessionLockedSQL reports whether a backend takes its distributed locks on a
+// dedicated pooled connection. SQLite does not -- it has no distributed locking
+// and falls back to process-local mutexes, which pin nothing.
+func isSessionLockedSQL(backend string) bool {
+	return backend == "postgres" || backend == "mysql" || backend == "mariadb"
 }
 
 // leafValidity resolves the configured leaf lifetime, mirroring the CA's own

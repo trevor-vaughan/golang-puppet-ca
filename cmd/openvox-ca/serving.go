@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/voxpupuli/openvox-ca/internal/api"
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 )
 
@@ -95,6 +96,40 @@ func toTLSCertificate(sc *ca.ServingCertificate) (*tls.Certificate, error) {
 		PrivateKey:  sc.Key,
 		Leaf:        sc.Leaf,
 	}, nil
+}
+
+// serverAuthConfig returns the mTLS authorisation configuration for the server,
+// or nil when TLS is off.
+//
+// A nil AuthConfig disables the authorisation middleware for every route, so
+// this must answer "configured" for exactly the topologies that terminate TLS
+// -- including tls_self_provision, where no tls_cert/tls_key pair is set. That
+// is what cfg.tlsEnabled() already decides, and routing the decision through
+// here keeps it a single expression: a second condition at the call site is how
+// a listener ends up on TLS with every endpoint unauthenticated.
+func serverAuthConfig(cfg *serverConfig, myCA *ca.CA) (*api.AuthConfig, error) {
+	if !cfg.tlsEnabled() {
+		return nil, nil
+	}
+	return buildAuthConfig(cfg, myCA)
+}
+
+// servingMaintenanceTasks returns the background tasks tls_self_provision
+// needs, and none at all when it is off.
+//
+// Collected here rather than appended inside the serve command so that "the
+// feature is on, therefore these tasks run" is a proposition a spec can check.
+// Both tasks are the feature's standing promises -- renew before expiry, revoke
+// what was superseded -- and a task that is never registered never fails, so
+// neither counter would signal its absence.
+func servingMaintenanceTasks(myCA *ca.CA, cfg *serverConfig, holder *servingCertHolder) []maintenanceTask {
+	if !cfg.TLSSelfProvision {
+		return nil
+	}
+	return []maintenanceTask{
+		servingRenewalTask(myCA, cfg, holder),
+		supersededRevocationTask(myCA, cfg),
+	}
 }
 
 // reconcileAtStartup drains any pending serving-certificate revocations before
