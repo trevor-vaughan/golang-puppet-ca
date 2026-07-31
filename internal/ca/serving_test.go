@@ -647,6 +647,58 @@ var _ = Describe("Renewing a node that has taken the CA's hostname", func() {
 	})
 })
 
+var _ = Describe("Reconciling superseded serving certificates", func() {
+	const subject = "puppet.example.com"
+
+	var (
+		ctx   context.Context
+		store *storage.StorageService
+		myCA  *ca.CA
+		cfg   ca.ServingConfig
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		cfg = ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour}
+	})
+
+	It("revokes the entries it can and discards one it never could", func() {
+		// The property the per-entry loop exists for: partial progress across a
+		// mixed due list. Aborting on the first failure -- the previous
+		// behaviour -- would leave the good serial unrevoked and every
+		// certificate behind it a valid credential indefinitely.
+		//
+		// A single-entry list cannot tell the two implementations apart, which
+		// is why this one has both.
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		good := fmt.Sprintf("%X", issued.Leaf.SerialNumber)
+
+		due := fmt.Sprintf(
+			`[{"serial":%q,"revoke_at":"2020-01-01T00:00:00Z"},`+
+				`{"serial":"zz","revoke_at":"2020-01-01T00:00:00Z"}]`, good)
+		Expect(store.SaveServingSuperseded(ctx, []byte(due))).To(Succeed())
+
+		Expect(myCA.ReconcileSuperseded(ctx, cfg)).To(Succeed())
+
+		revoked, err := myCA.IsRevokedSerial(ctx, issued.Leaf.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue(), "a failing entry must not block the ones beside it")
+
+		// The malformed entry is dropped, not carried: it can never succeed, and
+		// retrying it forever would latch an alert with no way to clear it.
+		left, err := store.GetServingSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(left)).NotTo(ContainSubstring("zz"))
+		Expect(myCA.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+	})
+})
+
 var _ = Describe("Serving certificate read failures", func() {
 	// The rule under test: a read failure is not evidence the stored material
 	// is unusable. Minting on it would let a degraded backend rotate the
@@ -836,9 +888,10 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 	})
 
 	It("keeps a withdrawn name until the certificate is reissued for another reason", func() {
-		// Not an oversight: a subset test is what makes a mixed-configuration
-		// fleet converge. Set equality would leave replicas whose name lists
-		// differ minting over each other forever. See missingNames.
+		// Not an oversight. What makes a mixed-configuration fleet converge is
+		// the union carried on the missing-name path (see missingNames, and the
+		// convergence spec in servingconcurrent_test.go); the check itself
+		// stays one-directional, so a withdrawal needs the revoke below.
 		cfg.ExtraNames = []string{"ingress.example.com"}
 		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
 
@@ -850,6 +903,27 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(reused.Issued).To(BeFalse())
 		Expect(reused.Leaf.DNSNames).To(ContainElement("ingress.example.com"))
+	})
+
+	It("lets revocation win when a name is also missing", func() {
+		// A rename: withdraw one name and add another, then revoke to apply it.
+		// Both conditions hold at once, and only reasonMissingName carries the
+		// stored names forward -- so if the name check ran first the union
+		// would put the withdrawn name straight back and swallow the
+		// revocation, leaving the operator with a fresh certificate still
+		// asserting the name they revoked to remove.
+		cfg.ExtraNames = []string{"old.example.com"}
+		Expect(myCA.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+
+		cfg.ExtraNames = []string{"new.example.com"}
+		Expect(myCA.Revoke(ctx, subject)).To(Succeed())
+
+		reissued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reissued.Issued).To(BeTrue())
+		Expect(reissued.Leaf.DNSNames).To(ContainElement("new.example.com"))
+		Expect(reissued.Leaf.DNSNames).NotTo(ContainElement("old.example.com"),
+			"a revocation must mint from the configured names alone")
 	})
 
 	It("drops a withdrawn name once the serving certificate is revoked", func() {
