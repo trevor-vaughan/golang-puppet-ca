@@ -589,37 +589,61 @@ var _ = Describe("Renewing a node that has taken the CA's hostname", func() {
 			"a replaced certificate that is not the serving one must still be revoked")
 	})
 
-	It("skips the revocation when the serving certificate cannot be read", func() {
-		// The arm round 3 added, and the one that had no spec: reverting it to
-		// `return false` restores the fail-open a reviewer blocked on, with the
-		// whole suite otherwise green. A read failure is not an answer, so the
-		// revoke must not proceed on it.
-		dir := GinkgoT().TempDir()
-		seed := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, hostname)
-		seed.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		seed.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		Expect(seed.Init(ctx)).To(Succeed())
-		serving, err := seed.EnsureServingCert(ctx, ca.ServingConfig{Subject: hostname})
-		Expect(err).NotTo(HaveOccurred())
+	// caOver builds a second CA over an existing directory, as a replica or a
+	// restarted process would.
+	caOver := func(store *storage.StorageService) *ca.CA {
+		GinkgoHelper()
+		other := ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
+		other.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		other.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(other.Init(ctx)).To(Succeed())
+		return other
+	}
 
-		base := storage.NewFilesystemBackend(dir)
-		blind := ca.New(storage.NewWithBackend(
-			&failReadBackend{Backend: base, failKey: storage.KeyServingCert}, dir),
-			ca.AutosignConfig{Mode: "off"}, hostname)
-		blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
-		Expect(blind.Init(ctx)).To(Succeed())
+	DescribeTable("skips the revocation whenever it cannot tell what is being served",
+		// Every state in which servingSerialMatches cannot answer must answer
+		// alike, because the listener holds its certificate in memory: corrupt
+		// or unreadable storage does not put the credential out of circulation,
+		// and the serial being compared comes from the inventory, not from
+		// these bytes. Reverting any one arm to `return false` re-opens the
+		// fail-open round 3 blocked on. Only the read arm had a spec.
+		func(blindOver func(dir string) *ca.CA) {
+			dir := GinkgoT().TempDir()
+			seed := caOver(storage.New(dir))
+			serving, err := seed.EnsureServingCert(ctx, ca.ServingConfig{Subject: hostname})
+			Expect(err).NotTo(HaveOccurred())
 
-		_, err = blind.Renew(ctx, hostname, csrFor(hostname))
-		Expect(err).NotTo(HaveOccurred())
+			blind := blindOver(dir)
+			_, err = blind.Renew(ctx, hostname, csrFor(hostname))
+			Expect(err).NotTo(HaveOccurred())
 
-		// The serial Renew resolves is the serving certificate's -- it was
-		// issued last -- so that is the one that must survive.
-		revoked, err := blind.IsRevokedSerial(ctx, serving.Leaf.SerialNumber)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(revoked).To(BeFalse(),
-			"an unreadable serving certificate must not let the revocation through")
-	})
+			// The serial Renew resolves is the serving certificate's -- it was
+			// issued last -- so that is the one that must survive.
+			revoked, err := blind.IsRevokedSerial(ctx, serving.Leaf.SerialNumber)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(revoked).To(BeFalse(),
+				"a serving certificate it cannot read must not let the revocation through")
+		},
+		Entry("the read fails", func(dir string) *ca.CA {
+			return caOver(storage.NewWithBackend(&failReadBackend{
+				Backend: storage.NewFilesystemBackend(dir),
+				failKey: storage.KeyServingCert,
+			}, dir))
+		}),
+		Entry("the stored bytes are not PEM", func(dir string) *ca.CA {
+			Expect(storage.New(dir).SaveServingCert(
+				context.Background(), []byte("not a certificate\n"))).To(Succeed())
+			return caOver(storage.New(dir))
+		}),
+		Entry("the PEM block is not a certificate", func(dir string) *ca.CA {
+			Expect(storage.New(dir).SaveServingCert(context.Background(),
+				pem.EncodeToMemory(&pem.Block{
+					Type:  "CERTIFICATE",
+					Bytes: []byte("this is not DER"),
+				}))).To(Succeed())
+			return caOver(storage.New(dir))
+		}),
+	)
 
 	It("revokes normally when no serving certificate is stored", func() {
 		// The precision half, and the fs.ErrNotExist arm. Without it the guard
@@ -667,6 +691,33 @@ var _ = Describe("Reconciling superseded serving certificates", func() {
 		cfg = ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour}
 	})
 
+	It("keeps an entry whose revocation failed for a reason that may pass", func() {
+		// The carry-forward arm, distinct from the discard beside it: a
+		// well-formed serial that could not be revoked *this* pass must stay on
+		// the list, or it becomes a valid credential for its full remaining
+		// life with nothing recording that it should not be. A corrupt CRL is
+		// the transient shape -- revokeSerialLocked must read the CRL before it
+		// can add to it -- and it is what round 6 stopped covering when the
+		// malformed serial it had used became a discard instead.
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		serial := fmt.Sprintf("%X", issued.Leaf.SerialNumber)
+
+		due := fmt.Sprintf(`[{"serial":%q,"revoke_at":"2020-01-01T00:00:00Z"}]`, serial)
+		Expect(store.SaveServingSuperseded(ctx, []byte(due))).To(Succeed())
+		Expect(store.UpdateCRL(ctx, []byte("not a CRL"))).To(Succeed())
+
+		// The pass itself succeeds: one entry failing must not fail the sweep,
+		// which would strand every other entry behind it.
+		Expect(myCA.ReconcileSuperseded(ctx, cfg)).To(Succeed())
+
+		left, err := store.GetServingSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(left)).To(ContainSubstring(serial),
+			"a failed revocation must be retried, not dropped")
+		Expect(myCA.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+	})
+
 	It("revokes the entries it can and discards one it never could", func() {
 		// The property the per-entry loop exists for: partial progress across a
 		// mixed due list. Aborting on the first failure -- the previous
@@ -675,20 +726,31 @@ var _ = Describe("Reconciling superseded serving certificates", func() {
 		//
 		// A single-entry list cannot tell the two implementations apart, which
 		// is why this one has both.
-		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		first, err := myCA.EnsureServingCert(ctx, cfg)
 		Expect(err).NotTo(HaveOccurred())
-		good := fmt.Sprintf("%X", issued.Leaf.SerialNumber)
+		cfg.ExtraNames = []string{"alt.example.com"}
+		second, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(second.Leaf.SerialNumber.Cmp(first.Leaf.SerialNumber)).NotTo(BeZero())
 
+		// The malformed entry sits *between* the two good ones. With it last,
+		// abandoning the loop at the first bad entry still revoked everything
+		// and the spec could not tell the two implementations apart.
 		due := fmt.Sprintf(
 			`[{"serial":%q,"revoke_at":"2020-01-01T00:00:00Z"},`+
-				`{"serial":"zz","revoke_at":"2020-01-01T00:00:00Z"}]`, good)
+				`{"serial":"zz","revoke_at":"2020-01-01T00:00:00Z"},`+
+				`{"serial":%q,"revoke_at":"2020-01-01T00:00:00Z"}]`,
+			fmt.Sprintf("%X", first.Leaf.SerialNumber),
+			fmt.Sprintf("%X", second.Leaf.SerialNumber))
 		Expect(store.SaveServingSuperseded(ctx, []byte(due))).To(Succeed())
 
 		Expect(myCA.ReconcileSuperseded(ctx, cfg)).To(Succeed())
 
-		revoked, err := myCA.IsRevokedSerial(ctx, issued.Leaf.SerialNumber)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(revoked).To(BeTrue(), "a failing entry must not block the ones beside it")
+		for _, leaf := range []*x509.Certificate{first.Leaf, second.Leaf} {
+			revoked, err := myCA.IsRevokedSerial(ctx, leaf.SerialNumber)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(revoked).To(BeTrue(), "a failing entry must not block the ones beside it")
+		}
 
 		// The malformed entry is dropped, not carried: it can never succeed, and
 		// retrying it forever would latch an alert with no way to clear it.
@@ -749,6 +811,30 @@ var _ = Describe("Serving certificate read failures", func() {
 
 		Expect(blind.ServingRevocationFailureCount()).To(BeZero())
 		blind.StoredServingLeafForTest(ctx)
+		Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
+	})
+
+	It("counts a revocation failure when it cannot record the supersession", func() {
+		// The sibling of the arm above, and the other unrecoverable one: the
+		// mint has already overwritten what named the old serial, so no later
+		// sweep can rediscover it. The counter is the only signal it happened.
+		store := storage.NewWithBackend(
+			&failReadBackend{Backend: base, failKey: storage.KeyServingSuperseded}, dir)
+		blind := ca.New(store, ca.AutosignConfig{Mode: "off"}, subject)
+		blind.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		blind.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(blind.Init(ctx)).To(Succeed())
+
+		cfg := ca.ServingConfig{Subject: subject, RevokeAfter: time.Hour}
+		Expect(blind.EnsureServingCert(ctx, cfg)).Error().NotTo(HaveOccurred())
+		Expect(blind.ServingRevocationFailureCount()).To(BeZero(),
+			"the first mint supersedes nothing, so it reads no pending list")
+
+		cfg.ExtraNames = []string{"alt.example.com"}
+		reissued, err := blind.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reissued.Issued).To(BeTrue(),
+			"failing to schedule the revocation must not stop the CA serving")
 		Expect(blind.ServingRevocationFailureCount()).To(Equal(uint64(1)))
 	})
 
@@ -954,6 +1040,25 @@ var _ = Describe("Serving certificate reuse reasons", func() {
 		code, detail := reasonFor()
 		Expect(code).To(Equal("within-renewal-window"))
 		Expect(detail).To(HaveSuffix("remaining"))
+	})
+
+	It("reissues once the stored certificate is inside the renewal window", func() {
+		// The branch the feature exists for, end to end rather than as far as
+		// the reason code: reasonRenewalWindow must be mint-worthy, not an
+		// error. The arithmetic needs no clock faking -- a fresh certificate is
+		// backdated 24h, so a window just under the lifetime already contains
+		// it, and a window at or beyond the lifetime would be clamped.
+		issued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		lifetime := issued.Leaf.NotAfter.Sub(issued.Leaf.NotBefore)
+		cfg.RenewBefore = lifetime - time.Hour
+
+		reissued, err := myCA.EnsureServingCert(ctx, cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reissued.Issued).To(BeTrue(),
+			"a certificate inside its renewal window must be replaced, not served to expiry")
+		Expect(reissued.Leaf.SerialNumber.Cmp(issued.Leaf.SerialNumber)).NotTo(BeZero())
 	})
 
 	It("reports revocation with no detail", func() {

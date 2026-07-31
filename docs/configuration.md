@@ -379,8 +379,10 @@ provider (`ca_key_provider: openbao`), behind an external signer, or pinned with
 
 ### Sharing a backend between replicas
 
-The mint is serialised on a per-subject lock, which is a real distributed lock
-on etcd, Redis/Valkey, PostgreSQL and MySQL. On the **filesystem and SQLite**
+The mint is serialised on a fixed serving lock plus the per-subject lock, both
+real distributed locks on etcd, Redis/Valkey, PostgreSQL and MySQL. The fixed
+one is what makes replicas exclude each other even when they disagree about the
+hostname, and so about which subject lock to take. On the **filesystem and SQLite**
 backends it degrades to a process-local mutex, so two replicas can mint
 concurrently and the last writer wins; the loser serves a certificate no longer
 in storage until its next pass. Those backends are already documented as

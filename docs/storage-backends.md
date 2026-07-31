@@ -395,6 +395,18 @@ The SQL backends share one set of config keys and environment variables:
 The pool-tuning and TLS settings apply only to the networked SQL dialects;
 SQLite ignores them.
 
+> **`sql_max_open_conns` has a floor.** On PostgreSQL and MySQL each held
+> distributed lock pins one pooled connection for its whole critical section,
+> because both dialects scope their locks to a session. The CA nests locks: a
+> signing request holds two (subject, then CRL) and needs a third for the work
+> inside, and with `tls_self_provision` on the superseded-certificate sweep
+> holds three (serving, subject, CRL) and needs a fourth. Setting
+> `sql_max_open_conns` below **three** — or below **four** with
+> `tls_self_provision` — stalls the pool until the 60-second lock timeout
+> expires, on every pass. `0` (the default) means no limit and is always safe.
+> SQLite is unaffected: it has no distributed locking and falls back to
+> process-local mutexes, which hold no connection.
+
 ---
 
 ## CA cert/key as local files

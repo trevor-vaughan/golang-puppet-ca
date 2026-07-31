@@ -156,6 +156,28 @@ var _ = Describe("Collector", func() {
 		Expect(counterValue(servingRevocationFailures)).To(Equal(0.0))
 	})
 
+	It("keeps the three serving counters distinct", func() {
+		// Zero on every one of them means the spec above pins their names but
+		// not which value each carries: transposing two of the collector's
+		// MustNewConstMetric lines passes it, and stops the mixin's
+		// PuppetCAServingCertRenewalFailing firing exactly as a rename would.
+		Expect(myCA.EnsureServingCert(ctx, ca.ServingConfig{Subject: "puppet.test"})).
+			Error().NotTo(HaveOccurred())
+		myCA.IncServingRenewalFailures()
+		myCA.IncServingRenewalFailures()
+		for range 3 {
+			myCA.IncServingRevocationFailures()
+		}
+
+		g := gather(metrics.NewCollector(myCA))
+		Expect(counterValue(g.findByLabels("puppetca_serving_cert_issued_total", nil))).
+			To(Equal(1.0))
+		Expect(counterValue(g.findByLabels("puppetca_serving_cert_renewal_failures_total", nil))).
+			To(Equal(2.0))
+		Expect(counterValue(g.findByLabels("puppetca_serving_cert_revocation_failures_total", nil))).
+			To(Equal(3.0))
+	})
+
 	It("reports per-leaf metrics with issuance state", func() {
 		signCert("signed-node")
 		signCert("revoked-node")

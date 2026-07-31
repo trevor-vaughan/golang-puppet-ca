@@ -168,7 +168,7 @@ type CA struct {
 	servingRenewalFailures atomic.Uint64
 
 	// servingRevocationFailures counts failures to record or to complete a
-	// supersession. See IncServingRevocationFailures for the three arms and
+	// supersession. See IncServingRevocationFailures for the four arms and
 	// which of them is self-healing. Surfaced as
 	// puppetca_serving_cert_revocation_failures_total.
 	servingRevocationFailures atomic.Uint64
