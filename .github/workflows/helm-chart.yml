@@ -92,7 +92,7 @@ jobs:
           # validated the chart against — packaging with a Helm nobody linted
           # the chart on is how a chart ships broken. `mage dev:check` enforces
           # it (verifyChartPins), so this is not left to a reader's diligence.
-          version: v3.21.3
+          version: v3.21.4
 
       # Packaging goes through the same mage target CI runs, so the step CI
       # claims to exercise is the step that actually runs here.
