@@ -53,7 +53,39 @@ var _ = Describe("Same-host locking", func() {
 	// A short deadline for the contended attempts. Long enough that a slow
 	// machine does not report contention where there is none, short enough that
 	// a regression fails the suite rather than hanging it.
+	//
+	// What it is sized against is a lock acquisition: one that loses, and so is
+	// waited out for the whole budget, or one that is uncontended and returns at
+	// once. Four sites below do bound an acquisition asserted to succeed (the
+	// uncontended and distinct-name cases, the post-panic release, and the
+	// Eventually attempt) and are in bounds precisely because an uncontended
+	// flock costs microseconds.
+	//
+	// What it must never bound is work whose successful cost is open-ended -- a
+	// schema migration, an index build -- because that cost is a property of the
+	// schema and the machine, not of this constant. One was observed taking
+	// 1.508s under -race on a loaded runner. The migration spec below is where
+	// this had drifted onto a success path, which is the whole of #298.
 	const contendedTimeout = 750 * time.Millisecond
+
+	// How long a spec here waits for open-ended work that must succeed. It is
+	// not a migration budget: the migration keeps the production one, since that
+	// is what a real deployment gets and what #298 asked for. This bounds only
+	// how patient the *spec* is, which is a separate question and the one that
+	// got conflated with the other in #298.
+	//
+	// It matters that it is well under ten minutes. sqlMigrationTimeout is
+	// exactly ten minutes, and so is go test's default binary timeout, which
+	// nothing here overrides -- magefile.go passes no -timeout anywhere. This
+	// file is untagged, and unitTestExcludes holds only internal/testutil, so
+	// every job that builds the package runs it: test:unit as well as the four
+	// backend targets, five in all, plus the pre-push hook's `go test -race
+	// ./...`. Left unbounded, a regression in lock *release* would therefore
+	// race those two deadlines and most likely surface as "panic: test timed
+	// out after 10m0s" for the whole package, naming nothing, in all of them --
+	// including the one job every change runs. Twenty times the worst migration
+	// yet observed, and a twentieth of the binary's budget.
+	const specPatience = 30 * time.Second
 
 	svc := func(b Backend) *StorageService {
 		return NewWithBackend(b, filepath.Join(GinkgoT().TempDir(), "private"))
@@ -635,6 +667,13 @@ var _ = Describe("Same-host locking", func() {
 				DeferCleanup(func() { _ = b.Close() })
 			}
 
+			// Bounded for the same reason as the migration below: these four
+			// carry the production budget, and a regression in lock release
+			// would wedge three of them until it expired. Being the concurrent
+			// one, this spec is the likelier of the two to meet that first.
+			ready, cancelReady := context.WithTimeout(ctx, specPatience)
+			defer cancelReady()
+
 			errs := make([]error, runners)
 			var wg sync.WaitGroup
 			wg.Add(runners)
@@ -642,7 +681,7 @@ var _ = Describe("Same-host locking", func() {
 				go func() {
 					defer GinkgoRecover()
 					defer wg.Done()
-					errs[i] = backends[i].EnsureReady(ctx)
+					errs[i] = backends[i].EnsureReady(ready)
 				}()
 			}
 			wg.Wait()
@@ -677,14 +716,59 @@ var _ = Describe("Same-host locking", func() {
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() { _ = second.Close() })
 
+			// The refusal's own premise, pinned for the same reason as the reset
+			// below. Without this the guard is one-directional: moving the reset
+			// above this line would put the production budget on the refusal,
+			// which waits its budget out -- and ten minutes is also the binary
+			// timeout, so the likely surface is the package-wide panic rather
+			// than a slow pass. This fails in microseconds instead, and says so.
+			Expect(second.migrationTimeout).To(Equal(contendedTimeout),
+				"the refusal below must run under the contended budget")
+
 			err = second.EnsureReady(ctx)
 			Expect(err).To(HaveOccurred(), "a second starter must not migrate under a held lock")
 			Expect(err.Error()).To(ContainSubstring("another process on this host may be migrating"),
 				"and the error must say why, since this is a startup failure an operator sees")
 
 			// Released, it proceeds — so the refusal was the lock, not the DSN.
+			// It has to be this same backend that proceeds: a fresh one would
+			// only show the DSN is migratable, not that what stopped *this* one
+			// was the lock. But the budget it still carries was sized for the
+			// refusal above, and what follows is a genuine schema migration, so
+			// hand it the production budget for that.
+			second.migrationTimeout = sqlMigrationTimeout
+
 			Expect(held.Unlock()).To(Succeed())
-			Expect(second.EnsureReady(ctx)).To(Succeed())
+
+			// Asserted, not merely assigned. Deleting the line above would put a
+			// 750ms deadline back on a migration measured at 1.508s under -race,
+			// and the spec would go back to failing on whichever loaded runner
+			// picked it up — in test:unit, or in any of the four backend jobs,
+			// four of which this SQLite spec has nothing otherwise to do with
+			// (#298). Failing here instead costs nothing and names the reason.
+			//
+			// This is a deletion tripwire, not an invariant of the code under
+			// test: nothing in production can move the field between the line
+			// above and this one. That is what it is for; the refusal-side
+			// assertion above is the one that exercises real plumbing, running
+			// SQLConfig through applyDefaults into the field. Timing the
+			// migration instead would buy nothing: the ready context below
+			// already bounds that same window, so an elapsed-time assertion
+			// could only fire where the deadline has already cancelled -- no
+			// detection gained, and a clock on the success path is what #298
+			// was about.
+			Expect(second.migrationTimeout).To(Equal(sqlMigrationTimeout),
+				"the migration below must not run under the contended budget")
+
+			// The budget is the production one; how long this spec will wait for
+			// it is a different question, so it is asked here rather than by
+			// shrinking the budget. EnsureReady derives its deadline from this
+			// ctx (context.WithTimeout on the caller's), so the shorter of the
+			// two wins and a wedged lock fails here, naming this spec, instead
+			// of as an unattributed package timeout ten minutes later.
+			ready, cancelReady := context.WithTimeout(ctx, specPatience)
+			defer cancelReady()
+			Expect(second.EnsureReady(ready)).To(Succeed())
 		})
 
 		It("still migrates an in-memory database, which has no same-host lock", func() {
