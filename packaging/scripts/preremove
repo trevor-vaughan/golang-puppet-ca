@@ -35,6 +35,13 @@ esac
 STATEDIR="${OPENVOX_CA_STATEDIR:-/var/lib/openvox-ca}"
 rm -f "$STATEDIR/first-boot-enabled" 2>/dev/null || :
 
+# And the directory itself, which nothing else owns. `rmdir` rather than
+# `rm -rf`: it removes an empty directory and refuses a non-empty one, so if
+# anything else has put something under here -- a future release of this
+# package, an operator -- it is left exactly as it is. That refusal is the
+# point of choosing rmdir, not a limitation of it.
+rmdir "$STATEDIR" 2>/dev/null || :
+
 if [ -d "$SYSTEMD_RUNTIME" ]; then
 	systemctl --no-reload disable --now openvox-ca.service >/dev/null 2>&1 || :
 	# --now on the oneshot too. RemainAfterExit=yes leaves it "active

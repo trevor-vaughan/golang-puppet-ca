@@ -1625,7 +1625,10 @@ func buildVariantPackages(distDir, ver string, v distVariantSpec) ([]string, err
 		out := filepath.Join(distDir, packager.ConventionalFileName(info))
 		f, err := os.Create(out)
 		if err != nil {
-			return nil, err
+			// Wrapped like every other error here. Bare, this surfaced as an
+			// open(2) message naming a path, with nothing to say which format
+			// or which variant of a multi-variant run had stopped.
+			return nil, fmt.Errorf("creating %s for %s: %w", format, v.name, err)
 		}
 		if err := packager.Package(info, f); err != nil {
 			f.Close()

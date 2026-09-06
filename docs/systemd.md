@@ -64,8 +64,16 @@ unknown user, or one that fails setting up mount namespacing because
 `ReadWritePaths=` names a directory that is not there. Neither says which of
 the three changes it is.
 
-None of this applies to a fresh install, or to the packages — the `.deb` and
-`.rpm` create the account and ship both directories themselves.
+None of this applies to a fresh install. **The packages handle the third point
+by refusing rather than guessing:** if provisioning finds a CA in
+`/var/lib/puppet-ca` and none in `/etc/puppetlabs/puppet/ssl/ca`, it stops and
+says so, instead of bootstrapping a second CA that every already-enrolled agent
+would distrust. The message gives both ways out — point `cadir` and
+`ReadWritePaths=` at the old directory, or move the CA to the new one — because
+which is right depends on what you set `cadir` to, and moving a CA is not a
+copy: it takes the private key, the inventory and the CRL, and the service may
+be running against it. The first two points do not arise for packages, which
+create the account and ship both directories themselves.
 
 ### Why `puppet` and not a private account
 

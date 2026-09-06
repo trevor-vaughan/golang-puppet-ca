@@ -32,6 +32,12 @@ set -eu
 SSLDIR="${OPENVOX_CA_SSLDIR:-/etc/puppetlabs/puppet/ssl}"
 CADIR="$SSLDIR/ca"
 
+# Where releases before this one told an operator to put the cadir, and where
+# the removed StateDirectory=puppet-ca created it. Nothing writes here; it is
+# read once, to refuse rather than to migrate. Overridable for the same reason
+# the roots above are.
+LEGACY_CADIR="${OPENVOX_CA_LEGACY_CADIR:-/var/lib/puppet-ca}"
+
 # The package's own binaries, by absolute path rather than through PATH. An
 # operator who tried the release tarball before installing the package has
 # /usr/local/bin/openvox-ca ahead of /usr/bin on the default systemd PATH, and
@@ -249,6 +255,42 @@ ensure_ca() {
 		info "a CA already exists in $CADIR; leaving it alone"
 		return 0
 	fi
+
+	# Before bootstrapping, look where the CA used to live.
+	#
+	# The default cadir moved in this release: earlier releases shipped
+	# StateDirectory=puppet-ca and told operators to put the cadir under
+	# /var/lib/puppet-ca. A host that followed that advice and then installs
+	# this package has a real CA the new default knows nothing about -- so
+	# bootstrapping here would mint a SECOND CA, and the agents already
+	# enrolled against the first would silently stop verifying. Nothing in the
+	# resulting system says which of the two is the real one.
+	#
+	# It refuses rather than migrating. Moving a CA is not a copy: the cadir
+	# holds the private key, the inventory and the CRL, the service may be
+	# running against it, and the right destination depends on what the
+	# operator set cadir to. A maintainer-script-driven move that got any of
+	# that wrong would be unrecoverable in a way that stopping is not.
+	if [ -f "$LEGACY_CADIR/ca_crt.pem" ]; then
+		fail "found an existing CA in $LEGACY_CADIR, which was the default before this release,
+and none in $CADIR, which is the default now. Provisioning has stopped rather than bootstrap a
+second CA: agents enrolled against the one in $LEGACY_CADIR would not trust a new one, and nothing
+afterwards would say which is which.
+
+Choose one, then run 'systemctl restart openvox-ca-first-boot':
+
+  Keep the existing CA where it is -- set cadir to $LEGACY_CADIR in
+  /etc/puppet-ca/config.yaml, and change ReadWritePaths= in openvox-ca.service to match, since
+  that is the only path the unit can write to.
+
+  Or move it -- stop openvox-ca, move $LEGACY_CADIR to $CADIR with its ownership intact
+  ('mv $LEGACY_CADIR/* $CADIR/' as root, then 'chown -R puppet:puppet $CADIR'), and leave the
+  shipped configuration as it is.
+
+If the CA in $LEGACY_CADIR is genuinely finished with, delete it and provisioning will bootstrap
+a new one. That retires every certificate it ever issued."
+	fi
+
 	info "bootstrapping a new CA in $CADIR as \"$NAME\""
 	"$OPENVOX_CA_CTL" setup --cadir "$CADIR" --hostname "$NAME"
 }

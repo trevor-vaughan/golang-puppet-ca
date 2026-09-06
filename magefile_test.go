@@ -1782,6 +1782,37 @@ var _ = Describe("buildVariantPackages", func() {
 			Entry("postrm", "postrm", "packaging/scripts/postremove"),
 		)
 
+		// `hostname` above all. first-boot resolves this host's certificate
+		// name through `hostname -f` and `hostname -s`, and /usr/bin/hostname
+		// is its own package on both formats, absent from minimal and
+		// container base images. Drop it from the depends list -- an easy
+		// accident in a future edit -- and both calls fail into /dev/null,
+		// both resolver tiers are skipped, and provisioning mints a CA under
+		// `localhost` that no agent can ever use. That is a silent wrong
+		// answer rather than a failure, which is why it is asserted here
+		// rather than left to the packaging CI leg (#254).
+		It("declares the runtime dependencies first-boot needs", func() {
+			Expect(control).To(HaveKey("control"))
+
+			var depends string
+			for _, line := range strings.Split(control["control"], "\n") {
+				if strings.HasPrefix(line, "Depends:") {
+					depends = strings.TrimPrefix(line, "Depends:")
+				}
+			}
+			Expect(depends).NotTo(BeEmpty(), "the deb declares no Depends: at all")
+
+			var listed []string
+			for _, d := range strings.Split(depends, ",") {
+				// Strip any version relation: "systemd (>= 250)".
+				name, _, _ := strings.Cut(strings.TrimSpace(d), " ")
+				if name != "" {
+					listed = append(listed, name)
+				}
+			}
+			Expect(listed).To(ContainElements("hostname", "systemd", "passwd"))
+		})
+
 		// The dpkg half of the config|noreplace declaration. The rpm half is
 		// asserted in "the rpm's payload"; one line in nfpm.yaml produces
 		// both, and reading only one of them would not notice the other
@@ -1808,6 +1839,44 @@ var _ = Describe("buildVariantPackages", func() {
 		owners, err := debOwners(filepath.Join(distDir, "openvox-ca_9.9.9-1_amd64.deb"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(owners).To(HaveKeyWithValue("/etc/puppet-ca/config.yaml", "root:puppet"))
+	})
+
+	// The write side of the build, which nothing reached. Everything else in
+	// this block asserts a successful run; the failure branches here decide
+	// what a broken build leaves in dist/ for a release job to pick up.
+	//
+	// What this does NOT cover, stated rather than implied: `packager.Package`
+	// itself failing, which is the branch carrying the os.Remove(out) cleanup.
+	// Reaching it needs an nfpm-internal fault after the output file is
+	// created, and nfpm has no input that produces one from out here -- it
+	// sanitises even a version of "not a version" rather than refusing it, so
+	// there is no fixture that gets there. Forcing it would mean a seam in
+	// buildVariantPackages existing only for this test, which is a worse trade
+	// than the gap. Left uncovered deliberately, not overlooked.
+	Describe("when the output file cannot be written", func() {
+		It("names the format and the variant, and writes no other package", func() {
+			// packageFormats is ordered, and deb is first: occupying its
+			// output path stops the run before the rpm is attempted.
+			blocked := filepath.Join(distDir, "openvox-ca_9.9.9-1_amd64.deb")
+			Expect(os.Mkdir(blocked, 0o755)).To(Succeed())
+
+			written, err := buildVariantPackages(distDir, ver, variant)
+			Expect(err).To(MatchError(And(
+				ContainSubstring("creating deb"),
+				ContainSubstring(variant.name),
+			)))
+			Expect(written).To(BeEmpty(), "a failed run must report nothing as written")
+
+			// And nothing from the later format was left behind for a release
+			// job to find: a partial run that produced one of two packages is
+			// how a release ships half a set.
+			entries, err := os.ReadDir(distDir)
+			Expect(err).NotTo(HaveOccurred())
+			for _, e := range entries {
+				Expect(e.Name()).NotTo(HaveSuffix(".rpm"),
+					"the run continued past a failure and wrote %s", e.Name())
+			}
+		})
 	})
 
 	// nfpm stamps every payload entry, and the rpm's BUILDTIME, with the
@@ -2206,6 +2275,23 @@ func rpmScriptlets(path string) (map[string]string, error) {
 	return out, nil
 }
 
+// rpmRequires returns the rpm's declared runtime dependencies. Like the
+// scriptlets these are header tags, so a package can carry every file and
+// script this suite asserts and still declare that it needs nothing.
+func rpmRequires(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r, err := rpmutils.ReadRpm(f)
+	if err != nil {
+		return nil, err
+	}
+	return r.Header.GetStrings(rpmutils.REQUIRENAME)
+}
+
 var _ = Describe("the rpm's payload", func() {
 	// The deb and the rpm come out of one code path, but "one code path" is an
 	// argument, not a check: nfpm renders per-format metadata differently for
@@ -2297,6 +2383,16 @@ var _ = Describe("the rpm's payload", func() {
 			var err error
 			scriptlets, err = rpmScriptlets(filepath.Join(distDir, "openvox-ca-9.9.9-1.x86_64.rpm"))
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		// The rpm names the same three tools under its own package names --
+		// shadow-utils where the deb says passwd. Asserted separately from
+		// the deb because the two lists live in separate `overrides:` blocks
+		// in nfpm.yaml, so an edit can correct one and leave the other.
+		It("declares the runtime dependencies first-boot needs", func() {
+			requires, err := rpmRequires(filepath.Join(distDir, "openvox-ca-9.9.9-1.x86_64.rpm"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requires).To(ContainElements("hostname", "systemd", "shadow-utils"))
 		})
 
 		DescribeTable("carries the scriptlet rpm will run",
@@ -2911,6 +3007,48 @@ var _ = Describe("the packages' maintainer scripts", func() {
 			"a failed enable must not record itself, or the next upgrade will not retry")
 	})
 
+	// A full uninstall should leave nothing of ours behind, and $STATEDIR is
+	// the only directory this package creates outside the payload -- so
+	// nothing but these scripts will ever remove it.
+	Describe("preremove's cleanup of the state directory", func() {
+		marker := func() string { return filepath.Join(stateDir, "first-boot-enabled") }
+
+		It("removes the marker and the directory on a removal", func() {
+			Expect(os.WriteFile(marker(), nil, 0o644)).To(Succeed())
+
+			r, _ := run("packaging/scripts/preremove", "remove")
+			Expect(r.ok).To(BeTrue(), "preremove failed: %s", r.output)
+			Expect(marker()).NotTo(BeAnExistingFile())
+			Expect(stateDir).NotTo(BeADirectory())
+		})
+
+		// rmdir refuses a non-empty directory, and that refusal is the design:
+		// anything else under here belongs to somebody else. `rm -rf` would
+		// take it with us.
+		It("leaves the directory alone when something else is in it", func() {
+			Expect(os.WriteFile(marker(), nil, 0o644)).To(Succeed())
+			other := filepath.Join(stateDir, "something-elses-file")
+			Expect(os.WriteFile(other, []byte("keep me\n"), 0o644)).To(Succeed())
+
+			r, _ := run("packaging/scripts/preremove", "remove")
+			Expect(r.ok).To(BeTrue(), "preremove failed: %s", r.output)
+			Expect(marker()).NotTo(BeAnExistingFile(), "our own marker should still go")
+			Expect(stateDir).To(BeADirectory())
+			Expect(other).To(BeAnExistingFile())
+		})
+
+		// An upgrade is not a removal: taking the marker here would re-enable
+		// the oneshot on the next configure and undo an operator's disable.
+		It("touches neither on an upgrade", func() {
+			Expect(os.WriteFile(marker(), nil, 0o644)).To(Succeed())
+
+			r, _ := run("packaging/scripts/preremove", "upgrade")
+			Expect(r.ok).To(BeTrue(), "preremove failed: %s", r.output)
+			Expect(marker()).To(BeAnExistingFile())
+			Expect(stateDir).To(BeADirectory())
+		})
+	})
+
 	// What postremove does NOT do is the whole point of it, and asserting only
 	// that it exits 0 is satisfied by a script that deletes the `puppet`
 	// account and the CA tree with it. So the call log is matched exactly: the
@@ -3127,13 +3265,21 @@ var _ = Describe("Build.Packages", func() {
 // creates the files a bootstrapped cadir has, and `generate` writes the
 // credential it is asked for. What is under test is the script's own
 // behaviour, which is what the packages ship and what no CI leg installs.
-func runFirstBootScript(sslDir, binDir, certname string) firstBootResult {
+func runFirstBootScript(sslDir, binDir, certname string, extraEnv ...string) firstBootResult {
 	cmd := exec.Command("sh", firstBootScript)
 	cmd.Env = append(os.Environ(),
 		"OPENVOX_CA_SSLDIR="+sslDir,
 		"OPENVOX_CA_BINDIR="+binDir,
 		"OPENVOX_CA_CERTNAME="+certname,
+		// The legacy cadir defaults to /var/lib/puppet-ca, a real path on any
+		// machine that ran an earlier release -- a developer's laptop
+		// included. Left unset, a CA sitting there would make every spec below
+		// refuse instead of provisioning, and the failure would look like a
+		// defect in the script rather than in the fixture. Specs that want the
+		// guard point this at a directory they built.
+		"OPENVOX_CA_LEGACY_CADIR="+filepath.Join(GinkgoT().TempDir(), "no-legacy-cadir"),
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		var exit *exec.ExitError
@@ -3244,6 +3390,130 @@ var _ = Describe("first-boot's provisioning steps", func() {
 
 		It("writes no unresolved-name marker when the name resolved", func() {
 			Expect(filepath.Join(sslDir, "openvox-ca-certname-unresolved")).NotTo(BeAnExistingFile())
+		})
+	})
+
+	// The default cadir moved this release. A host that followed the old
+	// advice has a real CA the new default cannot see, and bootstrapping over
+	// it would mint a second one that every already-enrolled agent distrusts
+	// -- silently, since both CAs then exist and nothing says which is live.
+	Describe("a CA left at the previous default location", func() {
+		var sslDir, binDir, legacy string
+
+		BeforeEach(func() {
+			sslDir = GinkgoT().TempDir()
+			binDir = GinkgoT().TempDir()
+			legacy = GinkgoT().TempDir()
+			Expect(os.MkdirAll(filepath.Join(sslDir, "ca"), 0o755)).To(Succeed())
+			stubCA(binDir)
+		})
+
+		withLegacy := func() string { return "OPENVOX_CA_LEGACY_CADIR=" + legacy }
+
+		It("refuses to bootstrap a second CA, and says how to resolve it", func() {
+			Expect(os.WriteFile(filepath.Join(legacy, "ca_crt.pem"),
+				[]byte("OLD-CA\n"), 0o644)).To(Succeed())
+
+			r := runFirstBootScript(sslDir, binDir, "ca.example.com", withLegacy())
+			Expect(r.ok).To(BeFalse(), "provisioning should have refused: %s", r.output)
+			Expect(r.output).To(And(
+				ContainSubstring("found an existing CA in "+legacy),
+				ContainSubstring("second CA"),
+			))
+			// Both routes out have to be in the message: an operator who is
+			// told only to move it will move a CA the service is using.
+			Expect(r.output).To(And(
+				ContainSubstring("Keep the existing CA where it is"),
+				ContainSubstring("Or move it"),
+			))
+			// And it must stop before creating anything of its own.
+			Expect(filepath.Join(sslDir, "ca", "ca_crt.pem")).NotTo(BeAnExistingFile())
+		})
+
+		// The guard is about bootstrapping, not about the old directory
+		// existing. A host that already migrated has both, and must provision
+		// normally rather than be refused for ever.
+		It("provisions normally when the new location already has a CA", func() {
+			Expect(os.WriteFile(filepath.Join(legacy, "ca_crt.pem"),
+				[]byte("OLD-CA\n"), 0o644)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(sslDir, "ca", "ca_crt.pem"),
+				[]byte("CA-CERT\n"), 0o644)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(sslDir, "ca", "ca_crl.pem"),
+				[]byte("CA-CRL\n"), 0o644)).To(Succeed())
+
+			r := runFirstBootScript(sslDir, binDir, "ca.example.com", withLegacy())
+			Expect(r.ok).To(BeTrue(), "provisioning failed: %s", r.output)
+			Expect(r.output).To(ContainSubstring("leaving it alone"))
+		})
+
+		// An empty directory at the old path is not a CA. Refusing on its mere
+		// existence would strand anyone who tidied up but left the directory.
+		It("bootstraps normally when the old directory holds no CA", func() {
+			r := runFirstBootScript(sslDir, binDir, "ca.example.com", withLegacy())
+			Expect(r.ok).To(BeTrue(), "provisioning failed: %s", r.output)
+			Expect(filepath.Join(sslDir, "ca", "ca_crt.pem")).To(BeAnExistingFile())
+		})
+	})
+
+	// Both guards below exist to turn a confusing downstream failure into a
+	// named one, and neither had a spec: stubCA always writes both binaries
+	// 0755, and every caller creates $SSLDIR before running. So the true
+	// branch was exercised everywhere and the false branch nowhere.
+	Describe("the guards that name an incomplete package", func() {
+		var sslDir, binDir string
+
+		BeforeEach(func() {
+			sslDir = GinkgoT().TempDir()
+			binDir = GinkgoT().TempDir()
+			Expect(os.MkdirAll(filepath.Join(sslDir, "ca"), 0o755)).To(Succeed())
+			stubCA(binDir)
+		})
+
+		// Without this guard a missing openvox-ca reaches
+		// has_generate_subcommand as a pipeline whose status is grep's -- no
+		// match, so "this build has no generate subcommand", which sends the
+		// reader to #189 for a package that is merely broken.
+		DescribeTable("refuses when a shipped binary cannot be run",
+			func(name string, remove bool) {
+				path := filepath.Join(binDir, name)
+				if remove {
+					Expect(os.Remove(path)).To(Succeed())
+				} else {
+					Expect(os.Chmod(path, 0o644)).To(Succeed())
+				}
+
+				r := runFirstBootScript(sslDir, binDir, "ca.example.com")
+				Expect(r.ok).To(BeFalse(), "provisioning should have refused: %s", r.output)
+				Expect(r.output).To(And(
+					ContainSubstring("is missing or not executable"),
+					ContainSubstring("the openvox-ca package is incomplete"),
+				))
+				// The diagnostic has to name which one, or an operator is left
+				// checking two files.
+				Expect(r.output).To(ContainSubstring(path))
+				// And it must stop before provisioning does anything.
+				Expect(filepath.Join(sslDir, "certs")).NotTo(BeADirectory())
+			},
+			Entry("the server binary is absent", "openvox-ca", true),
+			Entry("the operator CLI is absent", "openvox-ca-ctl", true),
+			Entry("the server binary is not executable", "openvox-ca", false),
+			Entry("the operator CLI is not executable", "openvox-ca-ctl", false),
+		)
+
+		// The packages ship this directory precisely so systemd can bind-mount
+		// it; ReadWritePaths= fails the unit outright when its path is absent.
+		// If it is missing anyway, say which invariant broke rather than
+		// failing later in an unrelated mkdir.
+		It("refuses when the ssl tree the package ships is not there", func() {
+			missing := filepath.Join(GinkgoT().TempDir(), "no-ssl-dir")
+
+			r := runFirstBootScript(missing, binDir, "ca.example.com")
+			Expect(r.ok).To(BeFalse(), "provisioning should have refused: %s", r.output)
+			Expect(r.output).To(And(
+				ContainSubstring("does not exist"),
+				ContainSubstring("the package should have created it"),
+			))
+			Expect(missing).NotTo(BeADirectory(), "the guard must refuse, not create it")
 		})
 	})
 
