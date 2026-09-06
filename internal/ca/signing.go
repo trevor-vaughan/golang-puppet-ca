@@ -341,11 +341,40 @@ func (c *CA) sign(ctx context.Context, subject string) ([]byte, error) {
 	return c.signWithDuration(ctx, subject, 0, nil)
 }
 
+// asciiLower lowercases A-Z and leaves every other byte alone, which is the
+// case-insensitivity DNS actually has. Deliberately not strings.ToLower: see
+// sanStrings.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
 // sanStrings renders a SAN set as canonical "type:value" strings, so entries of
 // different kinds can be compared and reported as one set.
 //
 // Only DNS names are case-folded, because only DNS names are case-insensitive
-// by specification. Email local-parts and URI paths are not, so they are
+// by specification, and they are folded as ASCII rather than as Unicode.
+// strings.ToLower folds U+212A KELVIN SIGN to "k", which would make
+// "web01<U+212A>" compare equal to the subject "web01k" while the certificate
+// carried bytes no TLS peer matches -- an equivalence broader than the
+// consumer's, which is the direction a control for refusing names must not fail
+// in.
+//
+// No CSR can reach that, and the reason is worth recording so the same finding
+// is not filed twice: dNSName and rfc822Name are IA5Strings, so crypto/x509
+// refuses to encode a non-ASCII value into a request at all
+// ("cannot be encoded as an IA5String") and rejects one on parse; a URI is
+// percent-escaped to ASCII by url.URL.String() before it is encoded. Every
+// value arriving here from a parsed CSR is therefore ASCII, where the two folds
+// are identical. asciiLower is kept because it is the fold DNS actually
+// specifies -- correct by construction rather than by an encoding rule enforced
+// two layers away -- and because a future caller building a SAN set in Go
+// rather than parsing one would not inherit that guarantee. Email local-parts and URI paths are not, so they are
 // compared verbatim: over-folding here would make two entries that a TLS peer
 // treats as different compare equal, and every such comparison in this file
 // decides whether something is already permitted. Where the normalisation is
@@ -364,7 +393,7 @@ func (c *CA) sign(ctx context.Context, subject string) ([]byte, error) {
 func sanStrings(dns []string, ips []net.IP, emails []string, uris []*url.URL) []string {
 	out := make([]string, 0, len(dns)+len(ips)+len(emails)+len(uris))
 	for _, d := range dns {
-		out = append(out, "DNS:"+strings.ToLower(d))
+		out = append(out, "DNS:"+asciiLower(d))
 	}
 	for _, ip := range ips {
 		out = append(out, "IP:"+ip.String())
@@ -395,7 +424,12 @@ const (
 )
 
 // truncateSAN bounds one rendered entry for logging, cutting back to a rune
-// boundary so a multi-byte name is not sliced mid-character.
+// boundary so a multi-byte name is not sliced mid-character. Defensive for the
+// same reason as the fold above: the IA5String constraint means no multi-byte
+// value reaches this from a parsed CSR, so the boundary logic cannot be
+// exercised through the signing path and has no spec. It costs three lines and
+// makes the function correct for any caller, rather than only for the ones the
+// encoding happens to constrain.
 func truncateSAN(s string) string {
 	if len(s) <= maxLoggedSANValue {
 		return s
@@ -447,7 +481,7 @@ func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest, 
 	// four-kind coverage buys is that with the policy OFF such a request is
 	// refused rather than quietly trimmed. When #241 lands and all four kinds
 	// are carried through, this comment stops needing the qualification.
-	own := "DNS:" + strings.ToLower(subject)
+	own := "DNS:" + asciiLower(subject)
 	carried := make(map[string]struct{})
 	if baseline != nil {
 		for _, name := range sanStrings(baseline.DNSNames, baseline.IPAddresses, baseline.EmailAddresses, baseline.URIs) {

@@ -160,10 +160,11 @@ type CA struct {
 	// dropped — see #241, which adds the carry-through this gate assumes.
 	//
 	// The boundary is the CSR, not the caller: this governs names carried on a
-	// submitted certificate request, wherever it arrives from. Generate and
-	// GenerateWithOptions reach issueLeafLocked directly, never through
-	// signWithDuration, so neither is gated -- and that covers two callers, not
-	// one. The offline `openvox-ca generate --dns` takes its names from an
+	// submitted certificate request, wherever it arrives from. Minting reaches
+	// issueLeafLocked directly, never through signWithDuration, so it is not
+	// gated: one direct caller, GenerateWithOptions, which Generate delegates to
+	// -- issuanceseam_test.go pins that caller set. Both entry points into it
+	// take names an administrator supplied. The offline `openvox-ca generate --dns` takes its names from an
 	// operator on the CA host; POST /generate/{subject}?dns= takes them from a
 	// query string, and *is* a request, admitted by lookupTier's tierAdminOnly
 	// default. Both mint from names an administrator supplied directly rather

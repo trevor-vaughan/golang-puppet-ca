@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -97,7 +98,7 @@ var _ = Describe("The issuance seam", func() {
 					}
 					pos := fset.Position(call.Pos())
 					found[fn.Name.Name] = append(found[fn.Name.Name],
-						filepath.Base(pos.Filename)+":"+itoa(pos.Line))
+						filepath.Base(pos.Filename)+":"+strconv.Itoa(pos.Line))
 					return true
 				})
 			}
@@ -125,17 +126,4 @@ func keysOf[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// itoa avoids pulling strconv in for one call site.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
 }

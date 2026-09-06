@@ -170,7 +170,8 @@ signing-errors list. An operator testing the setting with autosign off should
 expect the `200`. That last refusal is deliberately generic — it names no entries, so a
 caller on this unauthenticated endpoint cannot use it to discover which names
 the CA would issue; the refused entries go to the CA's log at `WARN`. Anything
-else is a `500`, whose message is withheld for the same reason.
+else is a `500`, whose message is withheld for the same reason — except a submission
+refused by [`csr_rate_limit`](configuration.md), which answers `429 Too Many Requests` before the CSR is read at all.
 
 `DELETE /certificate_request/{subject}` is an operator rejecting a request
 rather than signing it, and it takes the same per-subject lock that `POST

@@ -560,9 +560,15 @@ nodes will fail to sign until you set:
 allow_subject_alt_names: true
 ```
 
-Certificates you have already imported are unaffected: renewal carries forward
-whatever SANs a certificate already holds, whatever the setting says. Only a
-request for a *new* name is refused. The generate paths are not filtered either
+Certificates you have already imported keep renewing whatever the setting says:
+the gate judges a renewal against the certificate being renewed, so a name it
+already holds is never refused and only a request for a *new* name is. What the
+setting does not fix is which names survive onto the replacement — the
+empty-body auto-renewal path carries all four SAN types forward, while a
+CSR-body renewal is issued with DNS names only, as every CSR-signed certificate
+is today (see [#241](https://github.com/voxpupuli/openvox-ca/issues/241)). An
+imported certificate holding IP, email or URI SANs keeps them through
+auto-renewal and loses them through a re-key. The generate paths are not filtered either
 — `openvox-ca generate --dns` on the CA host and the admin-only
 `POST /generate/{subject}?dns=` — because their names come from an administrator
 rather than from an agent's CSR.
