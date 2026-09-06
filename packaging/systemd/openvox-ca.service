@@ -1,3 +1,18 @@
+# One unit, rendered per channel: ExecStart below carries a placeholder in the
+# copy kept in the repository, and rendering substitutes it. The release
+# tarballs get /usr/local/bin, which is what an unmanaged `install` prefix
+# means; the deb and rpm get /usr/bin, which is what a package must use.
+# `mage build:unit <bindir>` renders a copy locally -- see docs/systemd.md.
+#
+# This comment travels into both rendered copies, so ExecStart is what tells
+# you which one you are reading: an absolute path means an installable unit, a
+# placeholder means the template and not something to install.
+#
+# The placeholder is deliberately not spelled out in prose here, because
+# rendering replaces every occurrence of it in the file -- naming it would have
+# this comment rewritten too, and the shipped unit would then explain itself
+# with the substitution already applied.
+
 [Unit]
 Description=OpenVox Certificate Authority
 Documentation=https://github.com/voxpupuli/openvox-ca/blob/main/docs/systemd.md
@@ -24,7 +39,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 # No --config: the binary already auto-detects /etc/puppet-ca/config.yaml when
 # it exists, and pinning the path here would make PUPPET_CA_CONFIG inert and
 # turn an env-only deployment (no YAML on disk) into a start failure.
-ExecStart=/usr/local/bin/openvox-ca
+ExecStart=@BINDIR@/openvox-ca
 
 # The frontend feeds the watchdog on a timer, so a frontend that has died or
 # whose heartbeat has stalled is restarted rather than left half-alive. It is
@@ -52,16 +67,26 @@ TimeoutStartSec=300s
 # supervisor's 3s headroom, or systemd will truncate the drain it asked for.
 TimeoutStopSec=35s
 
-User=puppet-ca
-Group=puppet-ca
+# `puppet`, not a private `puppet-ca`: OpenVox Server already creates
+# puppet:puppet and chowns /etc/puppetlabs/puppet/ssl to it, so the tree this
+# service writes is already expected to be owned by that account. See
+# docs/systemd.md. The account is not assumed to exist -- the packages create
+# it themselves, because this host may run neither openvox-agent nor
+# openvox-server.
+User=puppet
+Group=puppet
 
-# /var/lib/puppet-ca, created and owned by systemd, and the only writable path
-# under ProtectSystem=strict below. Either point cadir at it, or uncomment
-# ReadWritePaths and name the directory you use -- for a CA migrated from
-# OpenVox/Puppet Server that is typically /etc/puppetlabs/puppet/ssl/ca.
-StateDirectory=puppet-ca
-StateDirectoryMode=0750
-#ReadWritePaths=/etc/puppetlabs/puppet/ssl/ca
+# The only writable path under ProtectSystem=strict below, and it is the CA
+# directory alone. A filesystem-backend CA writes a signed certificate, a
+# serial and a CRL under here, so without this the service cannot issue.
+#
+# Deliberately narrower than openvox-ca-first-boot.service, which gets the
+# parent /etc/puppetlabs/puppet/ssl because it links certs/ca.pem and crl.pem
+# into the tree above this one. The long-running service never needs to write
+# there, so it does not get to.
+#
+# Point cadir somewhere else and this line has to move with it.
+ReadWritePaths=/etc/puppetlabs/puppet/ssl/ca
 
 # Hardening. The CA holds a private key that signs every certificate in the
 # estate, so it should reach as little of the system as possible.
@@ -87,15 +112,41 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RemoveIPC=yes
+# RemoveIPC= is deliberately absent, and must stay absent.
+#
+# It removes every System V and POSIX IPC object owned by the unit's UID when
+# the unit stops -- the UID, not this unit's processes. That was harmless while
+# the service ran as a private `puppet-ca` account. It is not once the account
+# is `puppet`, which is shared with openvox-agent and openvox-server by design
+# (see above), because a co-located CA and Server is exactly the deployment
+# that sharing exists for.
+#
+# It is dropped rather than justified, because it protects nothing here.
+# openvox-ca creates no System V or POSIX IPC object at all: its only IPC is
+# the AF_UNIX socketpair the launcher passes to the isolated signer on fd 3
+# (internal/signer/signer.go), which RemoveIPC= does not cover and which the
+# kernel reclaims when the last descriptor closes. So the directive had no
+# cleanup to do for this service, and the only thing it could ever have acted
+# on belongs to somebody else.
+#
+# Note what this reasoning does NOT rest on: any claim about whether
+# openvox-server holds SysV IPC under that UID. That is another product's
+# internals, it can change without us, and a hardening directive should not
+# need it to be true.
 # AF_UNIX covers both the notification socket and the launcher's socketpair to
 # the isolated signer process.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-# The API listens on 8140 and the metrics exporter on 9140; neither is a
-# privileged port, so the service needs no capabilities at all.
+# The API and the metrics exporter both listen on unprivileged ports -- the
+# binary defaults to 8140 and 9140, the packages ship a configuration file
+# that moves the API off 8140 to leave it to OpenVox Server, and any port an
+# operator configures instead is unprivileged too or the service could not bind
+# it. So the service needs no capabilities at all. (The number itself is
+# deliberately not repeated here: it is set in one place, the packaged
+# /etc/puppet-ca/config.yaml, and a unit shared with the release tarballs is
+# not that place.)
 CapabilityBoundingSet=
 AmbientCapabilities=
 

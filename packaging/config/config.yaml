@@ -1,0 +1,69 @@
+# Configuration for a packaged openvox-ca, installed as
+# /etc/puppet-ca/config.yaml -- the path the server auto-detects, which is why
+# the unit passes no --config and PUPPET_CA_CONFIG still works in a drop-in.
+#
+# Yours to edit. Both packages mark it as a configuration file, so neither
+# `apt upgrade` nor `dnf update` will overwrite your changes; an upgrade whose
+# shipped defaults have moved leaves the new file beside yours
+# (.dpkg-dist / .rpmnew) for you to merge.
+#
+# It sets four keys, and only four: cadir and the tls_cert/tls_key pair,
+# without which a packaged CA cannot start at all, and port, which it would
+# otherwise get wrong on the host a package is most likely to land on.
+# Everything else stays at the built-in defaults, so that what a packaged CA
+# does is otherwise the documented behaviour of the binary rather than a second
+# set of values to look up. See
+# /usr/share/doc/openvox-ca/docs/configuration.md for the full list.
+
+# Where the CA keeps its material. REQUIRED: openvox-ca has no built-in default
+# for it and refuses to start without one ("cadir is required"), so a package
+# that omitted this would install a service that cannot start at all.
+#
+# /etc/puppetlabs/puppet/ssl/ca is the Clojure CA's own layout, so a CA
+# migrated from OpenVox/Puppet Server is already here. It is also the one
+# writable path openvox-ca.service grants under ProtectSystem=strict -- change
+# this and the unit's ReadWritePaths= has to move with it, or the CA will not
+# be able to write.
+cadir: /etc/puppetlabs/puppet/ssl/ca
+
+# The certificate and key the server presents.
+#
+# REQUIRED in practice, for the same reason as cadir: the server binds
+# 0.0.0.0, and it refuses to serve plain HTTP on a non-loopback address
+# ("refusing to start: plain HTTP on a non-loopback address is vulnerable to
+# certificate injection"). Without these a packaged install starts, loads its
+# CA, and then exits.
+#
+# These are STABLE ALIASES, not this host's certificate name. The credential
+# first-boot provisioning mints is named for the host
+# (certs/<certname>.pem), which no file shipped in a package can know; the
+# oneshot links these two paths to it once it does. So this file names a fixed
+# path and provisioning points that path at the right file -- which is also
+# what makes re-minting under a corrected name a matter of relinking rather
+# than editing configuration.
+#
+# Point them elsewhere and provisioning leaves them alone: like every other
+# step, the link is only made when nothing is already there.
+tls_cert: /etc/puppetlabs/puppet/ssl/certs/openvox-ca-server.pem
+tls_key: /etc/puppetlabs/puppet/ssl/private_keys/openvox-ca-server.pem
+
+# 8141, not the binary's built-in 8140.
+#
+# 8140 is right for a release tarball, a container and a host that runs
+# nothing but the CA. It is wrong for a package, because a package is what
+# gets installed alongside OpenVox Server -- which binds 8140 itself. Two
+# services claiming the same port is a first-boot failure that reads as a
+# CA fault rather than a collision.
+#
+# So agents are configured with `ca_port = 8141` against a packaged CA. This
+# is the only place that value is set: the Debian and EL packaging build on
+# this file rather than each declaring it, so there is one number to change.
+#
+# It is set HERE, in a configuration file, rather than as `--port` in the unit
+# or PUPPET_CA_PORT in the environment, and that is not a stylistic choice.
+# The server resolves the port as config file, then environment, then flag
+# (cmd/openvox-ca/config.go applyServerEnv, then the Changed("port") override
+# in main.go), so a value in the unit or the environment would beat this file
+# and silently ignore an operator who edited it. A default has to sit at the
+# layer an operator can override, and that is this one.
+port: 8141

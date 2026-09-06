@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# Shared preremove for the deb and the rpm: stop and disable the units while
+# they are still on disk to be found.
+#
+# Removal only. Both package managers run this on upgrade as well, with an
+# argument that says so -- dpkg passes "upgrade", rpm passes a remaining-count
+# of 1 -- and stopping the service on an upgrade would be a needless outage.
+#
+# The accepted set is exactly what each can send here on a removal: dpkg's
+# `prerm remove`, and rpm's `%preun` remaining-count of 0. "purge" is NOT in
+# it, and its absence is deliberate: dpkg passes purge to *postrm*, never to
+# prerm, so accepting it here would be a branch nothing can reach -- which
+# reads to the next person as though purge were handled, when the file that
+# handles it is postremove.
+
+set -eu
+
+# Overridable so a test can reach the systemd branch on a host without
+# systemd. Duplicated rather than sourced, deliberately -- see the comment on
+# this line in packaging/scripts/postinstall for why a maintainer script must
+# be self-contained.
+SYSTEMD_RUNTIME="${OPENVOX_CA_SYSTEMD_RUNTIME:-/run/systemd/system}"
+
+case "${1:-}" in
+0 | remove) ;;
+*) exit 0 ;;
+esac
+
+# The marker postinstall writes when it enables the oneshot. Removing it here
+# is what lets a later reinstall enable again: dpkg cannot distinguish
+# "removed, now being reinstalled" from "being upgraded" by its arguments
+# alone, and without this a reinstall would leave the unit disabled by the very
+# disable below.
+STATEDIR="${OPENVOX_CA_STATEDIR:-/var/lib/openvox-ca}"
+rm -f "$STATEDIR/first-boot-enabled" 2>/dev/null || :
+
+# And the directory itself, which nothing else owns. `rmdir` rather than
+# `rm -rf`: it removes an empty directory and refuses a non-empty one, so if
+# anything else has put something under here -- a future release of this
+# package, an operator -- it is left exactly as it is. That refusal is the
+# point of choosing rmdir, not a limitation of it.
+rmdir "$STATEDIR" 2>/dev/null || :
+
+if [ -d "$SYSTEMD_RUNTIME" ]; then
+	systemctl --no-reload disable --now openvox-ca.service >/dev/null 2>&1 || :
+	# --now on the oneshot too. RemainAfterExit=yes leaves it "active
+	# (exited)" after a successful run, so a plain disable removes the symlink
+	# and leaves the unit active with no unit file behind it -- which systemd
+	# then reports as "not-found" for as long as the machine stays up.
+	systemctl --no-reload disable --now openvox-ca-first-boot.service >/dev/null 2>&1 || :
+fi

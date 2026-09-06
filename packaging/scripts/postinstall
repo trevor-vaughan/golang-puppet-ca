@@ -1,0 +1,228 @@
+#!/bin/sh
+#
+# Shared postinstall for the deb and the rpm. Two jobs: make sure the `puppet`
+# account exists, and make sure systemd knows about the units.
+#
+# It is shared rather than per-format because nothing in it diverges. Both
+# formats install the same units, the same binaries and the same
+# /etc/puppet-ca/config.yaml, and the one thing that does differ between them
+# -- the argument contract this script is called under -- is handled by the
+# case below rather than by two scripts.
+
+set -eu
+
+# The two paths this script hands to `puppet`. Overridable from the
+# environment for the same reason SYSTEMD_RUNTIME below is: without it the
+# ownership and permission branch is unreachable outside a container, and the
+# hardening it applies -- --no-dereference, the symlink refusal, mode 0640 on a
+# file that can hold credentials -- would go untested. Nothing in the packages
+# sets either, and neither dpkg nor rpm passes an environment, so an installed
+# system always takes the defaults.
+SSLDIR="${OPENVOX_CA_SSLDIR:-/etc/puppetlabs/puppet/ssl}"
+CONFIG="${OPENVOX_CA_CONFIG:-/etc/puppet-ca/config.yaml}"
+
+# Records that this package has enabled the provisioning oneshot at least once.
+# See the enable block at the foot of this file for why the alternative --
+# inferring it from dpkg's $2 -- gets a remove-then-reinstall wrong.
+STATEDIR="${OPENVOX_CA_STATEDIR:-/var/lib/openvox-ca}"
+ENABLED_MARKER="$STATEDIR/first-boot-enabled"
+
+# Where systemd's runtime directory lives. Overridable from the environment for
+# the same reason first-boot's roots are, and with the same caveat: nothing in
+# the packages sets it, and neither dpkg nor rpm passes an environment, so an
+# installed system always takes the default. It exists so a test can assert
+# what this script does on a machine that has no systemd -- without it the
+# systemd branch is unreachable off a Linux host, and a table asserting "acts
+# on a removal, not on an upgrade" could only ever check the second half.
+#
+# The line below is repeated in all three maintainer scripts rather than
+# sourced from a shared file, and that duplication is deliberate. A maintainer
+# script has to be self-contained: postrm in particular runs at moments when
+# this package's files are partly or wholly gone, so sourcing anything the
+# package ships would make removal depend on the very files being removed. One
+# assignment repeated three times is cheaper than that failure. This comment is
+# the canonical explanation; the other two point here.
+SYSTEMD_RUNTIME="${OPENVOX_CA_SYSTEMD_RUNTIME:-/run/systemd/system}"
+
+
+# Failures here are reported and not fatal. Reported, because the previous
+# version sent every one of them to /dev/null: a package could install
+# "successfully" and leave a service that cannot read its own configuration,
+# with nothing anywhere saying why. Not fatal, because a maintainer script
+# that exits non-zero leaves the package half-configured, which is a worse
+# state to hand an operator than a working install with a loud warning.
+warn() {
+	echo "openvox-ca: WARNING: $*" >&2
+}
+
+# dpkg passes "configure" on install and upgrade; rpm passes the number of
+# packages that will remain, 1 on install and 2 on upgrade. Anything else --
+# dpkg's abort-upgrade, abort-remove and friends -- is a rollback, where
+# re-running this would fight the very state being rolled back to.
+case "${1:-configure}" in
+configure | 1 | 2) ;;
+*) exit 0 ;;
+esac
+
+# -- The service account -----------------------------------------------------
+
+# sysusers.d is the declarative answer and the one we ship. It is not enough on
+# its own: rpm distributions wire a file trigger for /usr/lib/sysusers.d and
+# Debian's does not reliably, so a package that only dropped the file would
+# create no account on some hosts and the units would fail to start with a
+# message about an unknown user. Calling systemd-sysusers directly makes the
+# declaration authoritative on both; the useradd path is for hosts with no
+# systemd-sysusers at all.
+#
+# Every branch is idempotent: systemd-sysusers leaves an existing account
+# alone, and the fallback creates nothing it already found. That matters on
+# upgrade, and it matters on a host where openvox-server got here first -- its
+# account is the one we want, not one to correct.
+#
+# Reported rather than fatal, like everything else in this script. This block
+# was the one exception, and `set -e` made a failure here abort the postinstall
+# *before* the ownership fixes below -- so a host where the account already
+# existed but sysusers exited non-zero for an unrelated reason (a read-only
+# /etc in an image build, an account visible through NSS but absent from
+# /etc/passwd, an exhausted system UID range) ended up with a configuration
+# file the service still could not read. Warning and continuing leaves strictly
+# more working than aborting does.
+if command -v systemd-sysusers >/dev/null 2>&1; then
+	systemd-sysusers /usr/lib/sysusers.d/openvox-ca.conf || warn \
+		"systemd-sysusers could not create the \`puppet\` account from" \
+		"/usr/lib/sysusers.d/openvox-ca.conf. openvox-ca.service and" \
+		"openvox-ca-first-boot.service both run as that account and will not start until it exists."
+else
+	if ! getent group puppet >/dev/null 2>&1; then
+		groupadd --system puppet || warn "could not create the \`puppet\` group."
+	fi
+	if ! getent passwd puppet >/dev/null 2>&1; then
+		# Kept in step with packaging/sysusers/openvox-ca.conf: the home
+		# directory and shell here must match the declarative form, or a host
+		# without systemd-sysusers gets a different account from one with it.
+		# magefile_test.go asserts the two agree.
+		useradd --system --gid puppet \
+			--home-dir /etc/puppetlabs/puppet \
+			--shell /usr/sbin/nologin \
+			--comment "OpenVox Certificate Authority" \
+			puppet || warn "could not create the \`puppet\` account."
+	fi
+fi
+
+# Everything the package ships that the service must reach is packaged
+# root-owned, because at the moment dpkg or rpm unpacks it the `puppet` account
+# does not exist yet -- it is created above, in this script. rpm notices and
+# falls back to root:root with a warning; dpkg simply writes what it was told.
+# Either way the owner has to be set here, after the account exists.
+#
+# --no-dereference, and it matters: $SSLDIR is writable by `puppet`, this runs
+# as root, and a symlink planted at one of these paths would otherwise have
+# chown follow it and change the owner of whatever it points at.
+#
+# Not recursive: an existing tree may hold an agent's or a server's files, and
+# this package is not entitled to reassign those.
+if [ -d "$SSLDIR" ]; then
+	chown --no-dereference puppet:puppet "$SSLDIR" "$SSLDIR/ca" || warn \
+		"could not give $SSLDIR to puppet:puppet. Provisioning runs as \`puppet\` and will not be" \
+		"able to write there; fix the ownership and run 'systemctl restart openvox-ca-first-boot'."
+fi
+
+# The configuration file is 0640 and can hold credentials, so the service must
+# be able to read it and nothing else should. Without this it stays root:root
+# and openvox-ca -- which runs as `puppet` -- cannot read its own
+# configuration, including the cadir it refuses to start without.
+#
+# The symlink check comes first and is not decoration. `chown` has
+# --no-dereference, so it was already safe; `chmod` has no portable
+# equivalent -- GNU chmod grew -h only recently, and it is rejected outright by
+# coreutils 8.32 (RHEL and Rocky 9) and 9.1 (Debian bookworm), two of the
+# platforms these packages exist for. Using it there would fail, be swallowed
+# by the `|| warn` below, and leave the mode unset altogether: worse than the
+# hole it was meant to close. `[ -L ]` is POSIX and works everywhere.
+#
+# -L before -f, because -f follows the link and a symlink to a regular file
+# would otherwise pass it.
+if [ -L "$CONFIG" ]; then
+	warn "$CONFIG is a symlink, so this package will not change its owner or mode --" \
+		"both would apply to whatever it points at, which is not ours to alter. If that link is" \
+		"deliberate, give its target root:puppet and mode 0640 yourself; openvox-ca runs as" \
+		"\`puppet\` and must be able to read it."
+elif [ -f "$CONFIG" ]; then
+	chown --no-dereference root:puppet "$CONFIG" || warn \
+		"could not give $CONFIG to root:puppet. openvox-ca runs as \`puppet\` and will not be able to" \
+		"read its own configuration, including the cadir it refuses to start without."
+	chmod 0640 "$CONFIG" || warn "could not set mode 0640 on $CONFIG; it may be readable by others."
+fi
+
+# -- systemd -----------------------------------------------------------------
+
+# openvox-ca.service is neither enabled nor started here: the operator gets a
+# configuration file to review first, and an install is not consent to create a
+# certificate authority.
+#
+# openvox-ca-first-boot.service IS enabled, and that is not the same thing.
+# Its [Install] section carries only RequiredBy=openvox-ca.service, so enabling
+# it installs one symlink into openvox-ca.service.requires/ and nothing that
+# any target pulls in. It therefore runs when the operator first starts
+# openvox-ca and at no other time -- not at install, not on the next boot.
+# Without this the [Install] section is inert, because systemd acts on
+# [Install] at enable time and never merely because a unit file is present.
+#
+# daemon-reload needs a systemd that is actually running, so it stays behind
+# the runtime check. `systemctl enable` does not: it writes a symlink into
+# /etc/systemd/system, which is ordinary on-disk work that succeeds in a
+# chroot, a debootstrap or mmdebstrap target, a container image build, or any
+# install into a mounted root. Gating the enable on a *running* systemd meant
+# none of those hosts ever got the symlink -- and because the oneshot's only
+# [Install] directive is RequiredBy=, a unit that is never enabled is a unit
+# that never runs. The first `systemctl start openvox-ca` on such a host then
+# exits on the serving credential provisioning would have created, and nothing
+# retries the enable on the next boot.
+if [ -d "$SYSTEMD_RUNTIME" ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || :
+fi
+
+# Enabled once, by us, and not re-enabled afterwards -- an operator who runs
+# `systemctl disable openvox-ca-first-boot` must not have that undone by the
+# next package update.
+#
+# The marker, rather than dpkg's $2, is what distinguishes the two cases. dpkg
+# passes the previously-configured version in $2 for a package that was removed
+# but not purged as well as for a genuine upgrade, so a `remove` followed by an
+# `install` looked like an upgrade -- and since our own preremove had disabled
+# the unit, the reinstall left it disabled, giving a service that starts and
+# exits. preremove deletes the marker on removal, so a reinstall enables again
+# while an operator's deliberate disable survives an upgrade.
+#
+# The outcome is reported. It decides whether provisioning ever runs, and the
+# previous version sent it to /dev/null: an install could "succeed" and leave a
+# host whose first `systemctl start openvox-ca` bootstraps a CA inside the
+# server process under a name none of first-boot's checks ever saw.
+if [ ! -e "$ENABLED_MARKER" ]; then
+	if systemctl enable openvox-ca-first-boot.service >/dev/null 2>&1; then
+		# Reported, not swallowed, like every other step in this script. The
+		# unit is enabled at this point whatever happens next, so a failure
+		# here is not an install failure -- but it leaves no record that we
+		# enabled it, and the marker is the only thing that stops the NEXT
+		# upgrade enabling it again. An operator who has since run
+		# `systemctl disable openvox-ca-first-boot` would have that decision
+		# silently undone, which is the one outcome this marker exists to
+		# prevent. Causes are mundane and real: a read-only /var during an
+		# image build, a full filesystem, an SELinux denial, something already
+		# occupying $STATEDIR.
+		if mkdir -p "$STATEDIR" 2>/dev/null && : >"$ENABLED_MARKER" 2>/dev/null; then
+			:
+		else
+			warn "enabled openvox-ca-first-boot.service but could not record it at" \
+				"$ENABLED_MARKER. Provisioning is set up correctly and will run. The only" \
+				"consequence is later: if you run 'systemctl disable openvox-ca-first-boot'," \
+				"the next package upgrade will re-enable it. Create that file yourself to" \
+				"make the disable stick."
+		fi
+	else
+		warn "could not enable openvox-ca-first-boot.service. First-boot provisioning will not" \
+			"run, and 'systemctl start openvox-ca' will bootstrap a CA under a name none of its" \
+			"checks have seen. Run 'systemctl enable openvox-ca-first-boot' before starting the" \
+			"service."
+	fi
+fi

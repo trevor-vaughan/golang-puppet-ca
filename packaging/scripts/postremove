@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# Shared postremove for the deb and the rpm.
+#
+# What it does NOT do is the point of it. The `puppet` account stays, and so
+# does everything under /etc/puppetlabs/puppet/ssl. Both are shared with
+# openvox-agent and openvox-server, and both hold or own the CA's private key
+# and its issued certificates. A package that deleted either would take an
+# estate's trust root with it on an `apt remove`, and might take another
+# product's account while it was there.
+
+set -eu
+
+# Overridable so a test can reach the systemd branch on a host without
+# systemd. Duplicated rather than sourced, deliberately -- see the comment on
+# this line in packaging/scripts/postinstall for why a maintainer script must
+# be self-contained.
+SYSTEMD_RUNTIME="${OPENVOX_CA_SYSTEMD_RUNTIME:-/run/systemd/system}"
+
+if [ -d "$SYSTEMD_RUNTIME" ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || :
+fi

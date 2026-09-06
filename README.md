@@ -57,7 +57,7 @@ wire-compatible with your existing Puppet/OpenVox fleet.
 - **Helm chart:** an OCI-published chart, versioned in lockstep with the server, covering dual-stack Services, TLS-passthrough Ingress and Gateway API routes, an opt-in ServiceMonitor and network policies; the server's own settings pass straight through to its config file, so the whole configuration reference is reachable. See [deploying with Helm](docs/helm-chart.md)
 - **Graceful shutdown:** `SIGTERM`/`SIGINT` drains in-flight requests with a configurable window (25s default) before exiting; deferred storage and signer cleanup always runs
 - **Configuration reload:** `SIGHUP` (or `systemctl reload`) re-reads the TLS keypair and the admin allow list without dropping connections, so renewing the CA's server certificate or decommissioning a compile server needs no restart. See [reloading configuration](docs/configuration.md#reloading-configuration)
-- **systemd integration:** `Type=notify` readiness (`systemctl start` returns once the listener is actually accepting), a live status line covering the listener, CA expiry and CRL freshness, watchdog keep-alives, and `systemctl reload` for TLS certificate renewal and admin allow-list changes; ships a hardened [unit file](packaging/systemd/openvox-ca.service). See [running under systemd](docs/systemd.md)
+- **systemd integration:** `Type=notify` readiness (`systemctl start` returns once the listener is actually accepting), a live status line covering the listener, CA expiry and CRL freshness, watchdog keep-alives, and `systemctl reload` for TLS certificate renewal and admin allow-list changes; ships a hardened unit, rendered per channel from [one template](packaging/systemd/openvox-ca.service) — installed by the packages, and in every release tarball ready to use. See [running under systemd](docs/systemd.md)
 - **FIPS-compatible:** the core CA uses the standard library only (`crypto/x509`, `net/http`); no CGO by default; FIPS build available via `GOEXPERIMENT=boringcrypto` (the optional Kubernetes export adds the `client-go` dependency)
 - **`openvox-ca-ctl`:** operator CLI matching `puppetserver ca` subcommands. See the [operator CLI reference](docs/operator-cli.md)
 
@@ -95,6 +95,28 @@ $ tar xzf openvox-ca_${VERSION}_linux_amd64.tar.gz
 ```
 
 See [running under systemd](docs/systemd.md) for the rest of a VM install.
+
+### Packages (`.deb`, `.rpm`)
+
+A `.deb` and an `.rpm` per architecture install the binaries, a unit rendered
+for `/usr/bin`, a working `/etc/puppet-ca/config.yaml`, and a `Type=oneshot`
+that provisions the CA the first time you start the service — so a package
+install is `install`, then `systemctl enable --now openvox-ca`, with no
+configuration to write first. They create the `puppet` service account and use
+the OpenVox/Puppet layout (`/etc/puppetlabs/puppet/ssl`), so they coexist with
+an openvox-agent or OpenVox Server on the same host; that is also why they
+listen on **8141** rather than 8140, which Server binds itself.
+
+**They are not published as release assets yet.** Adding the packaging job to
+the release workflow is
+[#266](https://github.com/voxpupuli/openvox-ca/pull/266); until it lands, build
+them from a checkout with `mage build:dist && mage build:packages`, which
+writes them into `dist/` beside the tarballs. The packages carry the pure-Go
+build only — a FIPS deployment uses the `_fips` tarball.
+
+See [installing from a package](docs/systemd.md#installing-from-a-package) for
+what provisioning does, what an uninstall deliberately leaves behind, and the
+cost of sharing the `puppet` account.
 
 ### Verifying what you downloaded
 
@@ -311,7 +333,7 @@ The complete flag, environment-variable, and config-file reference is in
 | [Deploying with Helm](docs/helm-chart.md) | The `openvox-ca` chart: installation, TLS passthrough, ingress and Gateway API, monitoring |
 | [Kubernetes export](docs/kubernetes-export.md) | Publishing the CA cert/CRL into Secrets and ConfigMaps |
 | [Metrics & monitoring](docs/metrics.md) | The Prometheus exporter and the alerting [mixin](mixin/) |
-| [Running under systemd](docs/systemd.md) | The `Type=notify` unit, status text, `systemctl reload`, watchdog, and hardening |
+| [Running under systemd](docs/systemd.md) | The `Type=notify` unit, status text, `systemctl reload`, watchdog, hardening, and installing from a package with its first-boot provisioning |
 | [Container images](docs/container-images.md) | Pulling and running the published images |
 | [Migration guide](docs/migrating-from-puppet-server.md) | Replacing an OpenVox/Puppet Server built-in CA |
 

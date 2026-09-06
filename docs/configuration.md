@@ -59,6 +59,15 @@ The config file is located by checking, in order:
 
 ## Config file
 
+**The `.deb` and `.rpm` ship one already.** A packaged install has
+`/etc/puppet-ca/config.yaml` written for it, setting `cadir`, `tls_cert`,
+`tls_key` and `port: 8141` — enough to start without an edit, and marked as a
+configuration file in both formats so your changes survive upgrades. Everything
+below applies to it; what it sets and why 8141 rather than 8140 is in
+[installing from a package](systemd.md#installing-from-a-package). Release
+tarballs and container images ship no configuration file at all, so on those
+the settings below are yours to write.
+
 **Example `/etc/puppet-ca/config.yaml`:**
 
 ```yaml
@@ -273,14 +282,25 @@ common name for years.
 
 ### Issuing one
 
+**On a packaged install you do not need this procedure.** The `.deb` and
+`.rpm` provision a serving credential on the first `systemctl start openvox-ca`
+and point `tls_cert`/`tls_key` at it — see [installing from a
+package](systemd.md#installing-from-a-package). What follows is for a release
+tarball, a container, or a packaged CA whose certificate you are replacing by
+hand.
+
 `generate` needs a running server, so the first serving certificate is issued
-against this CA started temporarily on loopback with TLS switched off. Stop the
-service first if one is already running on port 8140, then:
+against this CA started temporarily on loopback with TLS switched off. **Stop
+the service first if one is running.** That is not just courtesy on
+`filesystem` and `sqlite`: those permit exactly one instance, and the second
+process is refused the store rather than allowed to corrupt it — so with the
+service up, the command below fails outright. Then:
 
 ```bash
 # Your configured cadir. The CA writes the serving key under it, and pointing
 # --out-dir at the same place keeps a second copy from being left elsewhere.
-# The systemd unit's default is /var/lib/puppet-ca, not the path below.
+# The path the systemd unit grants as its one writable directory, so this is
+# also what the unit expects cadir to be.
 CADIR=/etc/puppetlabs/puppet/ssl/ca
 
 openvox-ca --tls-cert= --tls-key= --host 127.0.0.1 --port 8140 &
@@ -374,9 +394,11 @@ relying on one.
 The block above assumes a shell that owns the CA process, which is not how the
 two production deployments in these docs work:
 
-- Under [systemd](systemd.md) the unit is already bound to 8140, so stop it
-  first. It also runs as a dedicated user, so run both commands as that user
-  rather than under plain `sudo` — `sudo -u puppet-ca openvox-ca --tls-cert=
+- Under [systemd](systemd.md) the unit is already bound to the port it
+  serves — 8140 from a release tarball, 8141 from a package — so stop it
+  first; on `filesystem` or `sqlite` it also holds the store's lock, and the
+  temporary CA is refused while it runs. It also runs as a dedicated user, so run both commands as that user
+  rather than under plain `sudo` — `sudo -u puppet openvox-ca --tls-cert=
   ...`. Anything created as `root` is left behind for a service that is not
   root: directories most of all, since they are created `0750` and the service
   then cannot write in them at all, and the private key, which is written

@@ -1,0 +1,168 @@
+# nfpm configuration for the openvox-ca deb and rpm.
+#
+# ONE configuration for both formats, with `overrides:` for the one thing that
+# genuinely differs: the dependency naming, where the same tools have different
+# package names on Debian and on EL. It is not parameterised by format anywhere
+# else, and it should not become so.
+#
+# The configuration file IS in this package (see the config|noreplace entry
+# below), which is a change from openvox-ca#250's original payload. That issue
+# excluded it on the grounds that a configuration file is where the two formats
+# diverge -- true of hand-written packaging, and not true here: nfpm renders one
+# `config|noreplace` declaration as a dpkg conffile and as rpm
+# %config(noreplace). openvox-ca#251 and #252 extend the file rather than each
+# creating one.
+#
+# `mage build:packages` renders this, once per packaged variant per format. The
+# four ${...} values are the only things that vary between those runs; they
+# come from the environment rather than from a config file per variant, so
+# there is one file to read and no per-variant copy to drift. See
+# `func (Build) Packages()` in magefile.go.
+#
+#   PKG_VERSION  the release version, without a leading v
+#   PKG_ARCH     the Go architecture name (amd64, arm64); nfpm spells it
+#                natively per format -- x86_64/aarch64 for rpm, amd64/arm64
+#                for deb -- which is why nothing here mentions those spellings
+#   PKG_STAGE    the staging directory the variant's tarball was unpacked into
+#   PKG_UNIT     the systemd unit rendered for /usr/bin, which is NOT the one
+#                in the tarball: that one is rendered for /usr/local/bin
+
+name: openvox-ca
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+# Not a version component the project sets. openvox-ca has no concept of
+# re-releasing the same version with a different package, so this is 1 always;
+# a rebuild that needed to differ would be a new version.
+release: "1"
+
+maintainer: Vox Pupuli <voxpupuli@groups.io>
+vendor: Vox Pupuli
+homepage: https://github.com/voxpupuli/openvox-ca
+license: GPL-2.0-or-later
+
+# deb-only metadata, and top-level rather than under overrides.deb because nfpm
+# has no per-format home for it: Overridables carries the dependency lists and
+# the contents, not the archive's own fields. The rpm packager ignores both.
+section: admin
+priority: optional
+
+description: |
+  Certificate authority for OpenVox and Puppet agents.
+  openvox-ca serves the Puppet CA API -- certificate signing requests,
+  issuance, revocation, CRL distribution and OCSP -- as a standalone service,
+  independently of OpenVox Server. It can run alongside an existing
+  installation or take over an existing CA directory.
+
+contents:
+  - src: ${PKG_STAGE}/openvox-ca
+    dst: /usr/bin/openvox-ca
+    # nfpm expands ${...} in a content entry's src and dst only when the entry
+    # asks it to, and silently leaves the literal text in place when it does
+    # not -- which fails later as "no matching files" against a path with a
+    # ${} still in it. Every entry below that names one of the four variables
+    # carries this.
+    expand: true
+    file_info:
+      mode: 0755
+
+  - src: ${PKG_STAGE}/openvox-ca-ctl
+    dst: /usr/bin/openvox-ca-ctl
+    expand: true
+    file_info:
+      mode: 0755
+
+  # Rendered for /usr/bin. The unit in the release tarball is the same template
+  # rendered for /usr/local/bin, which is why this is staged rather than taken
+  # from packaging/systemd/ directly.
+  - src: ${PKG_UNIT}
+    dst: /usr/lib/systemd/system/openvox-ca.service
+    expand: true
+    file_info:
+      mode: 0644
+
+  - src: packaging/systemd/openvox-ca-first-boot.service
+    dst: /usr/lib/systemd/system/openvox-ca-first-boot.service
+    file_info:
+      mode: 0644
+
+  # Internal, and under libexec because of it: invoked by the oneshot and by
+  # nothing else. It is not on PATH and takes no arguments.
+  - src: packaging/scripts/first-boot
+    dst: /usr/libexec/openvox-ca/first-boot
+    file_info:
+      mode: 0755
+
+  - src: packaging/sysusers/openvox-ca.conf
+    dst: /usr/lib/sysusers.d/openvox-ca.conf
+    file_info:
+      mode: 0644
+
+  # The one setting a packaged CA needs that the binary's defaults get wrong:
+  # port 8141, because a package is what gets installed beside OpenVox Server
+  # and Server binds 8140. See the file for why it is a config file rather
+  # than a flag in the unit.
+  #
+  # `config|noreplace` is one declaration that nfpm renders as a dpkg conffile
+  # and as rpm %config(noreplace), so an upgrade never overwrites an operator's
+  # edit on either format. That is also what makes this file shared rather than
+  # per-format: the divergence between deb and rpm here is in how the format
+  # marks a config file, and nfpm expresses both from this line.
+  #
+  # 0640 root:puppet, not 0644: it is the file that will hold credentials once
+  # a storage backend needs them (etcd_password, an inline OpenBao role_id),
+  # and the service only needs to read it. Getting the mode right now costs
+  # nothing; discovering it later means a permissions change on upgrade.
+  - src: packaging/config/config.yaml
+    dst: /etc/puppet-ca/config.yaml
+    type: "config|noreplace"
+    file_info:
+      mode: 0640
+      owner: root
+      group: puppet
+
+  # The ssl tree ships as directories so systemd has something to bind-mount:
+  # ReadWritePaths= fails the unit outright when its path does not exist, and
+  # both units name a path under here. They are packaged root-owned and handed
+  # to `puppet` by the postinstall, because at the moment these are unpacked
+  # the account does not exist yet.
+  - dst: /etc/puppetlabs/puppet/ssl
+    type: dir
+    file_info:
+      mode: 0771
+  - dst: /etc/puppetlabs/puppet/ssl/ca
+    type: dir
+    file_info:
+      mode: 0770
+
+  # LICENSE, README and docs/, with the repository's own layout preserved, so a
+  # link between two documents still resolves once installed.
+  - src: ${PKG_STAGE}/doc
+    dst: /usr/share/doc/openvox-ca
+    expand: true
+    type: tree
+
+scripts:
+  postinstall: packaging/scripts/postinstall
+  preremove: packaging/scripts/preremove
+  postremove: packaging/scripts/postremove
+
+overrides:
+  deb:
+    depends:
+      # systemd for the units, and passwd for the groupadd/useradd fallback in
+      # the postinstall on a host with no systemd-sysusers.
+      - systemd
+      - passwd
+      # first-boot resolves this host's certificate name with `hostname -f` and
+      # `hostname -s`. /usr/bin/hostname is its own package on both formats and
+      # is absent from minimal and container base images, where both calls
+      # would fail into /dev/null, both resolver tiers would be skipped, and
+      # provisioning would mint a CA under `localhost` that no agent can use.
+      - hostname
+  rpm:
+    depends:
+      - systemd
+      # The same fallback's tools; on rpm distributions they are here.
+      - shadow-utils
+      - hostname

@@ -1,0 +1,130 @@
+# First-boot provisioning for a packaged openvox-ca.
+#
+# A unit rather than a maintainer script, for three reasons. It runs under the
+# service's hardening directives rather than as unconfined root -- the one
+# deliberate difference is ReadWritePaths= below, which is wider. It can run
+# again after the CA directory is wiped, which a postinst that already ran will
+# not; RemainAfterExit=yes means that is the next boot or an explicit
+# `systemctl restart openvox-ca-first-boot`, not a restart of the service. And
+# it fails visibly in `systemctl status` rather than in package-manager output
+# nobody keeps.
+#
+# Every step is guarded on absence, so this adopts rather than replaces:
+# nothing already on disk is overwritten, moved or re-signed. A takeover -- a
+# host that already has a CA, or an openvox-agent certificate to adopt --
+# leaves what it finds alone and fills in only what is missing around it.
+
+[Unit]
+Description=OpenVox Certificate Authority first-boot provisioning
+Documentation=https://github.com/voxpupuli/openvox-ca/blob/main/docs/systemd.md
+After=network-online.target
+Wants=network-online.target
+
+# Before, not After: this writes to the configured storage backend directly,
+# so it is a second writer to everything the server writes. The packages
+# default to the filesystem backend, which coordinates no writes across nodes
+# and cannot append to the inventory atomically -- an interleaved append leaves
+# an integrity record covering a state that never existed, after which the
+# server refuses to start and there is no supported repair. Ordering this
+# before the service is what makes that unreachable, so do not relax it.
+Before=openvox-ca.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/openvox-ca/first-boot
+
+# The same account the service runs as, so everything provisioning creates is
+# already owned by the process that will read it.
+User=puppet
+Group=puppet
+
+# The parent ssl tree, not just the CA directory: the last step links
+# certs/ca.pem and crl.pem into the tree above the CA, which is where an agent
+# on this host looks for them. openvox-ca.service gets the narrower
+# /etc/puppetlabs/puppet/ssl/ca, because the long-running service never writes
+# outside it.
+ReadWritePaths=/etc/puppetlabs/puppet/ssl
+
+# Bootstrapping a CA generates a key pair, which can take a while on a slow or
+# entropy-starved machine. openvox-ca.service allows 300s for the same reason;
+# this unit does the work that would otherwise happen on the service's first
+# start, so it needs the same budget.
+TimeoutStartSec=300s
+
+# The same hardening the service runs under, and kept in step deliberately:
+# this unit handles the CA private key for as long as it takes to sign, so it
+# is no less sensitive than the service.
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# RemoveIPC= is deliberately absent, and must stay absent.
+#
+# It removes every System V and POSIX IPC object owned by the unit's UID when
+# the unit stops -- the UID, not this unit's processes. That was harmless while
+# the service ran as a private `puppet-ca` account. It is not once the account
+# is `puppet`, which is shared with openvox-agent and openvox-server by design
+# (see above), because a co-located CA and Server is exactly the deployment
+# that sharing exists for.
+#
+# It is dropped rather than justified, because it protects nothing here.
+# openvox-ca creates no System V or POSIX IPC object at all: its only IPC is
+# the AF_UNIX socketpair the launcher passes to the isolated signer on fd 3
+# (internal/signer/signer.go), which RemoveIPC= does not cover and which the
+# kernel reclaims when the last descriptor closes. So the directive had no
+# cleanup to do for this service, and the only thing it could ever have acted
+# on belongs to somebody else.
+#
+# Note what this reasoning does NOT rest on: any claim about whether
+# openvox-server holds SysV IPC under that UID. That is another product's
+# internals, it can change without us, and a hardening directive should not
+# need it to be true.
+# The same set as the service, and AF_INET/AF_INET6 are here for one reason:
+# resolving this host's own name. `hostname -f` goes through NSS, which for
+# anything but a files-only nsswitch means a DNS query over UDP -- so denying
+# the internet families here would not fail loudly, it would silently make the
+# resolver step fall through to the short-hostname fallback on hosts whose name
+# only DNS knows. That is precisely the failure the fallback warns about, and
+# it would be self-inflicted.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+# Enabling this unit installs a Requires= symlink into
+# openvox-ca.service.requires/ and nothing else. Two consequences, both
+# deliberate:
+#
+# It is pulled in by openvox-ca.service and never on its own. There is no
+# WantedBy=multi-user.target, so enabling it at install time does not provision
+# anything -- a CA is minted the first time the operator starts openvox-ca, not
+# the first time the host reboots after an install. Installing a package is not
+# consent to create a certificate authority.
+#
+# And provisioning that fails stops the service, rather than letting it start
+# against a CA directory that provisioning did not finish. That edge carries
+# stop and restart in both directions, which is the price of the guarantee:
+# stopping this unit stops openvox-ca with it, even long after provisioning has
+# finished.
+#
+# It lives here rather than as a Requires= in openvox-ca.service because that
+# unit is shared with the release tarballs, which ship no oneshot for it to
+# require.
+RequiredBy=openvox-ca.service

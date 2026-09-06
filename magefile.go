@@ -29,6 +29,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"maps"
 	"os"
@@ -43,6 +46,9 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/goreleaser/nfpm/v2"
+	_ "github.com/goreleaser/nfpm/v2/deb"
+	_ "github.com/goreleaser/nfpm/v2/rpm"
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
 	yaml "go.yaml.in/yaml/v3"
@@ -60,7 +66,7 @@ import (
 
 // -- Namespaces ----------------------------------------------------------------
 
-type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVariant
+type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVariant  build:unit  build:packages
 type Test mg.Namespace    // test:unit  test:magefile  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
 type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
 type Release mg.Namespace // release:prepare
@@ -852,12 +858,331 @@ func verifyAutomergeBasePinIn(name string, src []byte) error {
 // reusable-workflow call has no steps for the step-level check to walk.
 var automergeActionRE = regexp.MustCompile(`(?i)auto-?merge`)
 
+// -- mage target resolution ---------------------------------------------------
+
+// requiredMageTargets are targets something outside this repository's Go code
+// depends on by name, and which nothing in Go would notice the loss of.
+//
+// build:packages is listed BEFORE its caller exists. Nothing in this tree runs
+// it: release.yml here has three jobs (verify, build, release) and no
+// packaging job. The job that calls it -- once, at release.yml:155 on #266's
+// branch -- arrives with #266, which was held until this target existed. So
+// this entry is deliberately early rather than describing the tree you are
+// reading, and a grep through release.yml is not evidence that it is unused.
+//
+// The count is stated because it was got wrong: `git grep -c` reports 2 for
+// that file, and the second line is a comment describing the target rather
+// than a second invocation. It counts matching lines, not occurrences.
+//
+// docs/development/releasing.md DOES describe packages, as of the commit that
+// made the build reproducible -- what it does not have is a release job that
+// builds them, which is the thing this entry stands in for.
+//
+// What it is worth once that caller lands: a workflow names a target as a
+// string, so deleting or renaming the target would compile cleanly, pass every
+// test, and fail at tag time -- after the tag is pushed, and while
+// container-images.yml and helm-chart.yml publish their images regardless,
+// including the mutable latest tags. Recovery is deleting GHCR package
+// versions, not re-tagging.
+//
+// This list is the machine-checked half of that dependency; the loop over the
+// workflows below is the other half, and neither subsumes the other. The
+// workflow scan catches a target a workflow calls and the magefile does not
+// have -- but it can only see callers that exist, which today is why the scan
+// alone would not notice build:packages disappearing. This catches that, and
+// it also catches the target being renamed and its caller updated to match,
+// which the scan would call correct while every `mage build:packages` written
+// down outside this repository had silently stopped working.
+var requiredMageTargets = []string{"build:packages"}
+
+// verifyMageTargets asserts that every mage target named outside Go resolves
+// to a target that exists: the ones in requiredMageTargets, and every
+// statically resolvable `mage <target>` invocation in the workflows.
+func verifyMageTargets() error {
+	mageSrc, err := os.ReadFile("magefile.go")
+	if err != nil {
+		return err
+	}
+	// Globbed, not listed. A hand-maintained list of filenames is a list that
+	// stops matching the directory: a workflow added later would invoke mage
+	// and simply not be checked, and nothing would say so -- the guard would
+	// keep passing while covering less than it claims.
+	paths, err := filepath.Glob(filepath.Join(".github", "workflows", "*.yml"))
+	if err != nil {
+		return err
+	}
+	// The floor over the glob itself. A pattern that stopped matching -- the
+	// directory moved, this run started somewhere else -- would hand
+	// verifyMageTargetsIn an empty map, and every per-workflow check below
+	// would pass by having nothing to look at.
+	if len(paths) < 2 {
+		return fmt.Errorf("found %d workflow files under .github/workflows, which is too few to be "+
+			"the real directory; the glob is wrong rather than the repository", len(paths))
+	}
+	workflows := map[string][]byte{}
+	for _, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		workflows[filepath.Base(path)] = src
+	}
+	return verifyMageTargetsIn(mageSrc, workflows)
+}
+
+// verifyMageTargetsIn is verifyMageTargets over caller-supplied sources, so
+// the checks can be exercised over synthetic input the way verifyDistVariantsIn
+// and verifyChartPinsIn are.
+func verifyMageTargetsIn(mageSrc []byte, workflows map[string][]byte) error {
+	targets, err := mageTargetNames(mageSrc)
+	if err != nil {
+		return fmt.Errorf("parsing magefile.go: %w", err)
+	}
+
+	// The floor. Every check below is a membership test against this set, so
+	// a parser that returned nothing -- a build tag that stopped matching, a
+	// namespace declared some new way -- would make all of them pass and
+	// report a magefile with no targets as fully consistent. build:dist is
+	// named because it is a target, is a namespaced one, and predates this
+	// check: if it is missing, the parse is wrong rather than the magefile.
+	if !slices.Contains(targets, "build:dist") {
+		return fmt.Errorf("parsed %d mage targets from magefile.go and build:dist was not among them, "+
+			"so the parse is wrong rather than the magefile: every check below is a membership test "+
+			"against that set and would pass vacuously (found: %s)",
+			len(targets), strings.Join(targets, ", "))
+	}
+
+	for _, want := range requiredMageTargets {
+		if !slices.Contains(targets, want) {
+			return fmt.Errorf("mage target %q does not exist, but it is depended on by name outside "+
+				"Go -- see requiredMageTargets for who calls it and what a rename costs", want)
+		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(workflows)) {
+		invoked, err := workflowMageTargets(workflows[name])
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		// The second floor, and it calibrates itself against the file it is
+		// reading. A workflow whose text invokes mage but whose parsed run:
+		// steps yield no invocation has not stopped using mage -- the parse
+		// has stopped finding it, and this check has quietly become a no-op
+		// for that workflow.
+		//
+		// Matched with the invocation pattern rather than by searching for
+		// "mage ", which every workflow contains: "image " ends in it, and
+		// container-images.yml says "image" constantly. That version of this
+		// floor fired on a correct workflow, which is the other way a floor
+		// fails -- it stops being believed.
+		if len(invoked) == 0 && mageInvocationRE.Match(workflows[name]) {
+			return fmt.Errorf("%s mentions `mage ` but no mage invocation was found in its run: steps; "+
+				"the workflow parse has gone wrong, and this check is a no-op for that file", name)
+		}
+		for _, target := range invoked {
+			if !slices.Contains(targets, target) {
+				return fmt.Errorf("%s runs `mage %s`, which is not a target magefile.go defines "+
+					"(defined: %s)", name, target, strings.Join(targets, ", "))
+			}
+		}
+	}
+	return nil
+}
+
+// mageTargetNames returns every target a magefile declares, lowercased, in the
+// spelling mage resolves on the command line: "dev:check" for a method on a
+// namespace type, "foo" for an exported package-level function.
+//
+// Parsed rather than obtained by shelling out to `mage -l`. Running mage from
+// inside a mage target to ask it what targets exist would recompile the
+// magefile mid-run, and would make this check depend on a mage binary being on
+// PATH -- which it is under `mage dev:check` and is not under `go test`, where
+// these checks are actually exercised.
+func mageTargetNames(src []byte) ([]string, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), "magefile.go", src, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Namespaces first: `type Build mg.Namespace`. A method is a target only
+	// if its receiver is one of these, so an exported method on any other type
+	// is not mistaken for one.
+	namespaces := map[string]bool{}
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			sel, ok := ts.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Namespace" {
+				continue
+			}
+			if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "mg" {
+				namespaces[ts.Name.Name] = true
+			}
+		}
+	}
+
+	var out []string
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || !fn.Name.IsExported() {
+			continue
+		}
+		if fn.Recv == nil {
+			out = append(out, strings.ToLower(fn.Name.Name))
+			continue
+		}
+		if len(fn.Recv.List) != 1 {
+			continue
+		}
+		recv, ok := fn.Recv.List[0].Type.(*ast.Ident)
+		if !ok || !namespaces[recv.Name] {
+			continue
+		}
+		out = append(out, strings.ToLower(recv.Name)+":"+strings.ToLower(fn.Name.Name))
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// mageInvocationRE matches a `mage <target>` call in shell. The target is
+// whatever follows, up to the first character that ends a word or a command.
+//
+// The leading class is #266's, from its releaseJobMageRE: anything that is not
+// a word character, a dot or a dash. Both guards are answering "is this an
+// invocation or a word ending in mage", and two expressions for one question
+// drift. It is written non-capturing here only so the target stays group 1;
+// the matching is the same.
+//
+// A bare `[\s]` prefix is not enough and a bare substring search is much worse:
+// "image " ends in "mage ", so a search for that finds one in every workflow
+// that mentions a container image.
+var mageInvocationRE = regexp.MustCompile(`(?m)(?:^|[^\w.-])mage\s+([^\s;&|)]+)`)
+
+// workflowMageTargets returns the mage targets a workflow's run: steps invoke,
+// lowercased, skipping the ones no static reading can resolve.
+//
+// It reads the parsed run: steps rather than the file, and drops comment lines
+// inside them. This file carries long explanatory comments that name the very
+// targets the check looks for -- including, elsewhere, `mage build:packages`
+// itself -- so a raw byte search over the source would be satisfied by prose
+// describing a step instead of by the step.
+func workflowMageTargets(src []byte) ([]string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, err
+	}
+
+	var shell strings.Builder
+	for _, job := range slices.Sorted(maps.Keys(doc.Jobs)) {
+		for _, step := range doc.Jobs[job].Steps {
+			for _, line := range strings.Split(step.Run, "\n") {
+				// Parsing the YAML removes # comments between steps, but not
+				// the ones inside a block scalar: to the parser those are
+				// shell text.
+				if strings.HasPrefix(strings.TrimSpace(line), "#") {
+					continue
+				}
+				shell.WriteString(line)
+				shell.WriteByte('\n')
+			}
+		}
+	}
+
+	var out []string
+	for _, m := range mageInvocationRE.FindAllStringSubmatch(shell.String(), -1) {
+		target := strings.Trim(m[1], `"'`)
+		switch {
+		case strings.HasPrefix(target, "-"):
+			// A flag, so the target is elsewhere in the line or absent
+			// (`mage -l`). Nothing to resolve either way.
+			continue
+		case strings.ContainsAny(target, "$`"):
+			// Chosen at run time -- ci.yml's `mage "$MAGE_TARGET"` matrix.
+			// Unresolvable here by construction, and skipping it is not a gap
+			// this check could close: the value is in the matrix, not the
+			// step.
+			continue
+		}
+		out = append(out, strings.ToLower(target))
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
+}
+
 // distVariantSpec describes one release artefact: its short name (the
-// artefact-name suffix, e.g. "linux_arm64_fips") and the build environment
-// that produces it.
+// artefact-name suffix, e.g. "linux_arm64_fips"), the build environment that
+// produces it, and whether it is also published as native packages.
 type distVariantSpec struct {
 	name string
 	env  map[string]string
+
+	// packaged marks a variant that is additionally shipped as one package
+	// per entry in packageFormats. It is a field on the variant rather than a
+	// second list of names because the packaged set is a subset of this one:
+	// a separate list is a list that can drift, and the whole purpose of
+	// verifyDistVariants is to stop copies of this list drifting apart.
+	//
+	// The FIPS variants are deliberately excluded. They exist so an operator
+	// under a FIPS obligation can run a boringcrypto build; that operator is
+	// installing into a controlled estate, not apt-getting from a repository.
+	// Packaging them would also mean hand-writing their dependencies and
+	// keeping them true: those binaries are cgo and dynamically linked, and
+	// nfpm runs neither dpkg-shlibdeps nor rpm's automatic requires. Not an
+	// oversight -- flip this to true and every count derived from this set
+	// moves with it, including the artefact counts the release workflow
+	// asserts once #266 has added its packaging job.
+	packaged bool
+}
+
+// packagedDistVariants returns the subset of distVariants() published as
+// packages. Callers that want a count want this, not len(distVariants()).
+func packagedDistVariants() []distVariantSpec {
+	out := make([]distVariantSpec, 0, len(distVariants()))
+	for _, v := range distVariants() {
+		if v.packaged {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// packageFormats are the nfpm packagers built for each packaged variant.
+// nfpm's packager names and the file extensions it writes are the same
+// strings, which is why one list serves both (see packageExtensions).
+//
+// This is the single source of truth for the format list, and Build.Packages
+// drives nfpm from it rather than from a slice of its own or from a
+// `packagers:` key in packaging/nfpm.yaml. A second list is exactly the drift
+// the packaged field above was made a field to avoid, and it would be
+// invisible: a format built but not declared is written into dist/ and then
+// silently dropped by a publisher that globs only the declared extensions.
+//
+// A var rather than a const so a test can substitute a list and observe that
+// the derivations below follow it -- which is how a derivation is told apart
+// from a hard-coded slice that happens to agree.
+var packageFormats = []string{"deb", "rpm"}
+
+// packageExtensions are the file extensions of the packages published for each
+// packaged variant, derived from packageFormats so the two cannot diverge.
+func packageExtensions() []string {
+	out := make([]string, 0, len(packageFormats))
+	for _, f := range packageFormats {
+		out = append(out, "."+f)
+	}
+	return out
 }
 
 // distVariants returns the full set of release artefact variants. The FIPS
@@ -874,20 +1199,28 @@ func distVariants() []distVariantSpec {
 	}
 	return []distVariantSpec{
 		{
-			name: "linux_amd64",
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
+			name:     "linux_amd64",
+			env:      map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
+			packaged: true,
 		},
 		{
-			name: "linux_arm64",
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+			name:     "linux_arm64",
+			env:      map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+			packaged: true,
+		},
+		// packaged is stated rather than left to the zero value. There is no
+		// behavioural difference; the difference is to the next person adding
+		// a variant, for whom an omission reads as an oversight and a false
+		// reads as a decision. This one is a decision -- see the field.
+		{
+			name:     "linux_amd64_fips",
+			env:      fipsEnv("amd64"),
+			packaged: false,
 		},
 		{
-			name: "linux_amd64_fips",
-			env:  fipsEnv("amd64"),
-		},
-		{
-			name: "linux_arm64_fips",
-			env:  fipsEnv("arm64"),
+			name:     "linux_arm64_fips",
+			env:      fipsEnv("arm64"),
+			packaged: false,
 		},
 	}
 }
@@ -897,6 +1230,51 @@ func distVariants() []distVariantSpec {
 // docs/systemd.md). Named once: the same string is the name under
 // packaging/systemd/ and the name inside the tarball.
 const distUnitFile = "openvox-ca.service"
+
+// The unit under packaging/systemd/ is a template, not an installable file:
+// its ExecStart names unitBindirPlaceholder, which is substituted per channel.
+// A release tarball is extracted by hand into an unmanaged prefix, which is
+// what /usr/local means; a package owns /usr and must not write outside it.
+//
+// One template rather than two files because the rest of the unit -- the
+// notification protocol, the watchdog budget, the whole hardening block -- is
+// identical for both, and two copies of that would drift.
+const (
+	unitBindirPlaceholder = "@BINDIR@"
+	tarballUnitBindir     = "/usr/local/bin"
+	packageUnitBindir     = "/usr/bin"
+)
+
+// renderUnit reads the unit template and substitutes bindir for its @BINDIR@
+// placeholder.
+//
+// The placeholder's absence is an error rather than a no-op. Without that
+// check, deleting @BINDIR@ from the template -- or hard-coding a path back
+// into ExecStart -- would render "successfully" and ship a tarball whose unit
+// points at /usr/bin, or a package whose unit points at /usr/local/bin, with
+// nothing at all to say so. A substitution that substitutes nothing is the one
+// failure this function exists to prevent.
+func renderUnit(bindir string) ([]byte, error) {
+	src, err := os.ReadFile(filepath.Join("packaging", "systemd", distUnitFile))
+	if err != nil {
+		return nil, err
+	}
+	return renderUnitFrom(src, bindir)
+}
+
+// renderUnitFrom is renderUnit over caller-supplied template bytes, so the
+// missing-placeholder branch can be exercised without editing the real unit --
+// which is the only way to reach the one failure this function exists to
+// produce.
+func renderUnitFrom(src []byte, bindir string) ([]byte, error) {
+	if !bytes.Contains(src, []byte(unitBindirPlaceholder)) {
+		return nil, fmt.Errorf(
+			"packaging/systemd/%s contains no %s placeholder, so rendering it for %q would silently "+
+				"produce a unit with whatever path is hard-coded in it; restore the placeholder in ExecStart",
+			distUnitFile, unitBindirPlaceholder, bindir)
+	}
+	return bytes.ReplaceAll(src, []byte(unitBindirPlaceholder), []byte(bindir)), nil
+}
 
 // distArchiveFiles lists a release archive's contents with the mode each entry
 // must extract as. Stating the modes here rather than reading them back off the
@@ -918,7 +1296,6 @@ func distArchiveFiles(bins []string) []archiveEntry {
 // contains both binaries plus the systemd unit.
 func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
 	bins := []string{"openvox-ca", "openvox-ca-ctl"}
-	unitSrc := filepath.Join("packaging", "systemd", distUnitFile)
 	archive := filepath.Join(distDir, fmt.Sprintf("openvox-ca_%s_%s.tar.gz", ver, v.name))
 
 	tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
@@ -937,7 +1314,12 @@ func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
 		}
 	}
 
-	if err := sh.Copy(filepath.Join(tmpDir, distUnitFile), unitSrc); err != nil {
+	// Rendered for the tarball's prefix, not copied: see renderUnit.
+	unit, err := renderUnit(tarballUnitBindir)
+	if err != nil {
+		return "", fmt.Errorf("stage %s for %s: %w", distUnitFile, v.name, err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, distUnitFile), unit, 0644); err != nil {
 		return "", fmt.Errorf("stage %s for %s: %w", distUnitFile, v.name, err)
 	}
 
@@ -1041,6 +1423,518 @@ func (Build) DistVariant(name string) error {
 		known = append(known, v.name)
 	}
 	return fmt.Errorf("unknown dist variant %q (known: %s)", name, strings.Join(known, ", "))
+}
+
+// Unit renders the systemd unit template to dist/openvox-ca.service for the
+// given bindir, so a from-source install has an installable unit without
+// building a release tarball to get one.
+//
+// bindir is the directory the binaries will live in: "/usr/local/bin" for the
+// `install` prefix docs/systemd.md describes, "/usr/bin" for what a package
+// would do. It is required rather than defaulted, because a unit whose
+// ExecStart names the wrong prefix fails at start with a message about the
+// binary rather than about the prefix, and the guess is not worth that.
+func (Build) Unit(bindir string) error {
+	if !strings.HasPrefix(bindir, "/") {
+		return fmt.Errorf("bindir %q is not an absolute path (try %s or %s)",
+			bindir, tarballUnitBindir, packageUnitBindir)
+	}
+	out, err := writeRenderedUnit("dist", bindir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Wrote %s (ExecStart=%s/openvox-ca)\n", out, strings.TrimSuffix(bindir, "/"))
+	return nil
+}
+
+// writeRenderedUnit renders the unit for bindir into distDir and returns the
+// path written. Separate from Build.Unit so specs can exercise the rendering
+// and the trailing-slash handling against a temporary directory: a test that
+// wrote into the repository's own dist/ would leave a file behind and would
+// differ depending on whether a build had run first.
+func writeRenderedUnit(distDir, bindir string) (string, error) {
+	// Trimmed once, and everything below uses the trimmed value -- including
+	// the message Build.Unit prints. Printing the argument instead reported
+	// "ExecStart=/opt/bin//openvox-ca" for a bindir given with a trailing
+	// slash, describing a unit that had been rendered correctly.
+	bindir = strings.TrimSuffix(bindir, "/")
+	unit, err := renderUnit(bindir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(distDir, 0755); err != nil {
+		return "", err
+	}
+	out := filepath.Join(distDir, distUnitFile)
+	if err := os.WriteFile(out, unit, 0644); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// Packages builds the .deb and .rpm for every packaged variant from the
+// tarballs already in dist/, and writes them beside those tarballs.
+//
+// It does NOT build binaries, and that is the whole point of it. The binaries
+// inside openvox-ca_VER_amd64.deb are byte-for-byte the ones inside
+// openvox-ca_VER_linux_amd64.tar.gz, because they are literally taken out of
+// it. A package is therefore never a second compilation of the same source
+// that might differ from the artefact that was tested, checksummed and
+// attested. Run `mage build:dist` (or build:distVariant per variant) first;
+// a missing tarball is an error naming the target that produces it, not a
+// silent rebuild.
+//
+// One package per format per packaged variant. The formats come from
+// packageFormats and the variants from packagedDistVariants(), so neither list
+// is restated here. The FIPS variants are not packaged -- see
+// distVariantSpec.packaged.
+//
+// The filenames are nfpm's conventional ones, which is what apt and dnf
+// expect: openvox-ca_VER_amd64.deb, openvox-ca-VER-1.x86_64.rpm. They carry no
+// variant name, and nothing downstream should try to derive one from them.
+func (Build) Packages() error {
+	return buildPackagesInto("dist")
+}
+
+// buildPackagesInto is Build.Packages against a caller-supplied directory, so
+// the orchestration -- resolve the version, check the inputs, loop the packaged
+// variants, count what landed -- can be exercised end to end without writing
+// into the repository's own dist/. The per-variant work is
+// buildVariantPackages; what this adds is the assembly, and the assembly is
+// what had no test.
+func buildPackagesInto(distDir string) error {
+	ver, err := releaseVersion()
+	if err != nil {
+		return err
+	}
+
+	variants := packagedDistVariants()
+	if err := checkPackagingInputs(variants, packageFormats); err != nil {
+		return err
+	}
+
+	var written []string
+	for _, v := range variants {
+		paths, err := buildVariantPackages(distDir, ver, v)
+		if err != nil {
+			return err
+		}
+		written = append(written, paths...)
+	}
+
+	return verifyPackagesWritten(written, len(variants))
+}
+
+// checkPackagingInputs refuses the two ways this target can do nothing and
+// report success.
+//
+// Either list being empty makes every loop in Packages run zero times: it
+// prints nothing, exits 0, and a release then publishes no packages at all
+// while every count that reads these same lists agrees with it. Neither
+// emptiness means "packaging is switched off" -- switching packaging off means
+// taking it out of release.yml as well, so the error says that rather than
+// just reporting a count.
+//
+// Separate from Packages so both branches can be exercised with synthetic
+// input, which is the only way to reach them: the real lists are never empty,
+// so a test that could not supply its own would be asserting nothing.
+//
+// Deliberately not named verifyPackageSetNonEmpty: #266 has a function by that
+// name doing the workflow-side half of this, with a different signature. Two
+// same-named functions across two branches would collide at rebase; two
+// differently-named ones are two checks, which is what these are.
+func checkPackagingInputs(variants []distVariantSpec, formats []string) error {
+	if len(variants) == 0 {
+		return errors.New("no dist variant is marked packaged, so there is nothing to package; " +
+			"if packaging was meant to be removed, take it out of release.yml and drop the packaged field too")
+	}
+	if len(formats) == 0 {
+		return errors.New("packageFormats lists no formats, so there is nothing to build; " +
+			"if packaging was meant to be removed, take it out of release.yml and drop packageFormats too")
+	}
+	return nil
+}
+
+// buildVariantPackages unpacks one variant's tarball into a staging directory,
+// adds the files that are in the packages but not in the tarball, and writes
+// one package per format.
+func buildVariantPackages(distDir, ver string, v distVariantSpec) ([]string, error) {
+	var written []string
+	bins := []string{"openvox-ca", "openvox-ca-ctl"}
+	archive := filepath.Join(distDir, fmt.Sprintf("openvox-ca_%s_%s.tar.gz", ver, v.name))
+	if _, err := os.Stat(archive); err != nil {
+		return nil, fmt.Errorf("%s is not in %s, and this target does not build binaries: "+
+			"run `mage build:dist` for every variant, or `mage build:distVariant %s` for this one, first",
+			filepath.Base(archive), distDir, v.name)
+	}
+
+	stage, err := os.MkdirTemp("", "openvox-ca-pkg-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(stage)
+
+	if err := extractTarGz(archive, stage, bins); err != nil {
+		return nil, fmt.Errorf("unpacking %s: %w", filepath.Base(archive), err)
+	}
+
+	// The unit in the tarball names /usr/local/bin, so the package cannot use
+	// it; the same template is rendered again for /usr/bin. Staged under a
+	// name of its own so a reader of nfpm.yaml cannot mistake it for the
+	// tarball's copy.
+	unit, err := renderUnit(packageUnitBindir)
+	if err != nil {
+		return nil, err
+	}
+	stagedUnit := filepath.Join(stage, "openvox-ca.service.pkg")
+	if err := os.WriteFile(stagedUnit, unit, 0644); err != nil {
+		return nil, err
+	}
+
+	if err := stageDocTree(filepath.Join(stage, "doc")); err != nil {
+		return nil, fmt.Errorf("staging documentation for %s: %w", v.name, err)
+	}
+
+	goarch, err := variantGOARCH(v)
+	if err != nil {
+		return nil, err
+	}
+	env := map[string]string{
+		"PKG_VERSION": ver,
+		"PKG_ARCH":    goarch,
+		"PKG_STAGE":   stage,
+		"PKG_UNIT":    stagedUnit,
+	}
+
+	cfg, err := nfpm.ParseFileWithEnvMapping(filepath.Join("packaging", "nfpm.yaml"), func(k string) string {
+		return env[k]
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reading packaging/nfpm.yaml: %w", err)
+	}
+
+	for _, format := range packageFormats {
+		info, err := cfg.Get(format)
+		if err != nil {
+			return nil, fmt.Errorf("%s configuration for %s: %w", format, v.name, err)
+		}
+		info = nfpm.WithDefaults(info)
+		if err := nfpm.Validate(info); err != nil {
+			return nil, fmt.Errorf("%s configuration for %s: %w", format, v.name, err)
+		}
+
+		packager, err := nfpm.Get(format)
+		if err != nil {
+			return nil, fmt.Errorf("no packager for format %q (packageFormats names it, nfpm does not "+
+				"provide it): %w", format, err)
+		}
+
+		out := filepath.Join(distDir, packager.ConventionalFileName(info))
+		f, err := os.Create(out)
+		if err != nil {
+			// Wrapped like every other error here. Bare, this surfaced as an
+			// open(2) message naming a path, with nothing to say which format
+			// or which variant of a multi-variant run had stopped.
+			return nil, fmt.Errorf("creating %s for %s: %w", format, v.name, err)
+		}
+		if err := packager.Package(info, f); err != nil {
+			f.Close()
+			// A half-written package is worse than none: it satisfies a count
+			// and an `ls`, and fails at install.
+			os.Remove(out)
+			return nil, fmt.Errorf("building %s for %s: %w", format, v.name, err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, err
+		}
+		fmt.Printf("Wrote %s\n", out)
+		written = append(written, out)
+	}
+	return written, nil
+}
+
+// variantGOARCH recovers a variant's target architecture from its build
+// environment, so the packages are described by the same value that compiled
+// the binaries they contain rather than by a second mapping off the variant
+// name. nfpm spells it natively per format -- x86_64/aarch64 for rpm,
+// amd64/arm64 for deb -- so nothing here needs to know those spellings.
+func variantGOARCH(v distVariantSpec) (string, error) {
+	if arch := v.env["GOARCH"]; arch != "" {
+		return arch, nil
+	}
+	return "", fmt.Errorf("variant %q sets no GOARCH, so its packages have no architecture to declare", v.name)
+}
+
+// verifyPackagesWritten checks that the packaging run produced one package per
+// format per packaged variant, and that no two of them are the same file.
+//
+// It is not a restatement of what the loop just did. nfpm derives each filename
+// from the configuration, so two variants whose configuration resolved to the
+// same architecture would write the same path twice -- the second silently
+// overwriting the first, leaving a run that reported two successes and produced
+// one file. Comparing the paths the run actually wrote is what notices.
+//
+// Deliberately NOT a census of distDir. That version counted every matching
+// file in the directory, and build:distVariant -- which is what CI, the release
+// workflow and this target's own error message all tell you to run -- does not
+// clear dist/ the way build:dist does. So a version bump followed by
+// distVariant and packages left the previous version's packages sitting there,
+// the count came to four, and a correct build failed while naming a
+// filename collision that had not happened.
+func verifyPackagesWritten(written []string, wantPerFormat int) error {
+	seen := map[string]bool{}
+	for _, p := range written {
+		if seen[p] {
+			return fmt.Errorf("%s was written twice: two variants resolved to one filename, so the "+
+				"second overwrote the first", p)
+		}
+		seen[p] = true
+	}
+
+	for _, ext := range packageExtensions() {
+		var got []string
+		for _, p := range written {
+			if filepath.Ext(p) == ext {
+				got = append(got, p)
+			}
+		}
+		if len(got) != wantPerFormat {
+			return fmt.Errorf("expected %d %s packages, the run wrote %d (%s)",
+				wantPerFormat, ext, len(got), strings.Join(got, ", "))
+		}
+		for _, p := range got {
+			if _, err := os.Stat(p); err != nil {
+				return fmt.Errorf("%s was reported written but is not there: %w", p, err)
+			}
+		}
+	}
+	return nil
+}
+
+// docTreeEntries are the documentation paths a package installs under
+// /usr/share/doc/openvox-ca, with the repository's own layout preserved so a
+// relative link between two documents still resolves once installed.
+var docTreeEntries = []string{"LICENSE", "README.md", "docs"}
+
+// stageDocTreeFloor are paths every enumeration must contain, and
+// stageDocTreePrefix is the directory at least one path must come from. See
+// checkDocTreeFloor.
+var (
+	stageDocTreeFloor  = []string{"LICENSE", "README.md"}
+	stageDocTreePrefix = "docs/"
+)
+
+// stageDocTree copies the tracked files under docTreeEntries into dest,
+// keeping their relative paths.
+//
+// Enumerated from git rather than by walking the working tree, and that is not
+// a stylistic preference. docs/ legitimately holds untracked working files --
+// design notes a maintainer has not committed and may never commit -- and a
+// walk would package them. The result would be an artefact whose contents
+// depend on the state of the tree it happened to be built in: complete in CI,
+// carrying a maintainer's private drafts when built on their laptop, with
+// nothing in the build output to distinguish the two. Tracked files are what
+// the release is made of.
+func stageDocTree(dest string) error {
+	// Every entry, not the first three. Indexing them by hand meant a fourth
+	// documentation path could be added to docTreeEntries and silently never
+	// packaged -- the list would say it shipped and the package would not
+	// contain it, with nothing failing.
+	args := append([]string{"ls-files", "--"}, docTreeEntries...)
+	out, err := sh.Output("git", args...)
+	if err != nil {
+		return fmt.Errorf("listing tracked documentation (packaging enumerates it from git, so it "+
+			"needs a git checkout rather than an unpacked source archive): %w", err)
+	}
+
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			paths = append(paths, line)
+		}
+	}
+
+	if err := checkDocTreeFloor(paths); err != nil {
+		return err
+	}
+
+	for _, path := range paths {
+		staged := filepath.Join(dest, path)
+		if err := copyStagedFile(path, staged); err != nil {
+			return err
+		}
+		if err := stampStagedFile(staged); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stampStagedFile pins a staged file's modification time to SOURCE_DATE_EPOCH,
+// and does nothing when that is unset.
+//
+// nfpm stamps everything it generates itself from that variable -- every other
+// payload entry, the rpm's BUILDTIME, the deb's control archive -- but the
+// documentation goes in as a `tree` of real files, and a tree entry keeps the
+// mtime it finds on disk. These files are written by copyStagedFile moments
+// earlier, so that mtime is "now": two builds of the same commit differ, and a
+// checksum published against a package means nothing across a rebuild. Every
+// other byte in the package is already reproducible, which makes this the only
+// thing standing between the packages and a verifiable rebuild.
+//
+// Unset is left alone deliberately. SOURCE_DATE_EPOCH is the caller's
+// statement that this build is meant to be reproducible; inventing a timestamp
+// when nobody asked would put a wrong date on installed documentation for the
+// ordinary developer build.
+func stampStagedFile(path string) error {
+	epoch := os.Getenv("SOURCE_DATE_EPOCH")
+	if epoch == "" {
+		return nil
+	}
+	// nfpm ignores a SOURCE_DATE_EPOCH it cannot parse rather than failing, so
+	// this does the same: a malformed value must not make the two halves of
+	// one package disagree about which rule they followed.
+	secs, err := strconv.ParseInt(epoch, 10, 64)
+	if err != nil {
+		return nil
+	}
+	when := time.Unix(secs, 0).UTC()
+	return os.Chtimes(path, when, when)
+}
+
+// checkDocTreeFloor rejects a documentation enumeration that is wrong rather
+// than merely empty.
+//
+// `git ls-files` exits 0 and prints nothing when it matches nothing, so a
+// pathspec that stopped matching -- docs/ renamed, this target run from a
+// subdirectory -- would otherwise stage an empty tree and package a
+// /usr/share/doc/openvox-ca holding no documentation at all, silently.
+//
+// Split out from stageDocTree so it can be exercised without renaming
+// directories in the working tree: the enumeration is the hard part to
+// arrange, the check over it is not.
+func checkDocTreeFloor(paths []string) error {
+	for _, want := range stageDocTreeFloor {
+		if !slices.Contains(paths, want) {
+			return fmt.Errorf("git tracks no %q under %s, so the documentation enumeration is wrong "+
+				"rather than empty (found %d paths)", want, strings.Join(docTreeEntries, ", "), len(paths))
+		}
+	}
+
+	// And at least one path from docs/ itself. Without this the floor checked
+	// only the two single-file entries, so the one entry that can silently
+	// stop matching -- the directory, whose pathspec is the whole reason this
+	// enumeration is not a fixed list -- was the one it did not cover. A
+	// renamed docs/ would have passed the floor and packaged LICENSE and
+	// README beside an empty tree.
+	for _, p := range paths {
+		if strings.HasPrefix(p, stageDocTreePrefix) {
+			return nil
+		}
+	}
+	return fmt.Errorf("git tracks no path under %q, so the documentation enumeration is wrong rather "+
+		"than empty (found %d paths: %s)", stageDocTreePrefix, len(paths), strings.Join(paths, ", "))
+}
+
+// copyStagedFile copies one file into the staging tree, creating its parents.
+// Mode 0644 unconditionally: everything staged this way is documentation, and
+// reading it back off the working tree would let a developer's umask decide
+// what the package installs.
+func copyStagedFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
+}
+
+// maxExtractedFileBytes caps a single entry unpacked from a release tarball.
+// The binaries are around 100MB; 2GB leaves room for growth by an order of
+// magnitude while still bounding what a malformed or hostile archive can write
+// to a build host.
+const maxExtractedFileBytes = 2 << 30
+
+// extractTarGz extracts the named entries of a .tar.gz into destDir, and fails
+// if any of them is missing. Only the names asked for are written, and any
+// entry whose name is not a plain filename is refused: this reads an archive
+// this build produced moments ago, but a path-traversal check that is only
+// present when the input is untrusted is a check that is absent when it is
+// needed.
+func extractTarGz(archive, destDir string, want []string) error {
+	f, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	found := map[string]bool{}
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		// Checked before the allowlist, not after. Behind it, this could
+		// only ever fire for a name the *caller* asked for -- an archive
+		// entry called ../../openvox-ca simply failed the allowlist and was
+		// skipped, so the guard the comment above describes could not be
+		// reached by a hostile archive at all, and the spec that appeared to
+		// cover it was passing the traversing name in `want`.
+		if hdr.Name != filepath.Base(hdr.Name) {
+			return fmt.Errorf("archive entry %q is not a plain filename", hdr.Name)
+		}
+		if !slices.Contains(want, hdr.Name) || found[hdr.Name] {
+			continue
+		}
+		// Regular files only. A symlink, hardlink or directory entry carries
+		// no payload, so io.Copy would write nothing, found[] would mark the
+		// name satisfied, and a later real entry of the same name would be
+		// skipped -- yielding a package containing a zero-byte binary from a
+		// build that reported success. The missing-entry check at the end
+		// cannot see it, because the name was found.
+		if hdr.Typeflag != tar.TypeReg {
+			return fmt.Errorf("archive entry %q is not a regular file (type %q)",
+				hdr.Name, string(hdr.Typeflag))
+		}
+		out := filepath.Join(destDir, hdr.Name)
+		w, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, os.FileMode(hdr.Mode).Perm())
+		if err != nil {
+			return err
+		}
+		// Bounded rather than suppressed. G110 is about how far the gzip
+		// stream expands, which the entry allowlist above does not constrain
+		// -- the previous //nolint:gosec here gave the allowlist as its
+		// reason, which answered a different question. The limit is generous
+		// enough that no real binary approaches it and small enough that a
+		// malformed archive cannot fill the build host's disk.
+		if _, err := io.Copy(w, io.LimitReader(tr, maxExtractedFileBytes)); err != nil {
+			w.Close()
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		found[hdr.Name] = true
+	}
+
+	for _, name := range want {
+		if !found[name] {
+			return fmt.Errorf("%s holds no %q", filepath.Base(archive), name)
+		}
+	}
+	return nil
 }
 
 // -- release:* -----------------------------------------------------------------
@@ -3859,6 +4753,10 @@ func (Dev) Check() error {
 	}
 	fmt.Println("Checking chart version pins...")
 	if err := verifyChartPins(); err != nil {
+		return err
+	}
+	fmt.Println("Checking mage targets named outside Go...")
+	if err := verifyMageTargets(); err != nil {
 		return err
 	}
 	fmt.Println("Checking the auto-merge label exclusion...")

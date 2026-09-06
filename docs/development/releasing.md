@@ -48,6 +48,20 @@ tarballs-only `checksums.txt`) locally in one go, run `mage build:dist`; the
 SBOMs and the provenance bundle are produced by the release workflow, not
 locally.
 
+**Packages are not in that table yet.** `mage build:packages` reads the
+variant tarballs already in `dist/` and writes one `.deb` and one `.rpm` per
+packaged variant beside them; it builds no binaries, and the FIPS variants are
+not packaged (see `packaged` on `distVariantSpec`). Adding the job that
+publishes them is [#266](https://github.com/voxpupuli/openvox-ca/pull/266),
+so today they are a local build only.
+
+When that job lands it should export `SOURCE_DATE_EPOCH`. nfpm stamps every
+entry it generates from that variable, and `stageDocTree` stamps the
+documentation tree with it too, so with it set a rebuild of the same inputs is
+byte-identical and a published checksum keeps its meaning; with it unset the
+packages carry the build's own clock and no two builds agree. The magefile
+specs assert both halves of that.
+
 The major-only container tag (`:1`, `:2`) is deliberately suppressed while the
 version is `v0.*`, because a `0.x` major carries no compatibility promise.
 

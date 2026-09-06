@@ -148,8 +148,8 @@ one instance, and the lock catches the case it can.
   server's next acquisition of that name fails — deliberately and loudly, with
   an error naming the file, its owner and `chown -R`, because the alternative is
   it quietly giving up on locking while the root process believes it holds an
-  exclusive one. Under systemd that means `sudo -u puppet-ca openvox-ca-ctl …`
-  (or `runuser -u puppet-ca --`), matching the `User=` in the unit. It applies
+  exclusive one. Under systemd that means `sudo -u puppet openvox-ca-ctl …`
+  (or `runuser -u puppet --`), matching the `User=` in the unit. It applies
   even to commands that only read, such as `migrate` from a live source, since
   taking the lock is what creates the file.
 
@@ -276,8 +276,8 @@ still required for per-subject generated keys and ancillary local state.
 ```yaml
 # /etc/puppet-ca/config.yaml
 storage_backend: etcd
-cadir: /var/lib/puppet-ca                # still needed for per-subject keys
-                                         # and ancillary local state
+# still needed for per-subject keys and ancillary local state
+cadir: /etc/puppetlabs/puppet/ssl/ca
 
 etcd_endpoints:
   - https://etcd-0.example.com:2379
@@ -408,8 +408,8 @@ operators who need the strictest cross-node consistency should prefer `etcd`.
 ```yaml
 # /etc/puppet-ca/config.yaml
 storage_backend: redis                   # or "valkey"
-cadir: /var/lib/puppet-ca                # still needed for per-subject keys
-                                         # and ancillary local state
+# still needed for per-subject keys and ancillary local state
+cadir: /etc/puppetlabs/puppet/ssl/ca
 
 redis_addrs:
   - redis-0.example.com:6379             # first address is used in direct mode
@@ -440,7 +440,7 @@ failovers automatically.
 
 ```yaml
 storage_backend: redis
-cadir: /var/lib/puppet-ca
+cadir: /etc/puppetlabs/puppet/ssl/ca
 
 redis_sentinel_master_name: mymaster
 redis_sentinel_addrs:
@@ -606,8 +606,9 @@ single-node, not a clustering option.
 ```yaml
 # /etc/puppet-ca/config.yaml
 storage_backend: sqlite
-cadir: /var/lib/puppet-ca                # still needed for per-subject keys
-sql_dsn: "file:/var/lib/puppet-ca/ca.db" # SQLite database file path / URI
+cadir: /etc/puppetlabs/puppet/ssl/ca      # still needed for per-subject keys
+# the SQLite database file path / URI
+sql_dsn: "file:/etc/puppetlabs/puppet/ssl/ca/ca.db"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
 sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
@@ -619,7 +620,7 @@ than failing under contention.
 
 ```text
 --storage-backend sqlite
---sql-dsn         file:/var/lib/puppet-ca/ca.db
+--sql-dsn         file:/etc/puppetlabs/puppet/ssl/ca/ca.db
 ```
 
 **Operational notes.** The database file *is* the CA — back it up (with its WAL
@@ -647,7 +648,7 @@ can share it. `postgres`, `postgresql` and `pg` are accepted as aliases.
 ```yaml
 # /etc/puppet-ca/config.yaml
 storage_backend: postgres
-cadir: /var/lib/puppet-ca                # still needed for per-subject keys
+cadir: /etc/puppetlabs/puppet/ssl/ca      # still needed for per-subject keys
 sql_dsn: "postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=require"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
@@ -683,7 +684,7 @@ replicas can share it. `mysql` and `mariadb` are accepted as aliases.
 ```yaml
 # /etc/puppet-ca/config.yaml
 storage_backend: mysql                   # or "mariadb"
-cadir: /var/lib/puppet-ca                # still needed for per-subject keys
+cadir: /etc/puppetlabs/puppet/ssl/ca      # still needed for per-subject keys
 sql_dsn: "puppetca:secret@tcp(db.example.com:3306)/puppetca"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
@@ -787,7 +788,7 @@ configured backend.
 
 ```yaml
 storage_backend: etcd
-cadir: /var/lib/puppet-ca
+cadir: /etc/puppetlabs/puppet/ssl/ca
 etcd_endpoints: [https://etcd:2379]
 
 # Keep the CA cert and key out of etcd; mount them from the host.
@@ -923,8 +924,8 @@ minimal SQLite target:
 ```yaml
 # sqlite.yaml
 storage_backend: sqlite
-cadir: /var/lib/puppet-ca
-sql_dsn: file:/var/lib/puppet-ca/ca.db
+cadir: /etc/puppetlabs/puppet/ssl/ca
+sql_dsn: file:/etc/puppetlabs/puppet/ssl/ca/ca.db
 ```
 
 The migration copies the whole CA — certificate, keys, CRL, serial, the
