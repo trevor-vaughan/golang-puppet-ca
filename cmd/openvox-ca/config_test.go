@@ -152,6 +152,12 @@ var _ = Describe("loadServerConfig built-in defaults", func() {
 		Expect(cfg.NoTLSRequired).To(BeFalse(), "NoTLSRequired = true; want false")
 		Expect(cfg.Verbosity).To(Equal(0), "Verbosity = %d; want 0", cfg.Verbosity)
 		Expect(cfg.CAPathLength).To(Equal(-1), "CAPathLength = %d; want -1 (unconstrained)", cfg.CAPathLength)
+		// Security-relevant default: a CSR may not name anything beyond its own
+		// certname unless an operator opts in. Guard the literal — flipping it
+		// would reopen the impersonation path #293 closed, and nothing else
+		// here would fail.
+		Expect(cfg.AllowSubjectAltNames).To(BeFalse(),
+			"AllowSubjectAltNames = true; want false (CSRs may not request SANs by default)")
 		// Security-relevant default: superseded certificates are revoked on
 		// auto-renewal unless explicitly disabled. Guard the literal so a
 		// regression flipping it to false cannot pass silently.
@@ -863,6 +869,10 @@ var _ = Describe("applyServerEnv each variable", func() {
 		// typo in the env key would then leave it false and fail this entry.
 		Entry("REVOKE_ON_AUTO_RENEW", "PUPPET_CA_REVOKE_ON_AUTO_RENEW", "true",
 			func(c *serverConfig) bool { return c.RevokeOnAutoRenew }, "RevokeOnAutoRenew"),
+		// Same reasoning as above: false is the zero value, so assert the env
+		// var flips it to true. A typo in the key leaves it false and fails.
+		Entry("ALLOW_SUBJECT_ALT_NAMES", "PUPPET_CA_ALLOW_SUBJECT_ALT_NAMES", "true",
+			func(c *serverConfig) bool { return c.AllowSubjectAltNames }, "AllowSubjectAltNames"),
 		// Distinct values, because these two are adjacent ints with adjacent
 		// names: swapping the destinations would turn a 12-hour overlap window
 		// into a 12-hour sweep interval on a 90-second delay, and both would
@@ -1084,6 +1094,61 @@ var _ = Describe("crlChainRefreshInterval", func() {
 		Expect(cfg.crlSyncInterval()).To(Equal(15 * time.Second))
 		Expect(cfg.crlChainRefreshInterval()).To(Equal(defaultCRLChainRefreshInterval),
 			"crl_sync_interval_sec must not decide how often the chain file is re-read")
+	})
+})
+
+// --- allow_subject_alt_names wiring ---
+
+var _ = Describe("allow_subject_alt_names wiring", func() {
+	// File-and-environment only, no CLI flag, and its failure mode is silent in
+	// both directions: a value that never reaches ca.AllowSubjectAltNames
+	// either strands the operator who turned it on (their agents keep being
+	// refused) or leaves the gate off while they believe they configured
+	// something, which is the impersonation path #293 exists to close. Nothing
+	// in internal/ca can catch that — those specs set the field in Go and never
+	// go through config loading at all.
+	BeforeEach(func() { clearServerEnv() })
+
+	It("is false by default", func() {
+		cfg, err := loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.AllowSubjectAltNames).To(BeFalse())
+	})
+
+	It("is read from the config file", func() {
+		path := writeTempConfig("allow_subject_alt_names: true\n")
+		cfg, err := loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.AllowSubjectAltNames).To(BeTrue())
+	})
+
+	It("is read from the environment, which outranks the file", func() {
+		path := writeTempConfig("allow_subject_alt_names: false\n")
+		setEnv("PUPPET_CA_ALLOW_SUBJECT_ALT_NAMES", "true")
+		cfg, err := loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.AllowSubjectAltNames).To(BeTrue())
+	})
+
+	It("reaches the CA, which is the step whose absence is silent", func() {
+		cfg, err := loadServerConfig(writeTempConfig("allow_subject_alt_names: true\n"))
+		Expect(err).NotTo(HaveOccurred())
+
+		myCA := ca.New(storage.New(GinkgoT().TempDir()), ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(applyCAConfig(myCA, cfg)).To(Succeed())
+		Expect(myCA.AllowSubjectAltNames).To(BeTrue())
+	})
+
+	It("leaves the CA refusing when the file says false", func() {
+		// The direction that matters for the vulnerability: a wiring defect
+		// that ignored the file would be invisible above, since true is what
+		// every other spec here asserts.
+		cfg, err := loadServerConfig(writeTempConfig("allow_subject_alt_names: false\n"))
+		Expect(err).NotTo(HaveOccurred())
+
+		myCA := ca.New(storage.New(GinkgoT().TempDir()), ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(applyCAConfig(myCA, cfg)).To(Succeed())
+		Expect(myCA.AllowSubjectAltNames).To(BeFalse())
 	})
 })
 

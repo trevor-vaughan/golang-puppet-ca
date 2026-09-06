@@ -309,6 +309,17 @@ func (s *Server) handlePutStatus(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("Sign failed", "subject", subject, "error", err)
 			if strings.Contains(err.Error(), "CSR not found") {
 				http.Error(w, "CSR not found", http.StatusNotFound)
+			} else if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
+				// 409 rather than the 400 the CSR-submission path uses, because
+				// here the operator's request is well-formed — it is the stored
+				// CSR that policy refuses, which is a conflict with the CA's
+				// state rather than a bad request. That matches the sibling
+				// signing-policy rejection immediately below, and the message
+				// is surfaced for the same reason: an admin-tier caller acting
+				// on a queued CSR needs to know why it will not sign, and a
+				// bare "conflict" sends them to the logs of whichever replica
+				// served them.
+				http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusConflict)
 			} else if strings.Contains(err.Error(), "found extensions that disallow signing") {
 				// Signing-policy rejection: the message lists only disallowed
 				// OIDs (no filesystem paths), so it is safe to surface and is a
@@ -696,6 +707,14 @@ func (s *Server) handlePutRequest(w http.ResponseWriter, r *http.Request) {
 			// Returning 409 here causes the node (e.g. openvox-agent) to treat the
 			// submission as fatal and abort the run entirely.
 			w.WriteHeader(http.StatusOK)
+		} else if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
+			// Policy refusal, not a fault: the CSR is well-formed but asks for
+			// names it may not have. 400 rather than 500 so the agent stops
+			// rather than retrying a request that can never succeed, and the
+			// sentinel's own message rather than err.Error() so the response
+			// stays generic — which entries were refused is in the CA's log.
+			slog.Warn("SaveRequest refused: disallowed subject alternative names", "subject", subject)
+			http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusBadRequest)
 		} else if csrValidationError(err) {
 			// Client-actionable validation failure (malformed or mis-signed CSR,
 			// or CN/subject mismatch). The message is path-free and useful to the
@@ -1530,6 +1549,18 @@ func (s *Server) handlePostCertificateRenewal(w http.ResponseWriter, r *http.Req
 			if errors.Is(err, ca.ErrNotInitialized) {
 				// See the auto-renewal branch.
 				http.Error(w, "CA not ready", http.StatusServiceUnavailable)
+				return
+			}
+			if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
+				// 400 as on PUT /certificate_request, and for the same reason:
+				// the client supplied this CSR, the refusal is a policy
+				// decision rather than a fault, and it can never succeed as
+				// submitted — so the agent must stop rather than retry a 500
+				// forever. Without this arm the catch-all below answers 500 and
+				// the agent reads a deliberate refusal as a server problem.
+				slog.Warn("Renewal refused: disallowed subject alternative names",
+					"subject", sanitiseForLog(cn))
+				http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusBadRequest)
 				return
 			}
 			slog.Warn("Renewal failed", "subject", sanitiseForLog(cn), "error", err)

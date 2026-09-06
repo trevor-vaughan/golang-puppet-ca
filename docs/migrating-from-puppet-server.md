@@ -545,6 +545,37 @@ sequential integers. This is a security improvement (CA/Browser Forum
 guidance) but means serial numbers will look different from what you're
 used to. The `serial` file from old Puppet CAs is ignored.
 
+### Subject alternative names requested by a CSR
+
+Parity, and worth checking before you cut over: `allow_subject_alt_names`
+defaults to `false`, as OpenVox Server's `allow-subject-alt-names` does. A CSR
+asking for any SAN beyond a DNS entry equal to its own certname is refused at
+signing time rather than trimmed or honoured.
+
+If your agents request alt names — a `dns_alt_names` setting in their
+`puppet.conf`, or a load-balanced service answering to several hostnames — those
+nodes will fail to sign until you set:
+
+```yaml
+allow_subject_alt_names: true
+```
+
+Certificates you have already imported keep renewing whatever the setting says:
+the gate judges a renewal against the certificate being renewed, so a name it
+already holds is never refused and only a request for a *new* name is. What the
+setting does not fix is which names survive onto the replacement — the
+empty-body auto-renewal path carries all four SAN types forward, while a
+CSR-body renewal is issued with DNS names only, as every CSR-signed certificate
+is today (see [#241](https://github.com/voxpupuli/openvox-ca/issues/241)). An
+imported certificate holding IP, email or URI SANs keeps them through
+auto-renewal and loses them through a re-key. The generate paths are not filtered either
+— `openvox-ca generate --dns` on the CA host and the admin-only
+`POST /generate/{subject}?dns=` — because their names come from an administrator
+rather than from an agent's CSR.
+
+The refusal names no entries back to the requester; look in the CA's log at
+`WARN` for which ones were refused.
+
 ### Auth-arc OID stripping
 
 openvox-ca strips Puppet authorization-arc OIDs (`1.3.6.1.4.1.34380.1.3.*`)

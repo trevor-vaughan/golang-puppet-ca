@@ -10,7 +10,7 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
-| `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
+| `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below. `signed` returns `409 Conflict` when the queued CSR requests subject alternative names policy refuses ([`allow_subject_alt_names`](configuration.md#subject-alternative-names-requested-by-a-csr)) or extensions that disallow signing; both carry a body naming the cause |
 | `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails, as does the deletion of any pending request — see the note below and [Authorization tiers](#authorization-tiers) |
 | `PUT` | `/certificate_status_by_serial/{serial}` | Revoke one specific serial, rather than whatever is newest for a subject — see [Revocation by serial](#revocation-by-serial); admin-only |
 
@@ -152,6 +152,27 @@ Two refusals are deliberate:
 | `PUT` | `/certificate_request/{subject}` | Submit a new CSR (body: raw PEM) |
 | `DELETE` | `/certificate_request/{subject}` | Delete a pending CSR |
 
+`PUT /certificate_request/{subject}` answers `200 OK` when the CSR is accepted —
+whether it was autosigned immediately or queued for manual signing, and also
+when a signed certificate already exists for the subject, which is a `200` so
+that an agent continues its poll loop and collects the certificate by `GET`
+rather than treating the submission as fatal. It answers `400 Bad Request` for a
+CSR that cannot be decoded or parsed, whose signature does not verify, or whose
+Common Name does not match the subject in the path. Those three are refused
+whatever the autosign policy, because they are decided before it. A fourth is
+not: a CSR requesting subject alternative names it may not have, which
+[`allow_subject_alt_names`](configuration.md#subject-alternative-names-requested-by-a-csr)
+governs, is refused here with `400` **only when the submission is autosigned**,
+since that is the only case in which this endpoint signs anything. With manual
+signing the CSR is accepted (`200`) and queued as usual, and the refusal
+surfaces later — at `PUT /certificate_status` as a `409`, or in `POST /sign`'s
+signing-errors list. An operator testing the setting with autosign off should
+expect the `200`. That last refusal is deliberately generic — it names no entries, so a
+caller on this unauthenticated endpoint cannot use it to discover which names
+the CA would issue; the refused entries go to the CA's log at `WARN`. Anything
+else is a `500`, whose message is withheld for the same reason — except a submission
+refused by [`csr_rate_limit`](configuration.md), which answers `429 Too Many Requests` before the CSR is read at all.
+
 `DELETE /certificate_request/{subject}` is an operator rejecting a request
 rather than signing it, and it takes the same per-subject lock that `POST
 /sign`, `PUT /certificate_request`'s autosign and [renewal](#certificate-renewal)
@@ -212,6 +233,8 @@ Requires a valid CA-signed client certificate. The new certificate is issued imm
 If the CA has not finished initialising, the request returns `503 Service Unavailable` (retry once it is ready).
 
 If the presented certificate's (or CSR's) key falls below the CA key-strength policy — for example an RSA-1024 key imported from a legacy CA — the request is rejected with `422 Unprocessable Entity` rather than renewed; the agent must re-key via the CSR path with a compliant key.
+
+A CSR-body renewal requesting a subject alternative name the presented certificate does not already carry is rejected with `400 Bad Request`, governed by [`allow_subject_alt_names`](configuration.md#subject-alternative-names-requested-by-a-csr). A renewal may keep the names its own certificate already holds — that is what stops the setting stranding the nodes it was enabled for — but it may not introduce new ones, so this is `400` rather than a server error: the request can never succeed as submitted and the agent should stop rather than retry. The refusal names no entries; they go to the CA's log at `WARN`. The empty-body path cannot reach this refusal at all, since it carries the presented certificate's SANs forward rather than reading any from a request.
 
 If the presented certificate has been revoked, both paths reject the request with `403 Forbidden`. That check re-reads the CRL from storage rather than trusting the in-memory copy the mTLS layer uses, so it holds even on a replica that has not yet picked up a revocation performed elsewhere — renewal does not become a way out of a lockout during the propagation window.
 

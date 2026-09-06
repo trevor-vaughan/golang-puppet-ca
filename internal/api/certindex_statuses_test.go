@@ -100,6 +100,9 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		DeferCleanup(func() { _ = backend.Close() })
 		store = storage.NewWithBackend(backend, dir)
 		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		// These fixtures sign CSRs that request DNS alt names, which the default
+		// policy refuses; the index projection under test is what needs them.
+		myCA.AllowSubjectAltNames = true
 
 		Expect(store.EnsureDirs(ctx)).To(Succeed())
 		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
@@ -465,6 +468,9 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		DeferCleanup(func() { _ = inner.Close() })
 		store = storage.NewWithBackend(&unknownStateBackend{SQLBackend: inner, subject: "idx-ambig"}, dir)
 		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		// These fixtures sign CSRs that request DNS alt names, which the default
+		// policy refuses; the index projection under test is what needs them.
+		myCA.AllowSubjectAltNames = true
 		Expect(store.EnsureDirs(ctx)).To(Succeed())
 		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
 		Expect(store.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())

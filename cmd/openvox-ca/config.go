@@ -156,6 +156,14 @@ type serverConfig struct {
 
 	// PromoteCNToSAN adds the CN as a DNS SAN when the CSR has no SANs (default: true).
 	PromoteCNToSAN bool `yaml:"promote_cn_to_san"`
+	// AllowSubjectAltNames lets a submitted CSR request Subject Alternative
+	// Names of its own (default: false, matching OpenVox Server's
+	// allow-subject-alt-names). When false, a CSR carrying any SAN other than a
+	// lone DNS entry equal to its own certname is refused at signing time. Does
+	// not affect either generate path (`openvox-ca generate --dns` or the
+	// admin-only `POST /generate/{subject}?dns=`), whose names come from an
+	// administrator rather than from an agent's CSR.
+	AllowSubjectAltNames bool `yaml:"allow_subject_alt_names"`
 	// PuppetDateTimeFormat formats JSON date/time fields using the original Puppet CA
 	// style ("2006-01-02T15:04:05MST") instead of RFC 3339 (default: false).
 	PuppetDateTimeFormat bool `yaml:"puppet_datetime_format"`
@@ -242,6 +250,9 @@ func loadServerConfig(configFile string) (*serverConfig, error) {
 		// Same sentinel convention; see resolveSigningConcurrency.
 		CASigningConcurrency: -1,
 		PromoteCNToSAN:       true, // RFC 2818: add CN as SAN when CSR has no SANs
+		// AllowSubjectAltNames defaults to false — see the field comment. Left
+		// implicit here would make the safe default look like an oversight.
+		AllowSubjectAltNames: false,
 		RevokeOnAutoRenew:    true, // only the newest serial per subject should be valid
 		// unset sentinel; 0 revokes inside the renewal, -1 falls back to
 		// defaultSupersededCertRevokeAfter
@@ -622,6 +633,11 @@ func applyServerEnv(cfg *serverConfig) {
 	if v := os.Getenv("PUPPET_CA_PROMOTE_CN_TO_SAN"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.PromoteCNToSAN = b
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_ALLOW_SUBJECT_ALT_NAMES"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.AllowSubjectAltNames = b
 		}
 	}
 	if v := os.Getenv("PUPPET_CA_PUPPET_DATETIME_FORMAT"); v != "" {

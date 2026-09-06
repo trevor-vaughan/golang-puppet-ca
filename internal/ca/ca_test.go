@@ -287,6 +287,10 @@ var _ = Describe("CA Lifecycle", func() {
 		})
 
 		It("does not promote CN when the CSR already carries SANs", func() {
+			// A CSR may only request SANs of its own where policy allows it,
+			// so this spec has to opt in to have anything to not-promote over.
+			myCA.AllowSubjectAltNames = true
+
 			key, _ := rsa.GenerateKey(rand.Reader, 2048)
 			tmpl := &x509.CertificateRequest{
 				Subject:  pkix.Name{CommonName: "test-node"},

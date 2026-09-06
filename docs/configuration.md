@@ -105,6 +105,7 @@ ca_path_length: -1    # -1 = unconstrained, 0 = leaf certs only, N = N levels of
 ca_validity_days: 0   # 0 = built-in default (~5 years); positive integer overrides
 leaf_validity_days: 0 # 0 = built-in default (~5 years); positive integer overrides
 promote_cn_to_san: true # add the CN as a DNS SAN when a CSR carries none (RFC 2818)
+allow_subject_alt_names: false # let a CSR request SANs of its own; see "Subject alternative names requested by a CSR"
 crl_validity_days: 0  # 0 = built-in default (30 days); positive integer overrides
 csr_rate_limit: 60    # max CSR submissions per IP per minute; 0 = disable rate limiting
 # Caps concurrent CA-key signatures across issuance, CRL re-signing and the OCSP
@@ -219,6 +220,7 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 | `ca_validity_days` | `PUPPET_CA_CA_VALIDITY_DAYS` |
 | `leaf_validity_days` | `PUPPET_CA_LEAF_VALIDITY_DAYS` |
 | `promote_cn_to_san` | `PUPPET_CA_PROMOTE_CN_TO_SAN` |
+| `allow_subject_alt_names` | `PUPPET_CA_ALLOW_SUBJECT_ALT_NAMES` |
 | `crl_validity_days` | `PUPPET_CA_CRL_VALIDITY_DAYS` |
 | `disable_crl_refresh` | `PUPPET_CA_DISABLE_CRL_REFRESH` |
 | `crl_refresh_interval_sec` | `PUPPET_CA_CRL_REFRESH_INTERVAL_SEC` |
@@ -1304,6 +1306,78 @@ csr_pem=$(cat)
 # approve only nodes whose name starts with "web-"
 [[ "$subject" == web-* ]] && exit 0 || exit 1
 ```
+
+### Subject alternative names requested by a CSR
+
+`allow_subject_alt_names` decides whether a submitted CSR may ask for Subject
+Alternative Names of its own. It is **off by default**, matching OpenVox
+Server's `allow-subject-alt-names`.
+
+> **What you will see if your agents request alt names.** Any node whose CSR
+> asks for a name beyond its own certname — a `dns_alt_names` setting in its
+> `puppet.conf`, or a service enrolling under several hostnames — cannot enrol
+> or re-key while this is off. The CA logs a `WARN` naming
+> `allow_subject_alt_names`, and the client gets a `400` (autosigned) or a `409`
+> (manual signing). Set `allow_subject_alt_names: true` if that is what your
+> fleet needs. Certificates that already hold SANs keep renewing either way:
+> renewal carries their existing names forward, so only new registrations and
+> re-keys are affected.
+
+It matters most with autosigning. TLS peers match the name they dialled against
+a certificate's SAN set, not its Common Name, so a CSR that may name anything is
+a CSR that may ask to *be* anything: a node autosigned as `web01` could request
+`DNS:puppet.example.com` and be handed a certificate that impersonates this CA's
+own server to everything trusting this PKI. With the setting off, that request is
+refused at signing time.
+
+A CSR whose only SAN is a DNS entry equal to its own certname is always allowed,
+whatever the setting: agents send that to comply with RFC 2818, and it asks for
+nothing the certname does not already grant. That is distinct from
+`promote_cn_to_san`, which *adds* that entry when a CSR carries none.
+
+Turn it on when nodes legitimately need extra names — a load-balanced service
+answering to several hostnames, say — and prefer a narrow autosign policy
+alongside it:
+
+```yaml
+allow_subject_alt_names: true
+```
+
+Note what turning it on does *not* yet buy. Only DNS names are carried onto an
+issued certificate today, so a CSR requesting an IP, email or URI SAN is signed
+with the setting on and that entry is silently dropped — the certificate comes
+back without it, and the mismatch surfaces later as a failed TLS verification
+rather than as a refusal at signing time. With the setting off the same request
+is refused outright, which is the louder of the two failures.
+[#241](https://github.com/voxpupuli/openvox-ca/issues/241) adds the
+carry-through; this caveat goes when it lands.
+
+The refusal is deliberately terse to the requester: it names no entries, so a
+client cannot use it to discover which names the CA would issue. The specifics
+are in the CA's log, at `WARN`:
+
+```text
+level=WARN msg="Refusing CSR: requested subject alternative names are not allowed"
+  subject=web01 disallowed="[DNS:puppet.example.com]" disallowed_count=1
+  renewal=false setting=allow_subject_alt_names
+```
+
+The gate covers names carried on a *submitted CSR*. Three paths are treated
+differently, all deliberately:
+
+- **Renewal** is judged against the certificate being renewed rather than against
+  policy, so a certificate that already carries SANs stays renewable after the
+  setting is turned off — otherwise enabling the gate would strand exactly the
+  nodes it was enabled for. The gate does still run: a renewal may keep the names
+  its own certificate already has, and may not introduce new ones.
+- **`openvox-ca generate --dns`** mints offline from names an operator typed on
+  the CA host, and is not filtered.
+- **`POST /generate/{subject}?dns=`** is the same minting path reached over HTTP,
+  and is likewise not filtered. It *is* a request, but an admin-only one —
+  `lookupTier` classifies it `tierAdminOnly` — so its names come from an
+  administrator who could already mint anything, not from an enrolling agent.
+  That is the distinction the exemption rests on: who supplies the names, not
+  whether the path is offline.
 
 ## Directory layout (filesystem backend)
 

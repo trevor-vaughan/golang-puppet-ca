@@ -286,6 +286,11 @@ together, or stop the service while you do.
 > `PUPPET_CA_*` are its only sources — the same two this command reads, and it
 > cannot diverge from the server. It is still printed in the pre-flight, because
 > it decides what a run without `--dns` produces.
+>
+> `allow_subject_alt_names` needs no mirroring either, for a different reason:
+> `generate` never reads it. It gates the names a submitted CSR may ask for, and
+> this command issues from your flags rather than from a request, so it is not in
+> the pre-flight and cannot change what a run produces.
 
 `import-ca-cert` requires a **complete chain, nearest first**: this CA's own
 certificate, each issuer after it, ending with a self-signed root. Supply only
@@ -384,7 +389,11 @@ SAN automatically (RFC 2818 clients match SANs, not the CN) — unless
 `promote_cn_to_san: false` is set, in which case a run with no `--dns` mints a
 certificate with **no SANs at all**, which is the same unusable outcome by
 configuration rather than by flag. Check the value the pre-flight prints. As
-soon as you supply any `--dns`, the list is taken verbatim. So a serving certificate that must answer
+soon as you supply any `--dns`, the list is taken verbatim, whatever
+[`allow_subject_alt_names`](configuration.md#subject-alternative-names-requested-by-a-csr)
+is set to: that setting governs names a *submitted CSR* asks for, and these come
+from an operator on the CA host rather than from a request. A `generate` runbook
+that worked before the setting existed works unchanged with it off. So a serving certificate that must answer
 to both its own name and an alias has to list both:
 
 ```bash

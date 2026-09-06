@@ -184,6 +184,7 @@ func applyCAConfig(myCA *ca.CA, cfg *serverConfig) error {
 	myCA.LeafValidityDays = cfg.LeafValidityDays
 	myCA.EncryptCAKey = cfg.EncryptCAKey
 	myCA.PromoteCNToSAN = cfg.PromoteCNToSAN
+	myCA.AllowSubjectAltNames = cfg.AllowSubjectAltNames
 	myCA.RevokeOnAutoRenew = cfg.RevokeOnAutoRenew
 	myCA.SupersedeAfter = cfg.supersededCertRevokeAfter()
 	myCA.SigningConcurrency = resolveSigningConcurrency(cfg.CASigningConcurrency)
