@@ -275,7 +275,7 @@ state is external there is nothing left to serialise on. `podDisruptionBudget` a
 
 ### Sizing
 
-The default memory limit is 64Mi, and it is a hard cap. The server's footprint
+The default memory limit is 128Mi, and it is a hard cap. The server's footprint
 grows with the size of the fleet: it keeps a serial index and a cache of
 pre-signed OCSP responses, one entry per known certificate, pruned only on
 revocation or expired-certificate cleanup. Crossing the limit is an OOMKill, and
@@ -334,7 +334,7 @@ config:
 The raised limit is not optional. The ceiling has to leave the frontend at least
 **24Mi** after both reservations, and a derived ceiling is scaled to 90% first,
 so a 128Mi signer reserve needs roughly 178Mi before anything divides at all —
-at the shipped 64Mi limit this setting alone would switch the whole mechanism
+at the shipped 128Mi limit this setting alone would switch the whole mechanism
 off.
 
 A budget too small to leave the frontend a workable share is left undivided
@@ -350,16 +350,11 @@ malformed GOMEMLIMIT`.
 (the exact floor is 65244729 bytes). Below it `resources.limits.memory` is left
 undivided — and then no process gets a limit at all, so the cliff is back.
 
-**Upgrading:** before the launcher divided anything, no process had a
-`GOMEMLIMIT` under the chart defaults, so the frontend could grow to most of the
-64Mi limit before being OOMKilled. After this change its share is 25.6Mi, and
-exceeding that is continuous GC rather than a restart — quieter, and easier to
-miss. If your fleet was running near the old limit, raise
-`resources.limits.memory` at upgrade time. At the shipped 64Mi default the tree budget
-is 57.6Mi and the frontend's share is **25.6Mi**, the launcher's 8Mi and the
-signer's 24Mi; the startup log line reports all four. If that is tighter than
-your fleet needs, raise `resources.limits.memory` — every byte above the two
-fixed reservations goes to the frontend.
+At the shipped 128Mi default the tree budget is 115.2Mi and the frontend's share
+is **83.2Mi**, the launcher's 8Mi and the signer's 24Mi; the startup log line
+reports all four. If that is tighter than your fleet needs, raise
+`resources.limits.memory` — every byte above the two fixed reservations goes to
+the frontend.
 
 These three keys go under `config`; see
 [memory budget](configuration.md#memory-budget) for their grammar and defaults.
@@ -792,14 +787,6 @@ Pass `-f values.yaml` instead if you keep your values in a file.
 
 Worth knowing before you upgrade:
 
-- **The server now divides one memory budget across its three processes**, where
-  each previously applied the whole of `GOMEMLIMIT` independently. With the
-  chart's default `resources.limits.memory: 64Mi` and no `GOMEMLIMIT` set, the
-  frontend's runtime was uncapped before and is now limited to 25.6Mi; exceeding
-  that is continuous GC rather than an OOMKill restart, so it is quieter than
-  what it replaced. An install left at the default takes this without any values
-  change. If your fleet was running near the old limit, raise
-  `resources.limits.memory` at upgrade time — see [Sizing](#sizing).
 - While `persistence.enabled` is true the derived strategy is Recreate, so
   there is a brief outage as the old pod releases the volume. External-backend
   deployments (`persistence.enabled: false`) derive RollingUpdate and roll

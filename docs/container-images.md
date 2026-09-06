@@ -95,12 +95,7 @@ it across the three processes it runs (a supervisor, an isolated signer and the
 frontend), rather than letting each apply the whole of it. On a cgroup v1 host
 nothing is derived; set `GOMEMLIMIT` on the container instead. `GOMEMLIMIT` set
 on the container likewise names the budget for the whole tree, not for one
-process.
-
-This changes an existing deployment: before this release nothing derived a
-limit, so a container that already ran with `--memory` has its frontend newly
-capped at what remains after the two fixed reservations. See
-[memory budget](configuration.md#memory-budget).
+process. See [memory budget](configuration.md#memory-budget).
 
 ### Runtime user
 

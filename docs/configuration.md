@@ -1289,15 +1289,6 @@ the operator's whole value independently and the aggregate soft limit would be
 three times what was asked for. The launcher therefore treats one budget as
 belonging to the **whole tree** and divides it.
 
-**Upgrading.** This is not additive for a deployment that already ran under a
-memory ceiling. Before this release nothing derived a limit, so each process's
-runtime was capped only by whatever `GOMEMLIMIT` the operator set — usually
-none. After it, a host with a cgroup v2 ceiling (a container memory limit, or a
-systemd unit with `MemoryMax=`) has that ceiling divided, and the frontend is
-capped at what remains after the two fixed reservations. Exceeding a soft limit
-is continuous GC rather than an OOMKill, which is quieter than what it replaced.
-If your fleet was running near the old ceiling, raise it at upgrade time.
-
 The budget comes from `GOMEMLIMIT` when set, and otherwise from this process's
 cgroup v2 memory ceiling (`memory.max`, resolved through `/proc/self/cgroup`, so
 a systemd unit's `MemoryMax=` is honoured as well as a container limit). An

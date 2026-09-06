@@ -404,12 +404,16 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		// cgroup ceiling and is scaled to 90% first, so those specs say nothing
 		// about the shipped configuration. These pin it, and the figures the
 		// chart and helm-chart.md publish.
-		It("divides the chart's shipped 64Mi limit on the cgroup path", func() {
-			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("67108864\n"))
+		It("divides the chart's shipped 128Mi limit on the cgroup path", func() {
+			// 128Mi is what charts/openvox-ca/values.yaml ships. These are the
+			// exact figures values.yaml, the chart README row and the Sizing
+			// section all publish by value, so a change to the reservations or
+			// the percentage that nobody carried into the documents fails here.
+			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("134217728\n"))
 
 			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
-			Expect(budget.total).To(Equal(int64(60397977)), "the documented 57.6Mi tree budget")
-			Expect(budget.frontend).To(Equal(int64(26843545)), "the documented 25.6Mi frontend share")
+			Expect(budget.total).To(Equal(int64(120795955)), "the documented 115.2Mi tree budget")
+			Expect(budget.frontend).To(Equal(int64(87241523)), "the documented 83.2Mi frontend share")
 			Expect(budget.launcher).To(Equal(int64(8 << 20)))
 			Expect(budget.signer).To(Equal(int64(24 << 20)))
 		})
@@ -690,7 +694,7 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		},
 		// Everything GOMEMLIMIT accepts, plus the trailing-B-less IEC spelling
 		// this project writes everywhere else: resources.limits.memory is
-		// "64Mi", and the shares are described in prose as "8Mi" and "24Mi".
+		// "128Mi", and the shares are described in prose as "8Mi" and "24Mi".
 		// Rejecting that form and silently substituting a default was a trap.
 		Entry("the GOMEMLIMIT spelling", "24MiB", int64(24<<20), true),
 		Entry("the Kubernetes spelling", "24Mi", int64(24<<20), true),

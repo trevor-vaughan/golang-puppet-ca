@@ -367,7 +367,7 @@ envFrom: []
 #     name: openvox-ca-extra
 #   prefix: PUPPET_CA_
 
-# 64Mi is a hard cap, and the server's footprint grows with the size of the
+# 128Mi is a hard cap, and the server's footprint grows with the size of the
 # fleet: it holds a serial index and a cache of pre-signed OCSP responses, one
 # entry per known certificate, pruned only on revocation or expired-cert
 # cleanup. Raise the limit before a growing inventory reaches it — crossing it
@@ -384,14 +384,10 @@ envFrom: []
 # gets a memory limit at all, so the cliff is back — lowering this value past
 # the default disables the mechanism rather than tightening it.
 #
-# At this 64Mi default the frontend's share is 25.6Mi, after 8Mi for the
-# launcher and 24Mi for the signer. UPGRADING: before this division existed the
-# frontend's runtime was uncapped and could grow to most of the limit, so an
-# install upgraded without changing this value has its frontend headroom cut to
-# 25.6Mi. Crossing that is continuous GC rather than a restart, which is quieter
-# and harder to spot. If your fleet was near the old limit, raise this value at
-# upgrade time; every byte above the two fixed reservations goes to the
-# frontend. With `persistence.enabled: false` and the default
+# At this 128Mi default the frontend's share is 83.2Mi, after 8Mi for the
+# launcher and 24Mi for the signer. Every byte above those two fixed
+# reservations goes to the frontend, so raising this limit raises its share and
+# nothing else. With `persistence.enabled: false` and the default
 # `medium: Memory`, the cadir tmpfs counts against this limit too and shares that
 # headroom. If you do set GOMEMLIMIT via `env` it names the budget for the whole
 # process tree, not one process, and is used in place of the ceiling derived from
@@ -401,9 +397,9 @@ envFrom: []
 resources:
   requests:
     cpu: 10m
-    memory: 48Mi
+    memory: 96Mi
   limits:
-    memory: 64Mi
+    memory: 128Mi
 
 # Roll the pods when the rendered config changes. Inert when existingConfigMap
 # is set: the chart cannot checksum a ConfigMap it did not render.

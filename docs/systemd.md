@@ -161,10 +161,7 @@ before any inventory, so a fleet beyond roughly 40,000 certificates should raise
 either, and `MemoryHigh=` is not read at all — only `memory.max` is consulted.
 Set `MemoryMax=` on the unit itself, or set `GOMEMLIMIT` explicitly.
 
-This changes an existing deployment: before this release nothing derived a
-limit, so a unit that already carries `MemoryMax=` has its frontend newly capped
-at what remains after the two fixed reservations. Raise the ceiling at upgrade
-time if the fleet was running near it. See [configuration](configuration.md#memory-budget).
+See [configuration](configuration.md#memory-budget).
 
 ## Hardening
 
