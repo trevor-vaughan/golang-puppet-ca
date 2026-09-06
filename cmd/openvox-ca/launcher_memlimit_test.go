@@ -435,6 +435,30 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(at63).To(Equal(budgetApplied), "63Mi is the first whole MiB that divides")
 		})
 
+		It("says what is still in force when an explicit GOMEMLIMIT is too small", func() {
+			// The half an operator cannot infer from a refusal. Saying only what
+			// was refused led one to conclude no process had a limit, which was
+			// the opposite of the truth: their value stays in force on all
+			// three, because it is not stripped from the children's environment
+			// and no share is appended to override it.
+			_, kind, reason := resolveMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), missingPath())
+
+			Expect(kind).To(Equal(budgetTooSmall))
+			Expect(reason).To(ContainSubstring("continue to apply GOMEMLIMIT independently"))
+			Expect(reason).NotTo(ContainSubstring("No process is given a memory limit"),
+				"that is the derived path's outcome, not this one")
+		})
+
+		It("says no limit is applied when a derived ceiling is too small", func() {
+			// The other path reaches the same refusal and needs the opposite
+			// sentence: here there is no inherited value to fall back on.
+			_, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("33554432\n"))
+
+			Expect(kind).To(Equal(budgetTooSmall))
+			Expect(reason).To(ContainSubstring("No process is given a memory limit at all"))
+			Expect(reason).NotTo(ContainSubstring("continue to apply GOMEMLIMIT"))
+		})
+
 		It("names the source in the too-small reason, so the advice is actionable", func() {
 			// The reason once told an operator on the derived path to "unset
 			// GOMEMLIMIT" -- a variable that path only reaches because it is

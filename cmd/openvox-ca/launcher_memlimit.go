@@ -256,9 +256,10 @@ func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPa
 	if frontend < minFrontendMemoryShare {
 		return memoryBudget{notes: notes}, budgetTooSmall, fmt.Sprintf(
 			"%s gives a tree budget of %d bytes, which leaves the frontend %d after reserving "+
-				"%d for the launcher and %d for the signer; it needs at least %d. Raise the limit, "+
-				"or lower memory_reserve_launcher / memory_reserve_signer",
-			source, total, frontend, launcher, signer, int64(minFrontendMemoryShare))
+				"%d for the launcher and %d for the signer; it needs at least %d. %s Raise the "+
+				"limit, or lower memory_reserve_launcher / memory_reserve_signer",
+			source, total, frontend, launcher, signer, int64(minFrontendMemoryShare),
+			undividedState(source))
 	}
 
 	return memoryBudget{
@@ -288,6 +289,25 @@ func scalePercent(n int64, percent int) int64 {
 		return n / 100 * int64(percent)
 	}
 	return n * int64(percent) / 100
+}
+
+// undividedState says what memory limits are in force when the division is
+// declined, which differs by where the ceiling came from and is the half an
+// operator cannot infer from the refusal.
+//
+// Saying only what was refused is not enough, and that is not hypothetical: an
+// operator read "Not dividing the memory budget across the process tree",
+// concluded that no process had a limit, and carried that into a merge request
+// and two other sessions before anyone checked the spawn path. The opposite was
+// true -- their GOMEMLIMIT was still in force on all three processes, because
+// it is not stripped from the children's environment and no share is appended
+// to override it when the budget is the zero value.
+func undividedState(source string) string {
+	if source == goMemLimitEnv {
+		return "Nothing is overridden, so all three processes continue to apply " +
+			"GOMEMLIMIT independently -- the whole value each, not a third of it."
+	}
+	return "No process is given a memory limit at all."
 }
 
 // treeMemoryCeiling returns the ceiling the tree budget is drawn from and where
