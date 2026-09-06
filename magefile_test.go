@@ -3272,8 +3272,8 @@ func runFirstBootScript(sslDir, binDir, certname string, extraEnv ...string) fir
 		"OPENVOX_CA_BINDIR="+binDir,
 		"OPENVOX_CA_CERTNAME="+certname,
 		// The legacy cadir defaults to /var/lib/puppet-ca, a real path on any
-		// machine that ran an earlier release -- a developer's laptop
-		// included. Left unset, a CA sitting there would make every spec below
+		// machine running a chart deployment or a hand-built install -- a
+		// developer's laptop included. Left unset, a CA there would make every spec below
 		// refuse instead of provisioning, and the failure would look like a
 		// defect in the script rather than in the fixture. Specs that want the
 		// guard point this at a directory they built.

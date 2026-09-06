@@ -347,7 +347,8 @@ under **`/var/lib/openvox-ca`** (`packaging/scripts/postinstall`). It is not a
 rebrand of `/var/lib/puppet-ca` but a different directory for a different
 thing — packaging bookkeeping that never existed in Puppet Server, so there is
 nothing to be a drop-in for. It must not be moved under `/var/lib/puppet-ca`,
-which is a cadir on any host upgraded from an earlier release; a marker file
+which is a cadir on hosts that have one there already — it is the Helm
+chart's `persistence.mountPath` default; a marker file
 dropped inside somebody's CA directory is the confusion this avoids.
 
 ## Helm chart

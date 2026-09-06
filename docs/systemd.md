@@ -36,45 +36,6 @@ The unit as rendered for a tarball expects the binary at `/usr/local/bin/openvox
 
 **Set `cadir` to `/etc/puppetlabs/puppet/ssl/ca`**, which is the one writable path the unit grants (`ReadWritePaths=`), or the CA will not be able to write: `ProtectSystem=strict` makes the rest of the filesystem read-only, and a filesystem-backend CA has to write a signed certificate, a serial and a CRL. It is also the Clojure CA's own layout, so a CA migrated from OpenVox/Puppet Server is already there. To use a different directory, change `ReadWritePaths=` to match — the two must always name the same place.
 
-### Upgrading an install made before this release
-
-**The unit changed in three ways that stop an existing install starting**, so a
-release tarball dropped over an older one needs these steps first. Earlier
-releases shipped `User=puppet-ca`, `Group=puppet-ca` and
-`StateDirectory=puppet-ca`, and the recipe above told you to create that
-account and put `cadir` under `/var/lib/puppet-ca`.
-
-1. **Create the `puppet` account** (the `groupadd`/`useradd` lines above). The
-   new unit runs as it, and systemd refuses to start a unit whose `User=` does
-   not exist.
-2. **Give it the CA material.** The tree — including the CA private key — is
-   owned by `puppet-ca`, and the service can no longer read it:
-   `sudo chown -R puppet:puppet /var/lib/puppet-ca` (or whatever your `cadir`
-   is).
-3. **Make the cadir writable again.** `StateDirectory=` is gone, and it was
-   what created `/var/lib/puppet-ca` and made it writable under
-   `ProtectSystem=strict`. `ReadWritePaths=` creates nothing. So either move
-   the CA to `/etc/puppetlabs/puppet/ssl/ca` (the new default, which the
-   directory must already exist for), or keep your directory and edit
-   `ReadWritePaths=` in the unit to name it. Whichever you choose, `cadir` and
-   `ReadWritePaths=` must name the same place.
-
-Skipping these gives one of two unhelpful failures: a start that fails on an
-unknown user, or one that fails setting up mount namespacing because
-`ReadWritePaths=` names a directory that is not there. Neither says which of
-the three changes it is.
-
-None of this applies to a fresh install. **The packages handle the third point
-by refusing rather than guessing:** if provisioning finds a CA in
-`/var/lib/puppet-ca` and none in `/etc/puppetlabs/puppet/ssl/ca`, it stops and
-says so, instead of bootstrapping a second CA that every already-enrolled agent
-would distrust. The message gives both ways out — point `cadir` and
-`ReadWritePaths=` at the old directory, or move the CA to the new one — because
-which is right depends on what you set `cadir` to, and moving a CA is not a
-copy: it takes the private key, the inventory and the CRL, and the service may
-be running against it. The first two points do not arise for packages, which
-create the account and ship both directories themselves.
-
 ### Why `puppet` and not a private account
 
 OpenVox Server creates `puppet:puppet` in its own `preinst` and chowns `/etc/puppetlabs/puppet/ssl` to it, so the tree openvox-ca needs to write is already expected to be owned by that account: running as it fits rather than intrudes. openvox-agent creates no account at all and runs as root.
@@ -238,6 +199,19 @@ Every step it takes is guarded on absence, so it **adopts rather than replaces**
 5. Link the serving credential the shipped configuration names — `certs/openvox-ca-server.pem` and `private_keys/openvox-ca-server.pem` — to the certificate step 3 produced.
 
 Step 5 is what makes the service able to start at all: it binds `0.0.0.0` and refuses plain HTTP on a non-loopback address, so it needs `tls_cert` and `tls_key`. Those name fixed paths because a file shipped in a package cannot know this host's certificate name, and provisioning points them at the credential it just adopted or minted. Re-minting under a corrected name is then a matter of replacing those two links rather than editing configuration. Like every other step it is guarded on absence, so pointing `tls_cert` at your own certificate keeps it.
+
+**Step 2 stops rather than bootstrap if it finds a CA at `/var/lib/puppet-ca`.**
+That path is where an `openvox-ca` CA commonly lives — it is the Helm chart's
+`persistence.mountPath` default, and a common choice for a hand-built install —
+so provisioning checks it before creating anything. Finding a CA there and none
+in `/etc/puppetlabs/puppet/ssl/ca`, it stops and says so, rather than
+bootstrapping a second CA that every agent already enrolled against the first
+would distrust. The message gives both ways out: point `cadir` and
+`ReadWritePaths=` at the existing directory, or move the CA to the shipped one.
+Which is right depends on what you set `cadir` to, and moving a CA is not a
+copy — it takes the private key, the inventory and the CRL, and the service may
+be running against it, which is why provisioning refuses rather than attempting
+the move itself.
 
 Step 3 is the one that can stop rather than warn, and it does so in two cases. If **one half of a credential** is present — a certificate with no key, or the reverse — it refuses to guess and says which file to move aside. If the binary has **no `generate` subcommand** it stops too, because a build that cannot mint leaves the service with no certificate to serve and `openvox-ca` refuses to start without TLS on a non-loopback address; failing here names the cause, where failing at the service would only report that TLS is not configured. In both cases the CA itself is bootstrapped and intact, and the message says so.
 

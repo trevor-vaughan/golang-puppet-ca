@@ -32,10 +32,11 @@ set -eu
 SSLDIR="${OPENVOX_CA_SSLDIR:-/etc/puppetlabs/puppet/ssl}"
 CADIR="$SSLDIR/ca"
 
-# Where releases before this one told an operator to put the cadir, and where
-# the removed StateDirectory=puppet-ca created it. Nothing writes here; it is
-# read once, to refuse rather than to migrate. Overridable for the same reason
-# the roots above are.
+# A cadir location openvox-ca CAs are commonly found at: it is the Helm chart's
+# persistence.mountPath default, it is what the StateDirectory=puppet-ca on
+# main creates, and it is a common choice for a hand-built install. Nothing
+# writes here; it is read once, to refuse rather than to migrate. Overridable
+# for the same reason the roots above are.
 LEGACY_CADIR="${OPENVOX_CA_LEGACY_CADIR:-/var/lib/puppet-ca}"
 
 # The package's own binaries, by absolute path rather than through PATH. An
@@ -256,15 +257,15 @@ ensure_ca() {
 		return 0
 	fi
 
-	# Before bootstrapping, look where the CA used to live.
+	# Before bootstrapping, look where a CA may already be.
 	#
-	# The default cadir moved in this release: earlier releases shipped
-	# StateDirectory=puppet-ca and told operators to put the cadir under
-	# /var/lib/puppet-ca. A host that followed that advice and then installs
-	# this package has a real CA the new default knows nothing about -- so
-	# bootstrapping here would mint a SECOND CA, and the agents already
-	# enrolled against the first would silently stop verifying. Nothing in the
-	# resulting system says which of the two is the real one.
+	# $CADIR is not the only place an openvox-ca CA is found:
+	# /var/lib/puppet-ca is the Helm chart's persistence.mountPath default and
+	# what the StateDirectory= on main creates, so a host can hold a real CA
+	# there that $CADIR knows nothing about. Bootstrapping regardless would
+	# mint a SECOND CA, and the agents already enrolled against the first would
+	# silently stop verifying. Nothing in the resulting system says which of
+	# the two is the real one.
 	#
 	# It refuses rather than migrating. Moving a CA is not a copy: the cadir
 	# holds the private key, the inventory and the CRL, the service may be
@@ -272,10 +273,10 @@ ensure_ca() {
 	# operator set cadir to. A maintainer-script-driven move that got any of
 	# that wrong would be unrecoverable in a way that stopping is not.
 	if [ -f "$LEGACY_CADIR/ca_crt.pem" ]; then
-		fail "found an existing CA in $LEGACY_CADIR, which was the default before this release,
-and none in $CADIR, which is the default now. Provisioning has stopped rather than bootstrap a
-second CA: agents enrolled against the one in $LEGACY_CADIR would not trust a new one, and nothing
-afterwards would say which is which.
+		fail "found an existing CA in $LEGACY_CADIR, and none in $CADIR, which is where this
+package keeps one. Provisioning has stopped rather than bootstrap a second CA: agents enrolled
+against the one in $LEGACY_CADIR would not trust a new one, and nothing afterwards would say which
+is which.
 
 Choose one, then run 'systemctl restart openvox-ca-first-boot':
 
