@@ -126,7 +126,7 @@ before a server exists.`,
 			// line in internal/ca reaches it. Non-fatal and non-creative, for
 			// reasons setupLogger's other callers do not share: see
 			// applySubcommandLogging.
-			closeLog := applySubcommandLogging(cfg, out)
+			closeLog := applySubcommandLogging(cfg, out, "this mint")
 			defer closeLog()
 
 			// The frontend role proxies signing to an isolated signer and never
@@ -229,7 +229,7 @@ before a server exists.`,
 			if capabilityKnown {
 				lockOpts = append(lockOpts, storage.WithKnownDistributedLocking(distributed))
 			}
-			if err := holdInstanceLock(ctx, rt, lockOpts...); err != nil {
+			if _, err := holdInstanceLock(ctx, rt, lockOpts...); err != nil {
 				return err
 			}
 
@@ -440,25 +440,11 @@ func reportIssuanceSettings(w io.Writer, cfg *serverConfig) {
 // either is missing, a concurrent server can issue a second certificate for the
 // same subject, or -- worse -- interleave an inventory append so the integrity
 // HMAC covers a blob that never existed, which makes the server refuse to start
-// with no supported repair (see #188).
+// until the integrity value is rebuilt. "openvox-ca rebuild-inventory-hmac" is
+// that repair, and it re-asserts integrity rather than verifying it -- which is
+// why this warning is worth printing before the mint rather than after.
 func reportBackendCapabilities(ctx context.Context, w io.Writer, store *storage.StorageService) (distributed, known bool) {
-	// Bound the probe. It takes a real backend lock, and pg_advisory_lock blocks
-	// until granted or the context is cancelled -- while cmd.Execute() runs on
-	// context.Background(), so there is no deadline anywhere above here. Without
-	// this, a stalled lock service hangs the command before it has printed
-	// anything, on the one call an operator hits first and on a command whose
-	// premise is being run by hand against a possibly-degraded CA host. Every
-	// WithLock in internal/ca bounds itself with ca.LockTimeout for the same
-	// reason; this is shorter because it is a pre-flight report, not the work.
-	//
-	// A timeout lands in the (bool, error) signature's third answer, so the
-	// operator gets "cross-process locking: unknown" rather than a stall or a
-	// false "no".
-	probeCtx, cancel := context.WithTimeout(ctx, lockProbeTimeout)
-	defer cancel()
-
-	locking, lockErr := store.SupportsDistributedLocking(probeCtx)
-	atomicInventory := store.SupportsAtomicInventory()
+	locking, atomicInventory, lockErr := probeBackendCapabilities(ctx, store)
 
 	// "Unknown" is a third answer, not a synonym for "no" -- which is why
 	// SupportsDistributedLocking returns (bool, error) rather than a bare bool.
@@ -500,6 +486,45 @@ func reportBackendCapabilities(ctx context.Context, w io.Writer, store *storage.
 		lockingStatus, atomicInventory)
 
 	return locking, lockErr == nil
+}
+
+// probeBackendCapabilities answers what the backend can coordinate, and prints
+// nothing.
+//
+// Shared by generate and rebuild-inventory-hmac, and left here rather than
+// moved to runtime.go beside the other cross-subcommand helpers: the move is
+// churn outside #188's scope, and this note is the pointer a reader of the new
+// command needs. If a third caller appears, move it then.
+//
+// The rendering is deliberately not part of this. What a missing capability
+// *costs* depends entirely on what the caller is about to do: for generate it
+// is a duplicate certificate and a stale OCSP answer, for
+// rebuild-inventory-hmac it is an append landing between the read that computes
+// the integrity head and the write that stores it. A shared probe with a shared
+// message told rebuild-inventory-hmac's operator that a distributed backend was
+// "safe to run alongside a live server" immediately before that command refused
+// on precisely those backends -- which is the reassurance that would talk an
+// operator past the one guard rail standing in for an unenforceable
+// precondition. Probe once, phrase per caller.
+func probeBackendCapabilities(ctx context.Context, store *storage.StorageService,
+) (locking, atomicInventory bool, lockErr error) {
+	// Bound the probe. It takes a real backend lock, and pg_advisory_lock blocks
+	// until granted or the context is cancelled -- while cmd.Execute() runs on
+	// context.Background(), so there is no deadline anywhere above here. Without
+	// this, a stalled lock service hangs the command before it has printed
+	// anything, on the one call an operator hits first and on a command whose
+	// premise is being run by hand against a possibly-degraded CA host. Every
+	// WithLock in internal/ca bounds itself with ca.LockTimeout for the same
+	// reason; this is shorter because it is a pre-flight report, not the work.
+	//
+	// A timeout lands in the (bool, error) signature's third answer, so the
+	// operator gets "cross-process locking: unknown" rather than a stall or a
+	// false "no".
+	probeCtx, cancel := context.WithTimeout(ctx, lockProbeTimeout)
+	defer cancel()
+
+	locking, lockErr = store.SupportsDistributedLocking(probeCtx)
+	return locking, store.SupportsAtomicInventory(), lockErr
 }
 
 // warnAdminCredential states what a pp_cli_auth certificate grants, and what it
@@ -612,7 +637,13 @@ func describeIssued(result *ca.GenerateResult) (string, time.Time, error) {
 // It degrades rather than failing. The root command treats a logging failure as
 // fatal; runSignerMode falls back to stderr. An interactive mint should follow
 // the signer: refusing to issue because a log file is unwritable helps nobody.
-func applySubcommandLogging(cfg *serverConfig, w io.Writer) func() {
+//
+// record names what the audit line would describe ("this mint", "this
+// rebuild"), because the no-logfile notice below is read by an operator of
+// whichever subcommand called this, and a shared helper that says "mint" to the
+// operator of a repair command is the same defect as a capability report that
+// calls a refused backend safe.
+func applySubcommandLogging(cfg *serverConfig, w io.Writer, record string) func() {
 	effective := *cfg
 
 	if effective.LogFile != "" {
@@ -640,7 +671,7 @@ func applySubcommandLogging(cfg *serverConfig, w io.Writer) func() {
 		_, _ = fmt.Fprintf(w, "Audit log: %s\n", effective.LogFile)
 		return func() { _ = f.Close() }
 	case cfg.LogFile == "":
-		_, _ = fmt.Fprintf(w, "No logfile configured: the audit record for this mint is terminal-only.\n")
+		_, _ = fmt.Fprintf(w, "No logfile configured: the audit record for %s is terminal-only.\n", record)
 	}
 	return func() {}
 }

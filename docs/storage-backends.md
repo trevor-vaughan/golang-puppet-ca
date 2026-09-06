@@ -87,8 +87,10 @@ directory beside the database file for `sqlite`. So:
   a wait, because waiting would only postpone the same answer.
 - **`openvox-ca-ctl setup`, `import` and `migrate` are refused the same way**,
   as are the offline `openvox-ca` subcommands (`csr`, `generate`,
-  `import-ca-cert`). Those are the commands that reach storage directly. Every
-  other `openvox-ca-ctl` subcommand works through the admin API over HTTP
+  `import-ca-cert`, and `rebuild-inventory-hmac` on its `--yes-re-bless` path;
+  reporting takes no store-wide instance lock). Those are the commands that
+  reach storage directly.
+  Every other `openvox-ca-ctl` subcommand works through the admin API over HTTP
   instead, never opens the store, and is unaffected — asking a running CA to
   sign, revoke or list remains an ordinary thing to do.
 - **`migrate` no longer hangs when both ends are the same store.** That was

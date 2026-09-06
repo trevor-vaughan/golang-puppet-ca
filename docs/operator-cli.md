@@ -207,22 +207,32 @@ See [storage backends](storage-backends.md#migrating-between-backends) for migra
 
 ## Offline subcommands on the server binary
 
-Three subcommands live on `openvox-ca` rather than `openvox-ca-ctl`, because they
+Four subcommands live on `openvox-ca` rather than `openvox-ca-ctl`, because they
 must reach the storage backend and CA key provider named in the *server's*
 configuration. `openvox-ca-ctl` reads a different configuration file and can
 only address a local filesystem directory, so it cannot serve a CA whose state
 is in PostgreSQL or whose key is in OpenBao Transit.
 
 None of them needs a running server, and on a backend that supports one running
-instance none of them will run beside one: each is refused, naming the process
-holding the store. Stop the server first. Within an instance they take the CA's
-locks while they work — `csr --create-key` and `import-ca-cert` take
-`bootstrap`, `import-ca-cert` the CRL lock too, and `generate` takes
-`subject:<name>` for the name it is minting, plus the CRL lock when `--force`
-revokes the certificate it replaces. See [running a second process against a
-live store](storage-backends.md#running-a-second-process-against-a-live-store).
+instance none of them will *write* beside one: each is refused before it acts,
+naming the process holding the store. Stop the server first.
+`rebuild-inventory-hmac` is the one exception worth knowing, and only in one
+direction: it reports without taking the instance lock, so a CA can be inspected
+while it is running, and takes it only with `--yes-re-bless`. Its capability
+pre-flight does briefly acquire and release `capability-probe` on backends that
+coordinate locks across hosts, which is a different lock and contends with
+nothing.
 
-All three read the **server's** configuration, not `openvox-ca-ctl`'s: `--config`, or
+Within an instance they take the CA's locks while they work — `csr --create-key`
+and `import-ca-cert` take `bootstrap`, `import-ca-cert` the CRL lock too, and
+`generate` takes
+`subject:<name>` for the name it is minting, plus the CRL lock when `--force`
+revokes the certificate it replaces. `rebuild-inventory-hmac` takes none of
+them, and takes `hmac-key` only in the one case where it has to mint a key.
+See [running a second process against a live
+store](storage-backends.md#running-a-second-process-against-a-live-store).
+
+All four read the **server's** configuration, not `openvox-ca-ctl`'s: `--config`, or
 `PUPPET_CA_CONFIG`, defaulting to `/etc/puppet-ca/config.yaml`. A working
 `ctl.yaml` has no effect on them. `--cadir` overrides the configured storage
 directory for a one-off run.
@@ -237,6 +247,12 @@ openvox-ca csr --hostname puppet.example.com --create-key --out ca-request.pem
 
 # Install the chain the parent signed, completing the round trip
 openvox-ca import-ca-cert --cert-bundle signed-chain.pem
+
+# Show why the inventory integrity check is failing, changing nothing
+openvox-ca rebuild-inventory-hmac
+
+# ... and re-assert integrity over the inventory as it stands
+openvox-ca rebuild-inventory-hmac --yes-re-bless
 
 # Mint a certificate with no running server and no API
 openvox-ca generate --certname web01.example.com --ttl 8760h \
@@ -270,7 +286,7 @@ together, or stop the service while you do.
 > matters: with no config file, `csr --create-key` would resolve
 > `ca_key_provider: file`, mint a **local** CA key, and emit a request bound to a
 > key a Transit-backed server will never use, so the parent would sign the wrong
-> key. All three commands therefore print the config file, storage backend and
+> key. All four commands therefore print the config file, storage backend and
 > key provider they resolved before doing anything — check those lines match the
 > server. If your server is configured by flags, mirror the storage and
 > key-provider settings into the config file or `PUPPET_CA_*` environment for
@@ -281,6 +297,13 @@ together, or stop the service while you do.
 > leave it minting certificates with no CRL distribution point while the
 > server's own issuance carries one, and with no durable record that an
 > administrator credential was created. Mirror those too.
+>
+> `rebuild-inventory-hmac` needs `logfile` for the same reason and a sharper
+> one: its audit record is the only lasting evidence that a CA's integrity
+> baseline was re-asserted, and without the setting mirrored the command says
+> "the audit record for this rebuild is terminal-only" and that evidence dies
+> with the shell. On a flag-configured server — the shipped container `CMD`
+> included — mirror `logfile` before running it.
 >
 > `promote_cn_to_san` needs no mirroring: it has no flag, so the config file and
 > `PUPPET_CA_*` are its only sources — the same two this command reads, and it
@@ -470,9 +493,10 @@ writers on different hosts can each decide a subject has no certificate and both
 issue one. Without an atomic inventory append — `filesystem` and `redis` — the
 integrity record is recomputed from a snapshot, so an interleaved append leaves
 an HMAC covering a state that never existed, after which the server refuses to
-start and there is no supported repair
-([#188](https://github.com/voxpupuli/openvox-ca/issues/188)). That second
-failure is the reason to take this seriously. It does not apply to `sqlite`,
+start until the integrity value is rebuilt (see
+[`rebuild-inventory-hmac`](#rebuild-inventory-hmac-re-asserting-inventory-integrity),
+which re-asserts integrity rather than repairing anything). That second failure
+is the reason to take this seriously. It does not apply to `sqlite`,
 which is single-node but appends atomically, nor to `etcd`, whose inventory is
 decomposed into per-entry keys and whose append commits the entry and the
 integrity head in one transaction.
@@ -769,3 +793,197 @@ by a name on its certificate, arranging resolution locally and passing
 `--server-url https://puppet.example.com:8140`. That is the same trust decision
 made in a different place, not a stronger one; the flag is not the thing to
 avoid here.
+
+### `rebuild-inventory-hmac`: re-asserting inventory integrity
+
+A CA whose inventory integrity value no longer verifies will not start, and
+while it does not verify every read path is fail-closed: revocation fails for
+**every** subject, so credentials cannot be retired while the cause is
+investigated. This is the supported way out.
+
+Read the warning in the command's own output before using it. Rebuilding does
+not verify or repair the inventory — it re-asserts integrity over whatever the
+inventory now contains, so any tampering present is signed over and becomes
+valid. Establish why verification failed first.
+
+With no flags it reports and changes nothing, which is the safe way to inspect
+a CA that will not start.
+
+One caveat when the CA is still running, and it applies to **every** backend.
+Reporting takes no store-wide instance lock, and it reads the inventory and the
+stored integrity value as two separate operations — so an append committing between
+them leaves `computed` covering one set of entries and `stored` covering
+another. A `verifies: NO` seen against a live server can therefore be a false
+alarm. This is not about whether the backend's append is atomic: an atomic write
+by the server does not make the reader's two reads one snapshot, so PostgreSQL
+and etcd are as exposed to it as the filesystem backend. Re-check with the
+server stopped before believing a NO — nothing acts on the reading in the
+meantime, because `--yes-re-bless` refuses while a server holds the store, or
+asks for `--replicas-stopped` where no lock can prove that it does not.
+
+```console
+$ openvox-ca rebuild-inventory-hmac
+Using config file: /etc/puppet-ca/config.yaml
+Storage backend: filesystem; CA key provider: file; cadir: /var/lib/puppet-ca
+No logfile configured: the audit record for this rebuild is terminal-only.
+Backend does not coordinate locks across hosts (atomic inventory append: false), so exactly one
+  instance is supported. Rebuilding refuses while a server holds the store, where the
+  store offers a lock to hold; reporting never takes it.
+
+Inventory integrity
+  scheme:        whole-blob-hmac
+  entries:       1284
+  HMAC key:      usable
+  stored value:  9f3a1c04b7e40218…
+  computed:      b7e40218a1c9f3d5…
+  verifies:      NO
+error: refusing to rebuild without --yes-re-bless: this re-asserts integrity over the inventory above rather than verifying it, ...
+```
+
+The report is on stdout; that last line is on stderr, which is why the capture
+recipe below redirects both.
+
+An `unparseable:` line appears between `entries:` and `HMAC key:` when the
+inventory blob holds lines that are not entry-shaped — only on the blob
+backends, since a structured inventory has rows rather than lines. Those lines
+are covered by the value a rebuild re-asserts while being absent from
+`entries:`, so read them in `inventory.txt` before confirming. Treat the count
+as a floor rather than an audit: a line counts only when it has fewer than four
+whitespace-separated fields, so trailing content appended to an otherwise valid
+entry is signed over without appearing here.
+
+`stored value: (stored, but empty)` is a distinct state from `(none stored)`: a
+zero-length value is present, which a torn write produces. It is an ordinary
+mismatch and takes the `--yes-re-bless` path, not the "no baseline stored" path
+below.
+
+`scheme` is worth reading before anything else. A mismatch also fires when a
+store is served under a different integrity scheme than the value was written
+with, which is a different cause reached by the same repair — see [upgrading a
+pre-fix deployment](development/storage-internals.md#upgrading-a-pre-fix-ca_key_file--ca_cert_file--database-deployment).
+
+What it cannot tell you is **which** entry diverged. The backends persist a
+single integrity head and no per-entry value, so nothing records what any
+prefix of the inventory should have hashed to; a report claiming to localise a
+divergence would be describing a bisection it never performed.
+
+Add `--yes-re-bless` to act. On a backend that supports one running instance the
+command refuses to rebuild beside a live server, naming the process holding the
+store — where the store offers a lock to hold. Where it does not (an in-memory
+SQLite store, a platform without `flock(2)`, a read-only mount) nothing can
+exclude a second writer, and the command refuses for that reason instead, asking
+for `--replicas-stopped` exactly as it does on a backend that coordinates across
+hosts.
+
+On backends that coordinate locks across hosts — etcd, redis, and the server
+SQL dialects — it refuses for a different reason. Those support many replicas,
+so the single-instance check does not apply to them and this command has no way
+to tell whether a replica is appending right now. That is precisely when a
+rebuild writes a *fresh* incorrect value, because the integrity head is computed
+from a snapshot. Stop every replica and say so with `--replicas-stopped`:
+
+```bash
+openvox-ca rebuild-inventory-hmac --yes-re-bless --replicas-stopped
+```
+
+The same applies when the backend's locking capability cannot be determined at
+all: a failed probe is a third answer, not a "no", and the command treats not
+knowing as not enforced.
+
+**Run it as the user the server runs as**, not under `sudo`. On the filesystem
+backend the rebuild replaces `.inventory.hmac` by writing a new file and
+renaming it over the old one, and it does no `chown`: the replacement is owned
+by whoever ran the command. Repair it as root and the unprivileged server may be
+unable to rewrite or even read it on the next append, so the CA still does not
+work and now fails for a second, unrelated reason. In the wrong-length-key state
+it writes a second file the same way — `private/.inventory_hmac_key`, mode
+`0600` — which the server cannot even read if it is root-owned. And
+`--yes-re-bless` takes the store's instance lock, which creates a lock file
+under `<cadir>/locks/` (and `locks/` itself if absent) owned by whoever ran the
+command and deliberately never removes it. The file is named for a digest of the
+lock name, so `ls` shows only `<hex>.lock` and there is nothing to match by eye.
+A root-owned lock file makes the server's next start fail on the lock rather
+than on integrity. Prefer the
+positive form — `sudo -u puppet-ca openvox-ca rebuild-inventory-hmac …` under
+the shipped systemd unit. If you have already run it as root, `chown` both files
+and `chown -R` the `locks/` directory back to the server's user.
+
+In containers the command's own premise gets in the way: a CA that will not
+start is a crash-loop under the shipped Deployment, so there is no healthy pod
+to `kubectl exec` into — and on a distributed backend you have been told to stop
+every replica first, after which there is no pod at all. Use the same one-shot
+Job recipe the [OpenBao intermediate-CA
+flow](openbao-transit.md#running-under-an-external-root-ca) uses: the same
+image, ServiceAccount and mounts as the Deployment, with the command replaced.
+Substitute the chart's own names before applying it — that recipe hardcodes an
+`openvox-ca-config` ConfigMap and a cadir under
+`/etc/puppetlabs/puppet/ssl/ca`, while the chart renders those from
+`openvox-ca.fullname` and `persistence.mountPath` (`/var/lib/puppet-ca` by
+default), as [the Helm chart guide](helm-chart.md) sets out. Mounting the PVC
+somewhere the configured cadir is not gives this command an empty store, which
+it reports as a CA that never initialised integrity — advice that is false about
+the real store. On a ReadWriteOnce PVC, scale the Deployment to zero before the
+Job can mount the cadir.
+
+Set `backoffLimit: 0` on that Job when running the report. Report-only mode
+exits non-zero when it refuses to act — on a mismatch, on both no-key states,
+and on an undecomposed legacy inventory — and zero when the value verifies or
+when no baseline is stored, so a
+Job left at the default retries the pod six more times on exactly the runs worth
+reading, and `kubectl logs job/...` then has several pods to choose between.
+Note also that every failure exits 1, so the status distinguishes "something is
+wrong" from "nothing is", not one cause from another.
+
+The whole report goes to stdout, including the resolved-configuration header.
+The verdict — the refusal, or an error — goes to stderr, as does the audit
+record when no `logfile` is configured, so capture both for a support ticket:
+`openvox-ca rebuild-inventory-hmac > integrity.txt 2>&1`.
+
+Five states it treats differently, and **none of them is the ordinary
+mismatch** the transcript above shows — that one is a usable key with a stored
+value the inventory no longer matches.
+
+If the store still holds an **undecomposed legacy inventory** — an etcd or Redis
+CA upgraded from a release before the inventory was decomposed into per-entry
+keys, which has not been started since — the command refuses outright. It reads
+the decomposed rows, which do not exist yet, so it would report an empty
+inventory for a store holding a full one, and rebuilding would write an empty
+chain head over the whole-blob value that is the only thing able to validate the
+real inventory.
+
+Start the server, and which of two things happens tells you where you are. If
+the legacy blob still verifies, the server decomposes it and starts, after which
+this command applies normally. If it does not, the server refuses with an
+integrity error — decomposition checks the blob against its own stored value
+before committing — and that error names the stored legacy value to remove in
+order to acknowledge a lost baseline. This command cannot repair a
+pre-decomposition inventory either way, which is why it refuses rather than
+reporting.
+
+If **no HMAC key is stored and no integrity value is either**, there is nothing
+to rebuild and the command refuses. This CA never initialised integrity;
+starting the server establishes a baseline.
+
+If **no HMAC key is stored but an integrity value still is**, the command
+refuses differently, and the difference matters: no key can reproduce that
+value, so starting the server would mint a fresh key, disagree with the retained
+value, and refuse with an integrity error for something the CA itself just did.
+Acknowledge the lost baseline by removing the stored integrity value first, then
+start the server. Where that value lives depends on the backend —
+`.inventory.hmac` in a filesystem cadir, the `inventory/hmac` key under etcd, the
+`inventory:hmac` key under Redis, and the `inventory_hmac` blob row on the SQL
+backends.
+
+If **no integrity value is stored** under a usable key, the command reports that
+and stops. Nothing has been written that could disagree with the inventory, so
+this is not tampering. Note what happens next, though: the server's next start
+establishes a baseline over the inventory **as it then stands, without verifying
+it**, which is the same act `--yes-re-bless` gates behind an explicit
+acknowledgement. If you are investigating an integrity failure, inspect the
+entries before starting the server.
+
+If the stored key is the **wrong length**, every existing value was computed
+under a key that no longer exists and none can be reproduced; this is the one
+state where `--yes-re-bless` mints a new key as well as a new value, and the
+report says so before you confirm. If no integrity value is stored alongside the
+unusable key, the previous state applies instead and nothing is minted.

@@ -40,6 +40,7 @@ wire-compatible with your existing Puppet/OpenVox fleet.
 - **Intermediate CA:** run under an external root, with `openvox-ca csr` emitting a signing request for a parent CA and `openvox-ca import-ca-cert` installing the signed chain. No key material is ever supplied on the command line, so it works identically for every `ca_key_provider` including an OpenBao Transit key that never leaves the vault. See the [operator CLI reference](docs/operator-cli.md)
 - **Server-side key generation:** issue cert+key pairs without a node-submitted CSR; configurable RSA (2048/3072/4096) or ECDSA (P-256/P-384/P-521)
 - **Offline certificate minting:** `openvox-ca generate` issues a certificate directly against storage with no running server and no API — the only way to mint a *new* `pp_cli_auth` administrator credential, and the way to mint before a server exists
+- **Inventory integrity repair:** `openvox-ca rebuild-inventory-hmac` is the supported way back from a CA that will not start because its inventory integrity value no longer verifies — a state in which revocation fails for every subject. It reports without changing anything by default, and re-asserts integrity only on an explicit confirmation. See the [operator CLI reference](docs/operator-cli.md#rebuild-inventory-hmac-re-asserting-inventory-integrity)
 - **Configurable key algorithms:** CA and leaf certificates can use RSA or ECDSA; ECDSA support for both bootstrapped CAs and generated leaf certs
 - **Random serial numbers:** every issued leaf certificate gets a cryptographically random 128-bit serial (CA/Browser Forum guidance)
 - **CRL Distribution Points:** optionally embed a CRL URL in every issued certificate (`--crl-url`) so verifiers can automatically fetch the CRL
@@ -304,7 +305,7 @@ The complete flag, environment-variable, and config-file reference is in
 | --- | --- |
 | [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; the serving certificate; autosigning; directory layout; graceful shutdown; reloading configuration; trusting client certificates from another CA |
 | [HTTP API reference](docs/api.md) | All endpoints, authorization tiers, and admin credential resolution |
-| [Operator CLI (`openvox-ca-ctl`)](docs/operator-cli.md) | The `openvox-ca-ctl` command reference, and the offline `openvox-ca` subcommands (`csr`, `import-ca-cert`, `generate`) that run against the server's own configuration |
+| [Operator CLI (`openvox-ca-ctl`)](docs/operator-cli.md) | The `openvox-ca-ctl` command reference, and the offline `openvox-ca` subcommands (`csr`, `import-ca-cert`, `generate`, `rebuild-inventory-hmac`) that run against the server's own configuration |
 | [Storage backends](docs/storage-backends.md) | filesystem, SQLite, PostgreSQL, MySQL, etcd, Redis/Valkey; migrating between them |
 | [CA key security](docs/ca-key-security.md) | Process isolation and the signer handshake, key encryption at rest, key-custody options, PKCS#11 plans, destructive-op monitoring |
 | [OpenBao Transit-engine CA key](docs/openbao-transit.md) | Delegating CA key custody to OpenBao |

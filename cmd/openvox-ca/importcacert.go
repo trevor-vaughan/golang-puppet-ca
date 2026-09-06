@@ -107,7 +107,7 @@ for deployments where the CA certificate is mounted read-only from outside
 			// Refuse while a server holds the store: this replaces the CA
 			// certificate and may revoke through the CRL, and one instance is
 			// all a backend without distributed locking supports.
-			if err := holdInstanceLock(cmd.Context(), rt); err != nil {
+			if _, err := holdInstanceLock(cmd.Context(), rt); err != nil {
 				return err
 			}
 

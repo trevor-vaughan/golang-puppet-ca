@@ -46,6 +46,20 @@ var _ = Describe("the store instance lock", func() {
 
 	BeforeEach(func() { ctx = context.Background() })
 
+	// The specs below drive real root commands, which resolve PUPPET_CA_CONFIG
+	// and the PUPPET_CA_* environment. Without a pin, an exported
+	// PUPPET_CA_STORAGE_BACKEND (or a host /etc/puppet-ca/config.yaml) sends
+	// them at a store the holdStore flock does not cover. It covers every
+	// command-driving spec in this file, not only the newest: the hazard is the
+	// same for csr and import-ca-cert, and counting them here would go stale
+	// the next time one is added.
+	BeforeEach(func() {
+		pinned := filepath.Join(GinkgoT().TempDir(), "pinned.yaml")
+		Expect(os.WriteFile(pinned, []byte("ca_key_algo: ecdsa\nca_key_size: 256\n"), 0o644)).To(Succeed())
+		setEnv("PUPPET_CA_CONFIG", pinned)
+		clearServerEnv()
+	})
+
 	// holdStore takes the store's instance lock the way a running server does,
 	// and releases it when the spec ends.
 	holdStore := func(cadir string) {
@@ -178,7 +192,7 @@ var _ = Describe("the store instance lock", func() {
 			rec := testutil.NewRecordingBackend(GinkgoT().TempDir())
 			rt := newRuntime(rec)
 
-			Expect(holdInstanceLock(ctx, rt)).To(Succeed())
+			Expect(func() error { _, e := holdInstanceLock(ctx, rt); return e }()).To(Succeed())
 			Expect(rec.Events()).To(BeEmpty(), "nothing is given back before Close")
 
 			Expect(rt.Close()).To(Succeed())
@@ -193,7 +207,7 @@ var _ = Describe("the store instance lock", func() {
 			rec := testutil.NewRecordingBackend(cadir)
 			rt := newRuntime(rec)
 
-			err := holdInstanceLock(ctx, rt)
+			_, err := holdInstanceLock(ctx, rt)
 			var locked *storage.StoreLockedError
 			Expect(errors.As(err, &locked)).To(BeTrue())
 
@@ -205,7 +219,7 @@ var _ = Describe("the store instance lock", func() {
 	})
 
 	Describe("the offline subcommands that share holdInstanceLock", func() {
-		// generate is covered above. These are the other two call sites, which
+		// generate is covered above. These are the other call sites, which
 		// exercised no lock behaviour at all.
 		It("refuses csr while another instance holds the store", func() {
 			caDir := GinkgoT().TempDir()
@@ -226,6 +240,44 @@ var _ = Describe("the store instance lock", func() {
 
 			_, err := runImport("--cadir", caDir,
 				"--cert-bundle", filepath.Join(caDir, "ca_crt.pem"))
+
+			Expect(err).To(MatchError(ContainSubstring("already running against this store")))
+			Expect(err).To(MatchError(ContainSubstring("pid " + strconv.Itoa(os.Getpid()))))
+		})
+
+		It("still reports rebuild-inventory-hmac while another instance holds the store", func() {
+			// The other half of the documented promise, and the half nothing
+			// pinned: reporting takes no instance lock, so a CA can be inspected
+			// while it runs. The guarantee rests entirely on holdInstanceLock
+			// sitting below the --yes-re-bless gate; moving that one line up
+			// would break it silently.
+			caDir := GinkgoT().TempDir()
+			bootstrapCAInDir(caDir, "puppet.example.com")
+			breakInventoryIntegrity(caDir)
+			holdStore(caDir)
+
+			stdout, _, err := runRebuild("--cadir", caDir)
+
+			Expect(err).To(MatchError(ContainSubstring("--yes-re-bless")),
+				"reporting must refuse for want of confirmation, not for the lock")
+			Expect(err).NotTo(MatchError(ContainSubstring("already running against this store")))
+			Expect(stdout).To(ContainSubstring("verifies:      NO"),
+				"and it must still have produced the report the operator came for")
+		})
+
+		It("refuses rebuild-inventory-hmac while another instance holds the store", func() {
+			caDir := GinkgoT().TempDir()
+			bootstrapCAInDir(caDir, "puppet.example.com")
+
+			// The integrity value must actually be broken, or the command
+			// reports "nothing to do" and returns before it reaches the lock at
+			// all -- it is taken only when a write is about to happen, so that a
+			// command which declines to act leaves no locks/ directory behind.
+			// A spec that skipped this would pass while asserting nothing.
+			breakInventoryIntegrity(caDir)
+			holdStore(caDir)
+
+			_, _, err := runRebuild("--cadir", caDir, "--yes-re-bless")
 
 			Expect(err).To(MatchError(ContainSubstring("already running against this store")))
 			Expect(err).To(MatchError(ContainSubstring("pid " + strconv.Itoa(os.Getpid()))))

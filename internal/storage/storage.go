@@ -652,11 +652,9 @@ func (s *StorageService) compareInventoryMACLocked(ctx context.Context, computed
 		return fmt.Errorf("reading inventory HMAC: %w", err)
 	}
 	if !hmac.Equal(storedMAC, computed) {
-		scheme := "whole-blob-hmac"
-		if _, ok := asInventoryStore(s.backend); ok {
-			scheme = "hash-chain"
-		}
-		slog.Warn("inventory HMAC mismatch; integrity check failed", "scheme", scheme)
+		scheme := s.inventoryScheme()
+		slog.Warn("inventory HMAC mismatch; integrity check failed", "scheme", scheme,
+			"repair", inventoryRepairHint)
 		return ErrInventoryTampered
 	}
 	return nil
@@ -680,16 +678,27 @@ func (s *StorageService) inventoryEntriesLocked(ctx context.Context) ([]Inventor
 // and malformed lines. Shared by the two readers of the blob form so they
 // cannot disagree about what counts as an entry.
 func parseInventoryBlob(data []byte) []InventoryEntry {
-	var entries []InventoryEntry
+	entries, _ := parseInventoryBlobCounting(data)
+	return entries
+}
+
+// parseInventoryBlobCounting is parseInventoryBlob, also reporting how many
+// non-blank lines it discarded. One pass rather than two: the caller that wants
+// the count is InventoryIntegrityReport, whose whole restructuring was to read
+// the inventory once, and a second strings.Split over the same bytes to count
+// what this loop has already seen undoes that on every blob-backend call.
+func parseInventoryBlobCounting(data []byte) (entries []InventoryEntry, unparseable int) {
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		if e, ok := parseInventoryEntry(line); ok {
 			entries = append(entries, e)
+			continue
 		}
+		unparseable++
 	}
-	return entries
+	return entries, unparseable
 }
 
 // PruneInventory removes every inventory entry for which keep returns false,
@@ -1296,18 +1305,47 @@ func (s *StorageService) computeInventoryHMAC(ctx context.Context, hmacKey []byt
 		if err != nil {
 			return nil, err
 		}
-		var head []byte
-		for _, e := range entries {
-			head = chainInventoryMAC(hmacKey, head, canonicalInventoryLine(e))
-		}
-		return head, nil
+		return foldInventoryHead(hmacKey, entries, nil, true), nil
 	}
 
 	data, err := s.readInventoryForHMAC(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return wholeBlobInventoryMAC(hmacKey, data), nil
+	return foldInventoryHead(hmacKey, nil, data, false), nil
+}
+
+// inventoryScheme names the integrity scheme this backend computes under. One
+// definition for the same reason foldInventoryHead has one: the value is now
+// operator-facing on both the report and the two mismatch warnings, and a
+// predicate that changed at one site would give an operator a report whose
+// scheme contradicts the log line that sent them to it.
+func (s *StorageService) inventoryScheme() string {
+	if _, ok := asInventoryStore(s.backend); ok {
+		return "hash-chain"
+	}
+	return "whole-blob-hmac"
+}
+
+// foldInventoryHead computes the integrity value from inventory contents
+// already in hand: the hash chain over entries when chained, otherwise the
+// whole-blob MAC over blob.
+//
+// One definition for the same reason wholeBlobInventoryMAC and
+// canonicalInventoryLine each have one. Those keep the primitives from
+// diverging; this keeps the *composition* from diverging, which
+// InventoryIntegrityReport made possible by folding from its own single read
+// rather than paying for a second one. A change to the fold order, a
+// domain-separation prefix, or the branch predicate now has one site.
+func foldInventoryHead(key []byte, entries []InventoryEntry, blob []byte, chained bool) []byte {
+	if !chained {
+		return wholeBlobInventoryMAC(key, blob)
+	}
+	var head []byte
+	for _, e := range entries {
+		head = chainInventoryMAC(key, head, canonicalInventoryLine(e))
+	}
+	return head
 }
 
 // wholeBlobInventoryMAC is the whole-blob inventory integrity value:
@@ -1412,12 +1450,21 @@ func (s *StorageService) UpdateInventoryHMAC(ctx context.Context, hmacKey []byte
 }
 
 // RebuildInventoryHMAC recomputes the inventory integrity head from the current
-// inventory contents using the stored HMAC key, and writes it. It is meant to
-// run after a migration: the destination's integrity scheme (whole-blob HMAC
-// vs. the structured backends' hash chain) may differ from the source's, so the
-// copied inventory_hmac value is not meaningful for the destination and must be
-// recomputed. It is a no-op when no HMAC key is present (a CA that never
-// initialised integrity), leaving the destination untouched.
+// inventory contents using the stored HMAC key, and writes it.
+//
+// Two callers, with different reasons. After a migration: the destination's
+// integrity scheme (whole-blob HMAC vs. the structured backends' hash chain)
+// may differ from the source's, so the copied inventory_hmac value is not
+// meaningful for the destination and must be recomputed. And from the offline
+// "openvox-ca rebuild-inventory-hmac", as the supported repair for a CA whose
+// stored value has stopped verifying — there it re-asserts integrity over the
+// inventory as it stands rather than verifying anything, which is why that
+// command gates it behind an explicit confirmation.
+//
+// It is a no-op when no HMAC key is present (a CA that never initialised
+// integrity), leaving the store untouched. That branch is contractual, not
+// incidental: the CLI checks the same condition first and refuses, because a
+// silent no-op here would report a repair it did not perform.
 func (s *StorageService) RebuildInventoryHMAC(ctx context.Context) error {
 	hasKey, err := s.backend.Exists(ctx, KeyHMACKey)
 	if err != nil {
@@ -1431,6 +1478,185 @@ func (s *StorageService) RebuildInventoryHMAC(ctx context.Context) error {
 		return err
 	}
 	return s.UpdateInventoryHMAC(ctx, key)
+}
+
+// HMACKeyState describes the stored inventory HMAC key as found, without
+// changing it. EnsureHMACKey regenerates a present-but-wrong-length key, which
+// is itself one of the ways an inventory stops verifying; a report that called
+// it would perform the very act it exists to describe.
+type HMACKeyState int
+
+const (
+	// HMACKeyUnknown is the zero value: nothing has been read yet. It exists so
+	// that a zero-valued report does not assert the most reassuring answer --
+	// InventoryIntegrityReport returns a partly-filled report alongside every
+	// error, and on the arms that fail before the key is read, a zero value
+	// meaning "usable" would be a lie a caller could act on.
+	HMACKeyUnknown HMACKeyState = iota
+	// HMACKeyUsable means the stored key is present and the expected length.
+	HMACKeyUsable
+	// HMACKeyAbsent means no key is stored: integrity was never initialised.
+	HMACKeyAbsent
+	// HMACKeyWrongLength means a key is stored but is not hmacKeyLen bytes.
+	// Every existing MAC was computed under a key that no longer exists, so no
+	// rebuild can reproduce them and one would mint a new key as a side effect.
+	HMACKeyWrongLength
+)
+
+// String names the state for operator-facing output.
+func (s HMACKeyState) String() string {
+	switch s {
+	case HMACKeyUnknown:
+		return "unknown"
+	case HMACKeyUsable:
+		return "usable"
+	case HMACKeyAbsent:
+		return "absent"
+	case HMACKeyWrongLength:
+		return "wrong-length"
+	default:
+		return "unknown"
+	}
+}
+
+// InventoryIntegrityReport is the inventory's integrity state as it currently
+// stands. Every field is what was found, never what was repaired.
+type InventoryIntegrityReport struct {
+	// Scheme is the integrity scheme this backend computes under:
+	// "hash-chain" on InventoryStore backends, "whole-blob-hmac" otherwise.
+	Scheme string
+	// Entries is the number of inventory entries the value covers.
+	Entries int
+	// KeyState is the stored HMAC key as found.
+	KeyState HMACKeyState
+	// StoredHead is the persisted integrity value, nil when none is stored.
+	StoredHead []byte
+	// ComputedHead is the value recomputed from the inventory as it now
+	// stands, nil when KeyState is not HMACKeyUsable.
+	ComputedHead []byte
+	// LegacyUndecomposed reports a structured backend still holding an
+	// undecomposed legacy inventory blob. Entries() reads only the decomposed
+	// rows, so such a store answers "no entries" while its real inventory sits
+	// in the blob and its stored head is a whole-blob MAC. Rebuilding there
+	// would write an empty hash-chain head over the only baseline that can
+	// validate the blob, which is destruction rather than repair.
+	//
+	// It can be true only because this report is reached without EnsureReady:
+	// the server decomposes on start (CA.Init -> EnsureDirs -> EnsureReady),
+	// and an offline command that reports rather than starts does not.
+	LegacyUndecomposed bool
+	// UnparseableLines counts lines the inventory blob holds that are not
+	// entry-shaped. Always zero on a structured backend, whose entries are
+	// rows. It is not a curiosity: the blob scheme MACs the whole blob, so
+	// those lines are covered by the value a rebuild re-asserts while being
+	// invisible in Entries — which is the operator's only quantitative view of
+	// what they are about to sign over.
+	UnparseableLines int
+	// Verifies reports whether StoredHead and ComputedHead agree. False
+	// whenever either is missing.
+	Verifies bool
+}
+
+// InventoryIntegrityReport describes the inventory's integrity state without
+// verifying it and without writing anything.
+//
+// It exists because every ordinary read path is fail-closed: ReadInventory and
+// InventoryEntries return ErrInventoryTampered on a mismatch, which is correct
+// for serving and useless for diagnosis. An operator whose CA will not start
+// needs to see what does not verify *before* deciding whether to re-assert it,
+// and the fail-closed paths will not show them.
+//
+// What it deliberately cannot answer: which entry diverged. The backends
+// persist one head MAC (KeyInventoryHMAC) and no per-entry value — an inventory
+// row carries the four canonical columns plus a display projection, none of
+// them a MAC — so nothing records what any prefix should have hashed to.
+// Localising a divergence would need a schema change, and a report that implied
+// otherwise would be inviting an operator to trust a bisection it never
+// performed. See docs/development/inventory-store.md for the row's shape; do
+// not re-enumerate the columns here, which is how this comment was wrong once
+// already (read off the initial migration rather than the current model).
+func (s *StorageService) InventoryIntegrityReport(ctx context.Context) (InventoryIntegrityReport, error) {
+	s.inventoryMu.RLock()
+	defer s.inventoryMu.RUnlock()
+
+	rep := InventoryIntegrityReport{Scheme: s.inventoryScheme()}
+
+	// Read the inventory once and keep what is needed to fold the head from it.
+	// computeInventoryHMAC would re-read the whole thing, and this method runs
+	// twice per repair (before and after), so deferring to it turned one
+	// operator command into five full inventory scans -- against a store whose
+	// owner is trying to get it back into service, and, since reporting is
+	// offered against a live CA, not only against a downed one.
+	var (
+		entries []InventoryEntry
+		blob    []byte
+		chained bool
+	)
+	if store, ok := asInventoryStore(s.backend); ok {
+		chained = true
+		got, err := store.Entries(ctx)
+		if err != nil {
+			return rep, fmt.Errorf("reading inventory entries: %w", err)
+		}
+		entries = got
+	} else {
+		data, err := s.readInventoryForHMAC(ctx)
+		if err != nil {
+			return rep, fmt.Errorf("reading inventory: %w", err)
+		}
+		blob = data
+		entries, rep.UnparseableLines = parseInventoryBlobCounting(data)
+	}
+	rep.Entries = len(entries)
+
+	if chained && len(entries) == 0 {
+		// Distinguish "structured and empty" from "structured but not yet
+		// decomposed". Backend-agnostic: after decomposition the blob key
+		// renders the rows, so entries and blob agree; before it, the rows are
+		// absent and the blob holds everything. A SQL backend's blob key is an
+		// empty presence marker, so it cannot false-positive here.
+		if legacy, err := s.readInventoryForHMAC(ctx); err == nil && len(parseInventoryBlob(legacy)) > 0 {
+			rep.LegacyUndecomposed = true
+		}
+	}
+
+	key, stored, err := s.loadHMACKey(ctx)
+	if err != nil {
+		return rep, fmt.Errorf("reading inventory HMAC key: %w", err)
+	}
+	switch {
+	case key != nil:
+		rep.KeyState = HMACKeyUsable
+	case stored != nil:
+		rep.KeyState = HMACKeyWrongLength
+	default:
+		rep.KeyState = HMACKeyAbsent
+	}
+
+	switch storedHead, err := s.backend.Get(ctx, KeyInventoryHMAC); {
+	case err == nil:
+		rep.StoredHead = storedHead
+	case errors.Is(err, fs.ErrNotExist):
+		// No baseline yet. Not an error: a CA that has never run the
+		// verification path has nothing stored, and the caller must be able to
+		// tell that apart from a mismatch.
+	default:
+		return rep, fmt.Errorf("reading inventory HMAC: %w", err)
+	}
+
+	if rep.KeyState == HMACKeyUsable {
+		// The same fold computeInventoryHMAC performs, over what was read above
+		// rather than over a second fetch of it.
+		computed := foldInventoryHead(key, entries, blob, chained)
+		rep.ComputedHead = computed
+		// StoredHead != nil is load-bearing beyond the obvious: an empty
+		// structured inventory folds to a nil head, and hmac.Equal(nil, nil) is
+		// true, so without it a store that never wrote a baseline would report
+		// as verifying.
+		rep.Verifies = rep.StoredHead != nil && hmac.Equal(rep.StoredHead, computed)
+	}
+
+	return rep, nil
 }
 
 func (s *StorageService) updateInventoryHMACLocked(ctx context.Context, hmacKey []byte) error {
@@ -1471,15 +1697,21 @@ func (s *StorageService) verifyInventoryHMACLocked(ctx context.Context, hmacKey 
 		// ca_key_file/ca_cert_file server on a build before the InventoryStore
 		// unwrap fix stored a whole-blob HMAC over what is now read as a hash
 		// chain). Surfacing the scheme lets an operator tell the two apart.
-		scheme := "whole-blob-hmac"
-		if _, ok := asInventoryStore(s.backend); ok {
-			scheme = "hash-chain"
-		}
-		slog.Warn("inventory HMAC mismatch; integrity check failed", "scheme", scheme)
+		scheme := s.inventoryScheme()
+		slog.Warn("inventory HMAC mismatch; integrity check failed", "scheme", scheme,
+			"repair", inventoryRepairHint)
 		return ErrInventoryTampered
 	}
 	return nil
 }
+
+// inventoryRepairHint names the supported repair on the two log lines an
+// operator actually reads when a CA will not start. One definition rather than
+// two copies: it names a flag defined in another package, and a rename that
+// updated only one site would leave the other pointing at a flag that no longer
+// exists — the same reason wholeBlobInventoryMAC is defined once.
+const inventoryRepairHint = "openvox-ca rebuild-inventory-hmac reports the state and, with " +
+	"--yes-re-bless, re-asserts integrity over the inventory as it stands"
 
 // ErrInventoryTampered is returned when the inventory HMAC verification fails.
 var ErrInventoryTampered = fmt.Errorf("inventory file integrity check failed: HMAC mismatch (possible tampering)")
