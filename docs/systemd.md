@@ -131,6 +131,38 @@ Status: "Shutting down: draining connections (up to 25s)"
 
 `TimeoutStopSec` must exceed the drain budget (`shutdown_timeout_sec`, 25 seconds by default) plus the supervisor's 3-second headroom, or systemd will `SIGKILL` the CA part-way through the drain it asked for. The shipped unit uses 35 seconds. If you raise `shutdown_timeout_sec`, raise `TimeoutStopSec` with it — see [graceful shutdown](configuration.md#graceful-shutdown).
 
+## Memory budget
+
+`openvox-ca` runs as three processes under this unit, and `GOMEMLIMIT` is a
+per-process knob, so the launcher treats one budget as belonging to the **whole
+tree** and divides it between itself, the isolated signer and the frontend. A
+`GOMEMLIMIT` set in the unit environment therefore caps the tree, not each
+process.
+
+With no `GOMEMLIMIT`, the launcher reads this unit's own cgroup v2 memory
+ceiling, so a `MemoryMax=` in a drop-in is honoured:
+
+```ini
+[Service]
+MemoryMax=512M
+```
+
+It claims 90% of that by default (`memory_budget_percent`), leaving headroom for
+the memory the Go runtime does not account for. The shipped unit sets no
+`MemoryMax=`, so out of the box nothing is derived and the runtimes are
+unlimited, which is the right default for a host that is not memory-constrained.
+
+The launcher and signer take fixed shares (`memory_reserve_launcher`,
+`memory_reserve_signer`) and the frontend takes the remainder. The signer's share
+does not grow with the ceiling, and it carries the Go runtime's own footprint
+before any inventory, so a fleet beyond roughly 40,000 certificates should raise
+`memory_reserve_signer` — raising `MemoryMax=` alone will not reach it. A
+`MemoryMax=` set on a parent slice rather than on this unit is not derived
+either, and `MemoryHigh=` is not read at all — only `memory.max` is consulted.
+Set `MemoryMax=` on the unit itself, or set `GOMEMLIMIT` explicitly.
+
+See [configuration](configuration.md#memory-budget).
+
 ## Hardening
 
 The shipped unit runs the CA as a dedicated `puppet-ca` user with `ProtectSystem=strict`, an empty capability set (the API's port 8140 and the exporter's 9140 are both unprivileged), and a `@system-service` syscall filter. `RestrictAddressFamilies` includes `AF_UNIX`, which is needed for both the notification socket and the launcher's socketpair to the isolated signer.

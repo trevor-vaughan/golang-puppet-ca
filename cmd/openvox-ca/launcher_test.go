@@ -33,6 +33,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,6 +54,12 @@ import (
 // slice position ↔ fd number contract (socketpair on fd 3, PSK pipe on
 // fd 4) is exercised across a genuine exec boundary.
 const pskChildEnv = "OPENVOX_CA_TEST_PSK_CHILD"
+
+// memLimitOutEnv names the file the report-memlimit child writes its effective
+// GOMEMLIMIT to. A file rather than stdout because spawnChild -- the production
+// helper under test -- wires the child's stdout to the launcher's own, so the
+// spec cannot capture it without changing the code it is meant to exercise.
+const memLimitOutEnv = "OPENVOX_CA_TEST_MEMLIMIT_OUT"
 
 func TestMain(m *testing.M) {
 	if role := os.Getenv(pskChildEnv); role != "" {
@@ -95,6 +103,22 @@ func runPSKChild(role string) int {
 			return 1
 		}
 		fmt.Println("SIGN-OK")
+		return 0
+	case "report-memlimit":
+		// debug.SetMemoryLimit(-1) reports the limit without changing it, so
+		// this is what the child's runtime ACTUALLY applied -- not the string it
+		// was handed. A spec reading the variable back would pass on a value
+		// that was delivered and never honoured.
+		path := os.Getenv(memLimitOutEnv)
+		if path == "" {
+			fmt.Fprintln(os.Stderr, "report-memlimit child: "+memLimitOutEnv+" is unset")
+			return 2
+		}
+		limit := strconv.FormatInt(debug.SetMemoryLimit(-1), 10)
+		if err := os.WriteFile(path, []byte(limit), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 		return 0
 	case "sighup-ignored":
 		// The signer's disposition, then a SIGHUP at this very process.
@@ -316,7 +340,7 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		// the pipe leaked, which is the one thing it was named for.
 		pipe := capturePSKPipe()
 
-		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk))
+		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(cmd) })
 
@@ -373,10 +397,10 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { _ = first.Close(); _ = second.Close() })
 
-		signerCmd, err := spawnChild(exe, shared, "signer", first, hex.EncodeToString(psk))
+		signerCmd, err := spawnChild(exe, shared, "signer", first, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(signerCmd) })
-		frontendCmd, err := spawnChild(exe, shared, "frontend", second, hex.EncodeToString(psk))
+		frontendCmd, err := spawnChild(exe, shared, "frontend", second, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(frontendCmd) })
 
@@ -409,7 +433,7 @@ var _ = Describe("spawnChild and its cleanup", func() {
 
 		pipe := capturePSKPipe()
 		cmd, err := spawnChild(filepath.Join(GinkgoT().TempDir(), "does-not-exist"),
-			os.Environ(), "signer", sock, hex.EncodeToString(psk))
+			os.Environ(), "signer", sock, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).To(HaveOccurred(), "a missing executable must not start")
 		Expect(cmd).To(BeNil())
 		Expect(pipe().Close()).To(MatchError(os.ErrClosed),

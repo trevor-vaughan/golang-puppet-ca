@@ -27,6 +27,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -49,6 +50,50 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 	"github.com/voxpupuli/openvox-ca/internal/version"
 )
+
+// openRoleLog installs the configured logger for a role that owns its own
+// process and returns the function that releases it. The returned closer is
+// always non-nil, so callers defer it unconditionally.
+//
+// Extracted because the launcher, the frontend and the signer each open this
+// and each deferred the same Close-and-report block, and the launcher's copy
+// arrived with this change untested: it is the wiring that makes every
+// operator-facing line the memory budget emits reach the configured
+// destination, so a mis-wiring here would silently take the diagnostics with
+// it. runSignerMode keeps its own variant deliberately -- it degrades to stderr
+// where these two return the error, because a signer that cannot open its log
+// should still come up holding the CA key.
+func openRoleLog(cfg *serverConfig) (func(), error) {
+	logFile, err := setupLogger(cfg)
+	if err != nil {
+		return func() {}, err
+	}
+	if logFile == nil {
+		return func() {}, nil
+	}
+	return closeRoleLog(logFile), nil
+}
+
+// closeRoleLog returns the deferred closer for a role's log file. Shared by
+// openRoleLog and runSignerMode: the setup differs between them deliberately
+// (the signer degrades to stderr where the other two return the error), but
+// this half is the same work in all three, and leaving it duplicated meant only
+// openRoleLog's copy was covered while the signer's could drift unguarded.
+func closeRoleLog(logFile *os.File) func() {
+	return func() {
+		// Report on stderr, not slog: the default logger writes to this very
+		// file, which is being closed here.
+		if cerr := logFile.Close(); cerr != nil {
+			// The write itself is best-effort: this is already the fallback path
+			// for a failed close, and there is nowhere left to report a failure to.
+			_, _ = fmt.Fprintf(logCloseErrOut, "failed to close log file: %v\n", cerr)
+		}
+	}
+}
+
+// logCloseErrOut is where openRoleLog reports a failed close. A variable so a
+// spec can read that branch back; it is os.Stderr everywhere else.
+var logCloseErrOut io.Writer = os.Stderr
 
 // setupLogger creates and sets the default slog logger based on config.
 // Returns the log file (if any) so the caller can close it on shutdown,
@@ -591,7 +636,18 @@ func newRootCmd() *cobra.Command {
 
 			// Launcher mode (default): spawn isolated signer + frontend children.
 			if role == "" && !singleProcess {
-				return runLauncher(cfg.shutdownDrain(), notifier, hupCh)
+				// The launcher configures logging for itself, like the signer
+				// does. Without this it ran on Go's built-in default handler:
+				// its verbosity was fixed at info whatever the operator set, so
+				// the debug line explaining why no memory budget was divided
+				// could never appear, and its warnings bypassed logfile
+				// entirely.
+				closeLog, err := openRoleLog(cfg)
+				if err != nil {
+					return err
+				}
+				defer closeLog()
+				return runLauncher(cfg, notifier, hupCh)
 			}
 
 			// Frontend mode (role=frontend) or single-process mode: run HTTP server.
@@ -601,19 +657,11 @@ func newRootCmd() *cobra.Command {
 			var remoteSigner *signer.RemoteSigner
 
 			// --- Logging setup ---
-			logFile, err := setupLogger(cfg)
+			closeLog, err := openRoleLog(cfg)
 			if err != nil {
 				return err
 			}
-			if logFile != nil {
-				defer func() {
-					// Report on stderr, not slog: the default logger writes to
-					// this very file, which is being closed here.
-					if cerr := logFile.Close(); cerr != nil {
-						fmt.Fprintf(os.Stderr, "failed to close log file: %v\n", cerr)
-					}
-				}()
-			}
+			defer closeLog()
 
 			slog.Info("Starting Puppet CA",
 				"cadir", absCADir,
@@ -1166,13 +1214,7 @@ func runSignerMode(ctx context.Context, cfg *serverConfig, absCADir string) erro
 		slog.Warn("Failed to open log file, using stderr", "error", err)
 	}
 	if logFile != nil {
-		defer func() {
-			// Report on stderr, not slog: the default logger writes to this
-			// very file, which is being closed here.
-			if cerr := logFile.Close(); cerr != nil {
-				fmt.Fprintf(os.Stderr, "failed to close log file: %v\n", cerr)
-			}
-		}()
+		defer closeRoleLog(logFile)()
 	}
 
 	ignoreReloadSignal()

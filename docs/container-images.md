@@ -87,6 +87,16 @@ relevant flags, or mount a config file and set `--config`. See [configuring the
 server](configuration.md) for the full reference, and the [HTTP API
 reference](api.md) for the endpoints agents use.
 
+### Memory limits
+
+If you set a memory limit — `--memory`, podman's `-m`, or a compose `mem_limit`
+— the launcher reads it from the container's **cgroup v2** ceiling and divides
+it across the three processes it runs (a supervisor, an isolated signer and the
+frontend), rather than letting each apply the whole of it. On a cgroup v1 host
+nothing is derived; set `GOMEMLIMIT` on the container instead. `GOMEMLIMIT` set
+on the container likewise names the budget for the whole tree, not for one
+process. See [memory budget](configuration.md#memory-budget).
+
 ### Runtime user
 
 Both variants run as the non-root user `puppet`, uid/gid **1000**, declared

@@ -302,7 +302,7 @@ The complete flag, environment-variable, and config-file reference is in
 
 | Guide | What it covers |
 | --- | --- |
-| [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; the serving certificate; autosigning; directory layout; graceful shutdown; reloading configuration; trusting client certificates from another CA |
+| [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; the serving certificate; autosigning; directory layout; the memory budget; graceful shutdown; reloading configuration; trusting client certificates from another CA |
 | [HTTP API reference](docs/api.md) | All endpoints, authorization tiers, and admin credential resolution |
 | [Operator CLI (`openvox-ca-ctl`)](docs/operator-cli.md) | The `openvox-ca-ctl` command reference, and the offline `openvox-ca` subcommands (`csr`, `import-ca-cert`, `generate`) that run against the server's own configuration |
 | [Storage backends](docs/storage-backends.md) | filesystem, SQLite, PostgreSQL, MySQL, etcd, Redis/Valkey; migrating between them |

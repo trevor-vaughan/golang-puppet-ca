@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -66,9 +68,10 @@ const (
 // passed via inherited file descriptors (fd 3). There is no filesystem path
 // for the socket; only the two child processes hold endpoints.
 //
-// drain is the frontend's resolved graceful HTTP-drain budget (see
-// serverConfig.shutdownDrain). The launcher waits drain+launcherShutdownHeadroom
-// for both children to exit after forwarding SIGTERM before hard-killing them,
+// cfg supplies the frontend's graceful HTTP-drain budget (see
+// serverConfig.shutdownDrain) and the three memory-budget keys. The launcher
+// waits that drain plus launcherShutdownHeadroom for both children to exit
+// after forwarding SIGTERM before hard-killing them,
 // so the frontend always gets its full drain even though the launcher's timer
 // starts first.
 //
@@ -83,8 +86,8 @@ const (
 // before any startup work begins, so a reload arriving early is queued rather
 // than fatal — SIGHUP's default disposition would otherwise kill the launcher.
 // NIST 800-53: SC-3 (Security Function Isolation), SC-4 (Information in Shared System Resources)
-func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os.Signal) error {
-	gracefulShutdownTimeout := drain + launcherShutdownHeadroom
+func runLauncher(cfg *serverConfig, notify *sdnotify.Notifier, hupCh <-chan os.Signal) error {
+	gracefulShutdownTimeout := cfg.shutdownDrain() + launcherShutdownHeadroom
 
 	// Create the socketpair for signer ↔ frontend communication.
 	signerSock, frontendSock, err := signer.Socketpair()
@@ -128,14 +131,21 @@ func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os
 	// share a backing array.
 	baseEnv := filterEnv(os.Environ(), internalEnvKeys...)
 
+	// Divide the tree's memory budget before either child starts. GOMEMLIMIT is
+	// a per-process knob and all three processes would otherwise apply the
+	// operator's whole value independently; see launcher_memlimit.go. A zero
+	// share means "leave the runtime default alone", which is what every child
+	// gets when no budget could be resolved.
+	budget := applyMemoryBudget(cfg, os.Getenv, debug.SetMemoryLimit)
+
 	// The frontend gets baseEnv untouched: it is the process that knows when
 	// the listener is accepting, so it is the one that reports READY=1.
-	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex)
+	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex, budget)
 	if err != nil {
 		return err
 	}
 
-	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex)
+	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex, budget)
 	if err != nil {
 		// The signer is already running and nothing will ever connect to it, so
 		// it has to go -- and be reaped, not merely signalled: Kill on its own
@@ -175,6 +185,60 @@ func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os
 		drain:    gracefulShutdownTimeout,
 		crash:    crashShutdownTimeout,
 	}).run()
+}
+
+// applyMemoryBudget resolves the tree budget, applies the launcher's own share
+// through setLimit, and reports the outcome at the level the documentation
+// promises. It returns the budget so the caller can hand it to each child.
+//
+// Extracted from runLauncher, which has no test and cannot easily have one, so
+// that its three decisions are pinned somewhere: that the launcher applies the
+// LAUNCHER's share and not one of the children's, that the lookup starts at the
+// cgroup mount root, and that each outcome reaches the level docs/configuration.md
+// names. The first and third are asserted by specs; the second is now structural,
+// since there is no mount-root argument to pass wrongly. All three were previously expressible only inside the untested function
+// -- swapping shareFor("launcher") for shareFor("signer") changed nothing any
+// spec could see.
+//
+// setLimit is a parameter rather than a direct debug.SetMemoryLimit call for the
+// same reason: a spec cannot observe the process-global limit without changing
+// it for every other spec in the suite. The mount root is deliberately NOT a
+// parameter -- it comes from cgroupMountRootPath, which a spec stubs -- so this
+// call site has no path argument to get wrong.
+func applyMemoryBudget(cfg *serverConfig, getenv func(string) string, setLimit func(int64) int64) memoryBudget {
+	budget, kind, reason := resolveMemoryBudget(cfg, getenv, cgroupMountRootPath)
+
+	// Configured values that could not be used are reported whatever the
+	// outcome: they are the operator's own input, and substituting a default in
+	// silence is how a raised memory_reserve_signer went unnoticed.
+	for _, note := range budget.notes {
+		slog.Warn("Ignoring a memory-budget setting", "detail", note)
+	}
+
+	switch kind {
+	case budgetApplied:
+		slog.Info("Dividing the memory budget across the process tree",
+			"source", budget.source,
+			"ceiling_bytes", budget.ceiling,
+			"total_bytes", budget.total,
+			"launcher_bytes", budget.launcher,
+			"signer_bytes", budget.signer,
+			"frontend_bytes", budget.frontend,
+		)
+		setLimit(budget.shareFor("launcher"))
+	case budgetTooSmall, budgetInvalid:
+		// A ceiling was stated and the division did not happen, so the operator
+		// asked for something and did not get it. Without this line the tree
+		// silently keeps the triple-counted behaviour the limit was meant to
+		// prevent -- and the documentation promises they are told.
+		slog.Warn("Not dividing the memory budget across the process tree", "reason", reason)
+	case budgetNoCeiling:
+		// Nothing stated a ceiling anywhere, which is every host that is not
+		// memory-limited. Unremarkable, so it does not warrant an operator's
+		// attention.
+		slog.Debug("No memory budget to divide across the process tree", "reason", reason)
+	}
+	return budget
 }
 
 // childResult reports which child exited and why.
@@ -322,7 +386,12 @@ var pskPipeFn = pskPipe
 // testable: the parent's copies of both descriptors must be dropped as soon as
 // the child holds them, and a PSK pipe created for a child that never starts
 // must not be leaked. Both rules were open-coded twice.
-func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string) (*exec.Cmd, error) {
+//
+// It takes the whole budget rather than one share, and picks the share by the
+// role it was already given, so a share cannot reach the wrong process. Two
+// positional int64 arguments at the call sites would let a transposition
+// compile, run, and pass every spec that only checks the arithmetic.
+func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string, budget memoryBudget) (*exec.Cmd, error) {
 	pskRead, err := pskPipeFn(pskHex)
 	if err != nil {
 		// Including here, the earliest exit: os.Pipe fails under descriptor
@@ -345,6 +414,15 @@ func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex
 		"PUPPET_CA_ROLE="+role,
 		"PUPPET_CA_DAEMON=1",
 	)
+	if memLimit := budget.shareFor(role); memLimit > 0 {
+		// Appended *after* baseEnv, which still carries the operator's
+		// tree-wide GOMEMLIMIT when they set one: os/exec's dedupEnv keeps the
+		// last occurrence of a key, so this child's share wins over the
+		// inherited total. Stripping GOMEMLIMIT from baseEnv instead would be
+		// wrong for the --daemon re-exec, which has to pass the operator's
+		// value through so the re-executed launcher can divide it.
+		cmd.Env = append(cmd.Env, goMemLimitEnv+"="+strconv.FormatInt(memLimit, 10))
+	}
 	cmd.ExtraFiles = []*os.File{sock, pskRead} // fd 3, fd 4
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

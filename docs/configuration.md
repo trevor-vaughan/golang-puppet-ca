@@ -87,6 +87,10 @@ verbosity: 0
 ocsp_url: ""
 crl_url: ""
 shutdown_timeout_sec: 0  # graceful HTTP-drain budget on SIGTERM; 0 = built-in default (25s)
+# Memory budget for the process tree (launcher + isolated signer + frontend).
+memory_reserve_launcher: ""  # launcher's fixed share; "" = built-in default (8MiB)
+memory_reserve_signer: ""    # signer's fixed share; "" = built-in default (24MiB)
+memory_budget_percent: 0     # share of a cgroup ceiling the tree may claim; 0 = default (90)
 # Key generation options (applied only when bootstrapping a new CA or generating leaf certs).
 ca_key_algo: ""       # "rsa" (default) or "ecdsa"
 ca_key_size: 0        # RSA: 2048/3072/4096 (default 4096); ECDSA: 256/384/521 (default 256)
@@ -231,6 +235,9 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 | `expired_cert_retention_sec` | `PUPPET_CA_EXPIRED_CERT_RETENTION_SEC` |
 | `expired_cert_cleanup_interval_sec` | `PUPPET_CA_EXPIRED_CERT_CLEANUP_INTERVAL_SEC` |
 | `shutdown_timeout_sec` | `PUPPET_CA_SHUTDOWN_TIMEOUT_SEC` |
+| `memory_reserve_launcher` | `PUPPET_CA_MEMORY_RESERVE_LAUNCHER` |
+| `memory_reserve_signer` | `PUPPET_CA_MEMORY_RESERVE_SIGNER` |
+| `memory_budget_percent` | `PUPPET_CA_MEMORY_BUDGET_PERCENT` |
 | `etcd_username` | `PUPPET_CA_ETCD_USERNAME` |
 | `etcd_password` | `PUPPET_CA_ETCD_PASSWORD` |
 | `etcd_dial_timeout_sec` | `PUPPET_CA_ETCD_DIAL_TIMEOUT_SEC` |
@@ -1353,6 +1360,82 @@ them as that user rather than under `sudo`: a root-owned lock file left in
 the server to be stopped, because the filesystem backend supports a single
 running instance. See [running a second process against a live
 store](storage-backends.md#running-a-second-process-against-a-live-store).
+
+## Memory budget
+
+In the default deployment `openvox-ca` runs as **three processes** — a launcher
+supervising an isolated signer that holds the CA key, and a frontend that serves
+the API (see [CA key security](ca-key-security.md#process-isolation)).
+`GOMEMLIMIT` is a per-process knob, so left to inherit it all three would apply
+the operator's whole value independently and the aggregate soft limit would be
+three times what was asked for. The launcher therefore treats one budget as
+belonging to the **whole tree** and divides it.
+
+The budget comes from `GOMEMLIMIT` when set, and otherwise from this process's
+cgroup v2 memory ceiling (`memory.max`, resolved through `/proc/self/cgroup`, so
+a systemd unit's `MemoryMax=` is honoured as well as a container limit). An
+explicit `GOMEMLIMIT` always takes precedence over the derived figure, and is
+taken at face value; a derived ceiling has `memory_budget_percent` of it claimed
+(default 90%), because `GOMEMLIMIT` bounds Go runtime memory only and the
+binary's resident text, kernel memory charged to the cgroup and any
+memory-backed state directory count against the same ceiling from outside it.
+`GOMEMLIMIT=off` disables the whole mechanism, as it disables the runtime's own
+limit.
+
+The launcher and signer take fixed shares (`memory_reserve_launcher`,
+`memory_reserve_signer`, byte counts such as `24MiB` or `24Mi`; the exact
+grammar is below) and the frontend takes the remainder, because in steady state
+the frontend is the process whose footprint grows with the fleet. The signer's share
+is the one an operator can outgrow: its startup peak is fleet-proportional at
+roughly 420 bytes per certificate, and **raising the container limit does not
+reach it**. The share also has to carry the Go runtime's own footprint, a few
+MiB before any inventory, so the usable headroom in the 24MiB default is nearer
+16MiB: raise `memory_reserve_signer` beyond roughly 40,000 certificates.
+
+`memory_reserve_launcher` and `memory_reserve_signer` take an integer with an
+optional IEC suffix, with or without the trailing `B`. Leaving either empty, or
+`memory_budget_percent` at `0`, selects the built-in default and is not reported
+— those are the unset sentinels, not rejected values. `24MiB` and `24Mi` are
+both accepted, as is a bare `25165824`. SI spellings are not — `64MB`, `64M`,
+`64 MiB` and `1.5GiB` are all rejected, because SI and IEC differ by 5% and
+guessing which was meant is worse than refusing. Neither may be below 8MiB: a
+share under the Go runtime's own footprint is arithmetically valid and
+operationally a process that collects continuously. A `memory_budget_percent`
+that is non-zero and outside 1-100 is likewise rejected. In each of these cases
+the built-in default is used and **the launcher logs a warning naming the key and
+the value it ignored**, so a mistyped reservation does not pass unnoticed. One
+value escapes that promise: a `PUPPET_CA_MEMORY_BUDGET_PERCENT` that is not an
+integer at all is discarded during parsing, before the launcher can see it, like
+every other numeric environment variable here, and the default is used
+silently.
+
+Nothing is divided at all in three cases. One is logged as a **warning**,
+because the operator stated a ceiling and did not get the division: a budget too
+small to leave the frontend a workable share. The three shares need 56MiB
+between them and a derived ceiling is scaled to 90% first, so under the default
+reservations the exact floor is 65244729 bytes and 63Mi is the smallest whole
+MiB that divides. The frontend's own floor is **24MiB**, which is what a raised
+`memory_reserve_signer` has to leave room for.
+Splitting a very small total would trade a visible OOMKill for a silent GC death
+spiral, so it is left undivided. What that leaves depends on where the ceiling
+came from. On the derived path no process gets a limit at all. Where the
+too-small ceiling was an explicit `GOMEMLIMIT`, it is still in the environment
+and all three processes inherit and apply the whole of it — the triple-counted
+aggregate this section opens by describing — so raise such a value to one that
+divides rather than lowering it further.
+
+The other two are logged at **debug** level, since there is nothing to act on:
+no ceiling stated anywhere — which includes every cgroup v1 host, because
+`memory.limit_in_bytes` is deliberately not read — and `GOMEMLIMIT=off`. On
+cgroup v1, set `GOMEMLIMIT` explicitly.
+
+A `GOMEMLIMIT` that is not a byte count is not one of these cases. The Go
+runtime parses it during startup, before any of this runs, and aborts with
+`fatal error: malformed GOMEMLIMIT` — so the symptom is a process that does not
+start, not a division that did not happen.
+
+`--single-process` divides nothing either, because there is no tree to divide;
+those installs should set `GOMEMLIMIT` in the ordinary per-process way.
 
 ## Graceful shutdown
 
