@@ -251,6 +251,103 @@ func workflowMatrixVariants(src []byte, job string) ([]string, error) {
 	return names, nil
 }
 
+// workflowRunScripts returns the shell of a workflow's `run:` steps, with
+// comment lines removed. Pass a job name for one job's steps in order, or ""
+// for every job's.
+//
+// This exists so the checks below match what a workflow *runs* rather than
+// what its file *contains*. It is the same distinction automergeRequiredClauses
+// draws one screen down, and for the same reason: this file carries long
+// explanatory comments that quote the very commands the checks look for, so a
+// raw byte search can be satisfied by prose describing a step instead of by the
+// step. `regexp.FindSubmatch` returns the first match in the file, so a comment
+// above the real site does not merely also match -- it is matched instead, and
+// the real site is then free to lose an operand silently.
+//
+// Comment lines inside a run scalar are stripped for the same reason: parsing
+// the YAML removes `#` comments between steps but not the ones inside a block
+// scalar, which is shell text as far as the parser is concerned.
+func workflowRunScripts(src []byte, job string) (string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return "", err
+	}
+	names := slices.Sorted(maps.Keys(doc.Jobs))
+	if job != "" {
+		if _, ok := doc.Jobs[job]; !ok {
+			return "", fmt.Errorf("job %q not found", job)
+		}
+		names = []string{job}
+	}
+	var b strings.Builder
+	scripts := 0
+	for _, name := range names {
+		for _, step := range doc.Jobs[name].Steps {
+			if step.Run == "" {
+				continue
+			}
+			scripts++
+			for _, line := range strings.Split(step.Run, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "#") {
+					continue
+				}
+				b.WriteString(line)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	// Counted, not measured by b.Len(). Splitting an empty Run yields one
+	// empty line, so a step that is purely `uses:` still wrote a newline and
+	// the length test could only ever fire on a job with no steps at all --
+	// which workflow YAML does not produce. The branch was dead.
+	if scripts == 0 {
+		return "", fmt.Errorf("%s has no run: steps", describeJobScope(job))
+	}
+	return b.String(), nil
+}
+
+// describeJobScope names what a workflowRunScripts call was looking at, so its
+// errors read correctly for both call shapes rather than saying `job ""`.
+func describeJobScope(job string) string {
+	if job == "" {
+		return "no job in the workflow"
+	}
+	return fmt.Sprintf("job %q", job)
+}
+
+// workflowStepUses returns the `uses:` reference of every step in one job, in
+// order. Separate from workflowRunScripts because the two answer different
+// questions: what a job *runs* as shell, and what it *pulls in* as an action.
+func workflowStepUses(src []byte, job string) ([]string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string `yaml:"uses"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, err
+	}
+	j, ok := doc.Jobs[job]
+	if !ok {
+		return nil, fmt.Errorf("job %q not found", job)
+	}
+	out := make([]string, 0, len(j.Steps))
+	for _, step := range j.Steps {
+		if step.Uses != "" {
+			out = append(out, step.Uses)
+		}
+	}
+	return out, nil
+}
+
 // shellVariantList extracts the variant names iterated by the
 // `for variant in ...; do` loop in the release workflow's checksum step.
 func shellVariantList(src []byte) ([]string, error) {
@@ -277,8 +374,8 @@ const sbomFormatsPerVariant = 2
 // but not the others fails CI loudly instead of silently shipping an
 // incomplete release. The checked copies: ci.yml's dist job matrix,
 // release.yml's build job matrix, release.yml's checksum-step shell loop and
-// its tarball- and SBOM-count literals, and the generate-sbom action's output
-// format count.
+// its tarball-, SBOM- and package-count literals, and the generate-sbom
+// action's output format count.
 func verifyDistVariants() error {
 	ciSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
 	if err != nil {
@@ -305,13 +402,24 @@ func verifyDistVariantsIn(ciSrc, relSrc, sbomSrc []byte) error {
 	}
 	sortedWant := slices.Sorted(slices.Values(want))
 
+	// The release job's shell, parsed and stripped of comment lines, is what
+	// every shell-shaped check below reads. Reading the file instead lets a
+	// comment quoting a command be found in that command's place -- see
+	// workflowRunScripts. The loop below was doing exactly that before the
+	// package checks were added, so this is one fix for four checks rather
+	// than three new ones beside an old one left as a trap.
+	relScript, err := workflowRunScripts(relSrc, "release")
+	if err != nil {
+		return fmt.Errorf("release.yml: %w", err)
+	}
+
 	checks := []struct {
 		where string
 		got   func() ([]string, error)
 	}{
 		{"ci.yml dist job matrix", func() ([]string, error) { return workflowMatrixVariants(ciSrc, "dist") }},
 		{"release.yml build job matrix", func() ([]string, error) { return workflowMatrixVariants(relSrc, "build") }},
-		{"release.yml checksum-step shell loop", func() ([]string, error) { return shellVariantList(relSrc) }},
+		{"release.yml checksum-step shell loop", func() ([]string, error) { return shellVariantList([]byte(relScript)) }},
 	}
 	for _, c := range checks {
 		got, err := c.got()
@@ -325,20 +433,50 @@ func verifyDistVariantsIn(ciSrc, relSrc, sbomSrc []byte) error {
 	}
 
 	// The checksum step also asserts exact artefact counts: one tarball per
-	// variant, and sbomFormatsPerVariant SBOM documents per variant. Both
-	// literals are checked, because a variant added to every list above but
-	// missed here would leave the release publishing fewer artefacts than it
-	// built while every matrix still agreed.
-	counts := []struct {
+	// variant, sbomFormatsPerVariant SBOM documents per variant, and one
+	// package per format per packaged variant. Every literal is checked,
+	// because a variant added to every list above but missed here would leave
+	// the release publishing fewer artefacts than it built while every matrix
+	// still agreed.
+	//
+	// The package counts are keyed on packagedDistVariants() rather than on
+	// every variant -- see distVariantSpec.packaged for why those differ --
+	// and there is one literal per format rather than a single total. A total
+	// of four is satisfied by four .deb files and no .rpm at all; two counts
+	// of two are not, and they name the format that went missing.
+	packagedWant := packagedDistVariants()
+
+	// Both emptiness cases are abstention, not "packaging is switched off".
+	// With either list empty every package check below passes vacuously --
+	// the counts loop adds no entries, packageExtensionsIn filters everything
+	// away, and the set comparison holds between two empty sets -- while
+	// release.yml goes on counting, checksumming and publishing packages.
+	// Caught here rather than left to fall through, because further down the
+	// symptom is sbomExtensionsIn's catch-all reporting .deb and .rpm as
+	// documents generate-sbom does not write, which sends the reader to
+	// entirely the wrong place.
+	if err := verifyPackageSetNonEmpty(packageFormats, packagedWant); err != nil {
+		return err
+	}
+
+	type artefactCount struct {
 		what     string
 		pattern  string
 		expected int
-	}{
+	}
+	counts := []artefactCount{
 		{"tarballs", `"\$tarballs" -ne (\d+)`, len(want)},
 		{"SBOMs", `"\$sboms" -ne (\d+)`, len(want) * sbomFormatsPerVariant},
 	}
+	for _, f := range packageFormats {
+		counts = append(counts, artefactCount{
+			what:     f + "s",
+			pattern:  `"\$` + f + `s" -ne (\d+)`,
+			expected: len(packagedWant),
+		})
+	}
 	for _, c := range counts {
-		m := regexp.MustCompile(c.pattern).FindSubmatch(relSrc)
+		m := regexp.MustCompile(c.pattern).FindSubmatch([]byte(relScript))
 		if m == nil {
 			return fmt.Errorf("release.yml: no %s-count check matching %q", c.what, c.pattern)
 		}
@@ -399,28 +537,368 @@ func verifyDistVariantsIn(ciSrc, relSrc, sbomSrc []byte) error {
 		return fmt.Errorf("generate-sbom writes %v, but release.yml names %v; update them together",
 			written, distinct)
 	}
-	mentions := make(map[string]int, len(written))
-	for _, ext := range globbed {
-		mentions[ext]++
+	if err := verifyExtensionParity(globbed, written, "SBOM document"); err != nil {
+		return err
 	}
-	for _, ext := range written[1:] {
-		if mentions[ext] != mentions[written[0]] {
-			return fmt.Errorf("release.yml names %s %d time(s) but %s %d time(s); every place that lists one SBOM document must list them all",
-				written[0], mentions[written[0]], ext, mentions[ext])
+
+	// The packages get the same treatment, and for the same reason. They are
+	// named at four sites -- the packaging job's upload list, the checksum
+	// step's two count globs, its sha256sum operands and the release step's
+	// asset list -- and the site that matters is the sha256sum: a package
+	// missing from checksums.txt is published unattested, because the
+	// attestation's subjects are exactly that file's lines.
+	//
+	// The set check is the other half, and it works in one direction only:
+	// a format in packageFormats that release.yml names nowhere would be built
+	// by `mage build:packages` and then silently left behind in dist/. The
+	// converse -- release.yml naming a format packageFormats does not define
+	// -- cannot reach here, because packageExtensionsIn filters through
+	// packageExtensions(), so pkgGlobbed is always a subset of pkgWant. That
+	// case is caught, but by sbomExtensionsIn's catch-all above, which reports
+	// it as an extension generate-sbom does not write. Said here because the
+	// error a maintainer sees names the SBOMs, and a comment claiming this
+	// check catches it would send them to the wrong place.
+	pkgWant := packageExtensions()
+	pkgGlobbed := packageExtensionsIn(relSrc)
+	pkgDistinct := slices.Compact(slices.Sorted(slices.Values(pkgGlobbed)))
+	if !slices.Equal(pkgDistinct, slices.Sorted(slices.Values(pkgWant))) {
+		return fmt.Errorf("packageFormats implies %v, but release.yml names %v; update them together",
+			pkgWant, pkgDistinct)
+	}
+	if err := verifyExtensionParity(pkgGlobbed, pkgWant, "package"); err != nil {
+		return err
+	}
+
+	// Everything above is relative: it compares copies of a list against each
+	// other, and every comparison is satisfied by dropping a whole set at
+	// once. Delete `*.deb *.rpm` from the sha256sum operands together and the
+	// mention counts fall from four to three in step, parity holds, the set
+	// check still sees both formats at the three remaining sites, and the
+	// count literals are in a different part of the step entirely -- so the
+	// guard passes while the release publishes two packages that appear in no
+	// line of checksums.txt, and therefore in no subject of the attestation.
+	// That is not a contrived edit: it is what a rebase or merge taking main's
+	// side of that one line produces.
+	//
+	// So the sites that cannot be allowed to lose an artefact are named
+	// outright. This is the same lesson as the sibling guard below, whose
+	// `merging == 0` branch exists because a guard that finds nothing to guard
+	// has abstained rather than passed.
+	published := make([]string, 0, 1+len(written)+len(pkgWant))
+	published = append(published, distArchiveExtension)
+	published = append(published, written...)
+	published = append(published, pkgWant...)
+	if err := verifyArtefactSites(relScript, published); err != nil {
+		return err
+	}
+
+	// And the packaging itself. Delete the whole `package` job and every check
+	// above still passes -- the release job's counts, globs and asset list are
+	// untouched -- leaving a gate that would first fail at tag time on
+	// "Expected 2 release deb packages, found 0", which is precisely the
+	// failure this function exists to move earlier.
+	// Every job's shell, not the file: the step this looks for is described in
+	// a comment directly above itself, so a file-wide byte search would be
+	// satisfied by that comment alone -- and commenting out the `run:` line
+	// while leaving its comment block is exactly the shape a "disable
+	// packaging while I debug this tag" edit takes.
+	allScripts, err := workflowRunScripts(relSrc, "")
+	if err != nil {
+		return fmt.Errorf("release.yml: %w", err)
+	}
+	if !strings.Contains(allScripts, distPackageBuildCommand) {
+		return fmt.Errorf("release.yml: no step runs %q, so the package counts and globs guard nothing; "+
+			"if packaging was removed, drop packageFormats and the packaged field with them; if it moved, "+
+			"teach verifyDistVariantsIn to find it in its new job -- but see below for the one job it may "+
+			"not move into", distPackageBuildCommand)
+	}
+
+	// And it must not have moved into the release job. That job holds
+	// contents: write, id-token: write and attestations: write, and carries no
+	// checkout precisely so that repository code never runs beside the
+	// signing identity -- the property the workflow's header comment and the
+	// package job's comment both assert. Nothing else in the repository
+	// enforces it: there is no actionlint or zizmor here, and a reviewer
+	// reading a diff that deletes one job and adds one step to another has to
+	// notice what those permissions mean.
+	//
+	// Checked as "no mage at all" rather than "not this target". The release
+	// job runs cp, ls, find, sha256sum and gh; any mage invocation there is
+	// repository code, whichever target it names, and the narrower check would
+	// pass for a differently-named target that does the same damage.
+	if releaseJobMageRE.MatchString(relScript) {
+		return fmt.Errorf("release.yml: the release job runs mage. It is the one job holding contents: " +
+			"write, id-token: write and attestations: write, so running repository code there puts the " +
+			"magefile and its whole dependency tree beside the identity that mints Sigstore certificates " +
+			"for this repository. Build in a job without those permissions and hand the result over as an " +
+			"artefact, the way the package job does")
+	}
+
+	// Shell is only one of the two ways repository code enters a job, and it
+	// is the less idiomatic one here: release.yml already reaches for a local
+	// composite action three times (verify-release-tag, verify-dist-artifact,
+	// generate-sbom), so `uses: ./.github/actions/build-packages` is the more
+	// natural way someone would move packaging into this job -- and a check
+	// that reads only `run:` cannot see it. A checkout is refused for the same
+	// reason one step further back: it is what puts the code on disk for a
+	// local action to run, and the header comment's claim is that this job
+	// carries none.
+	//
+	// Third-party actions pinned by SHA are not repository code and are what
+	// this job is built from, so only `./` references and checkout are named.
+	uses, err := workflowStepUses(relSrc, "release")
+	if err != nil {
+		return fmt.Errorf("release.yml: %w", err)
+	}
+	for _, u := range uses {
+		switch {
+		case strings.HasPrefix(u, "./"):
+			return fmt.Errorf("release.yml: the release job uses the local action %q. A local action is "+
+				"repository code, and this is the one job holding contents: write, id-token: write and "+
+				"attestations: write -- the same objection as running mage here, by the route that does "+
+				"not go through a run: step", u)
+		case strings.HasPrefix(u, "actions/checkout@"):
+			return fmt.Errorf("release.yml: the release job checks the repository out (%q). It carries no "+
+				"checkout deliberately: with no working tree there is nothing for a local action or an "+
+				"inline script to execute beside the signing identity", u)
 		}
 	}
 	return nil
 }
 
-// sbomExtensionsIn returns every SBOM file extension named in release.yml, in
-// the two shapes it uses: a glob (`*.spdx.json`, `dist/*.cdx.json`) or a
-// per-variant name (`openvox-ca_*_"$variant".cdx.json`). The tarball extension
-// is dropped, since most of these sites list it alongside the SBOMs and it has
-// its own count check above.
-func sbomExtensionsIn(src []byte) []string {
+// releaseJobMageRE matches a mage invocation in shell. Anchored on a
+// word boundary rather than testing for the substring "mage ", which is also a
+// substring of "image ", "damage " and "homage " -- a release-job line
+// mentioning an image would otherwise fail dev:check with an error telling the
+// maintainer to look for a mage call that is not there.
+var releaseJobMageRE = regexp.MustCompile(`(^|[^\w.-])mage\s`)
+
+// distPackageBuildCommand is the command release.yml must run to produce the
+// packages. Named as a constant so the check for it cannot drift from the
+// workflow by a rename that leaves a plausible-looking string behind.
+const distPackageBuildCommand = "mage build:packages"
+
+// artefactSite is one place in release.yml that must name every artefact the
+// release publishes, identified by a pattern capturing the list it holds.
+type artefactSite struct {
+	what    string
+	pattern string
+}
+
+// releaseArtefactSites are the two lists in release.yml where an omission is
+// silent and expensive. The other two sites that name every package -- the
+// packaging job's upload list and the gate's own count globs -- are left
+// unpinned deliberately: losing a format from either does not publish anything
+// wrong, it makes the count gate fire at tag time on "Expected 2 release deb
+// packages, found 0". Loud and blocking, so there is nothing for a
+// pull-request-time check to rescue. (Note that parity is not what saves those
+// two: a symmetric removal moves both counts in step and parity holds. The
+// count gate is the backstop, and it runs at tag time, which is exactly why
+// the two sites below -- where there is no backstop at all -- are pinned.)
+//
+// Losing an extension from the checksums.txt operands publishes that artefact
+// with no provenance at all, because the attestation's subjects are exactly
+// that file's lines. Losing one from the asset list is the mirror image: the
+// artefact is built, checksummed and attested, and then never published, so
+// every consumer's `sha256sum -c checksums.txt` fails on a file that does not
+// exist.
+//
+// Both patterns are anchored at both ends -- on the command that starts the
+// list and on `checksums.txt`, which terminates each of them -- rather than on
+// the workflow's current layout, so reformatting is free and removing an
+// operand is not.
+//
+// Be precise about where that tolerance comes from: a block scalar's common
+// leading indentation is stripped by the YAML parse, before any pattern here
+// runs, so shifting a whole step costs these patterns nothing and is not
+// evidence that they are tolerant. What they do absorb on their own is the
+// offset of a continuation line from the command it belongs to, which is what
+// the spec varies.
+//
+// `checksums.txt` doing the terminating also means it has to stay last in the
+// asset list. Move it to the head and the capture shrinks to almost nothing,
+// and the guard reports the first artefact as missing -- loud, but with a
+// message that describes the wrong problem.
+//
+// They differ in how much more than indentation they tolerate, and the weaker
+// one is worth naming. The asset list is `(?s)`, so it survives being
+// re-wrapped across lines. The checksums operand list is not: its capture
+// class excludes newlines, so splitting that line with backslash continuations
+// stops it matching -- a plausible edit, since the line already runs to about
+// eighty characters and grows by one operand per format. That failure is loud
+// rather than silent, taking the "could not find" branch below, which names
+// the pattern and says to teach it rather than delete it.
+func releaseArtefactSites() []artefactSite {
+	return []artefactSite{
+		{"the checksums.txt operand list", `sha256sum -- ([^\n>]+) > checksums\.txt`},
+		{"the gh release create asset list", `(?s)gh release create (.*?)dist/checksums\.txt`},
+	}
+}
+
+// verifyArtefactSites asserts that every extension in exts is named at every
+// site in releaseArtefactSites. exts holds extensions, so the check is for the
+// glob `*<ext>`: matching the bare extension would be satisfied by a mention
+// in a comment.
+func verifyArtefactSites(script string, exts []string) error {
+	for _, site := range releaseArtefactSites() {
+		// Exactly one, not the first of several. A second occurrence means the
+		// guard is choosing between two candidate sites with no way to know
+		// which one publishes the release, and picking the earlier silently is
+		// how a shadowed site goes unchecked.
+		all := regexp.MustCompile(site.pattern).FindAllStringSubmatch(script, -1)
+		if len(all) > 1 {
+			return fmt.Errorf("release.yml: found %d candidates for %s; the guard cannot tell which one "+
+				"publishes the release, so leave one", len(all), site.what)
+		}
+		var m []string
+		if len(all) == 1 {
+			m = all[0]
+		}
+		if m == nil {
+			// Distinct from an omission, and it gets its own message for the
+			// same reason the SBOM output-flag branch does: the guard could
+			// not see the list at all, which usually means the step was
+			// reshaped rather than that an artefact was dropped.
+			return fmt.Errorf("release.yml: could not find %s (pattern %q); if the release step was "+
+				"reshaped, teach releaseArtefactSites to find it rather than deleting the check",
+				site.what, site.pattern)
+		}
+		for _, ext := range exts {
+			if !strings.Contains(m[1], "*"+ext) {
+				return fmt.Errorf("release.yml: %s does not name *%s; every artefact a release publishes "+
+					"must be both checksummed and published, and the parity check above cannot see a "+
+					"format dropped from a site alongside its siblings", site.what, ext)
+			}
+		}
+	}
+	return nil
+}
+
+// verifyPackageSetNonEmpty rejects the two ways the package half of this guard
+// can end up guarding nothing. Split out from verifyDistVariantsIn so that both
+// branches can be reached from a spec: distVariants() is a function rather than
+// a variable, so the second one is otherwise unreachable without building a
+// synthetic workflow around it -- and an untestable branch in a guard is the
+// thing this file keeps finding in everyone else's work.
+func verifyPackageSetNonEmpty(formats []string, packaged []distVariantSpec) error {
+	if len(formats) == 0 {
+		return fmt.Errorf("the package set is empty: packageFormats lists no formats, so release.yml's " +
+			"package counts and globs are held to nothing; if packages are no longer published, remove " +
+			"them from release.yml and drop the packaged field too")
+	}
+	if len(packaged) == 0 {
+		return fmt.Errorf("the package set is empty: no variant in distVariants() is marked packaged, so " +
+			"release.yml's package counts and globs are held to nothing; if packages are no longer " +
+			"published, remove them from release.yml and drop packageFormats too")
+	}
+	return nil
+}
+
+// verifyExtensionParity asserts that release.yml names every extension in want
+// the same number of times, given every mention of any of them in globbed.
+//
+// Counting mentions rather than pinning a regex to each site is what keeps
+// this guard from being fragile against anyone reformatting the workflow: it
+// does not care where the names appear or how they are written, only that no
+// site lists one member of a set and not another. noun names one member, for
+// the error message.
+func verifyExtensionParity(globbed, want []string, noun string) error {
+	// want[1:] would panic on an empty slice, and empty is a state a
+	// maintainer can reach by following this guard's own advice to "drop
+	// packageFormats" -- which would hand them a stack trace out of
+	// `mage dev:check` instead of the clean result the message implies. It is
+	// also the abstaining case: with nothing to compare, every check below
+	// passes vacuously.
+	if len(want) == 0 {
+		return fmt.Errorf("the %s set is empty, so release.yml's %s lists are held to nothing; "+
+			"if that artefact is no longer published, remove its checks rather than emptying its list", noun, noun)
+	}
+	mentions := make(map[string]int, len(want))
+	for _, ext := range globbed {
+		mentions[ext]++
+	}
+	for _, ext := range want[1:] {
+		if mentions[ext] != mentions[want[0]] {
+			return fmt.Errorf("release.yml names %s %d time(s) but %s %d time(s); every place that lists one %s must list them all",
+				want[0], mentions[want[0]], ext, mentions[ext], noun)
+		}
+	}
+	return nil
+}
+
+// globbedExtensionsIn returns every release-artefact file extension named in
+// release.yml, in the two shapes it uses: a glob (`*.spdx.json`,
+// `dist/*.cdx.json`, `dist/*.deb`) or a per-variant name
+// (`openvox-ca_*_"$variant".cdx.json`). Duplicates are kept -- the callers
+// count mentions, not distinct names.
+//
+// Only these two shapes count, which is why prose may name a file freely: a
+// comment saying "openvox-ca_VER_amd64.deb" has no `*` or `"$variant"` in
+// front of the extension and so cannot satisfy a check by being written down.
+func globbedExtensionsIn(src []byte) []string {
 	var out []string
-	for _, m := range regexp.MustCompile(`(?:\*|"\$variant")(\.[a-z0-9.]+)`).FindAllSubmatch(src, -1) {
-		if ext := string(m[1]); ext != ".tar.gz" {
+	for _, m := range regexp.MustCompile(`(?:\*|"\$variant")(\.[a-z0-9.]+)`).FindAllSubmatch(withoutCommentLines(src), -1) {
+		out = append(out, string(m[1]))
+	}
+	return out
+}
+
+// withoutCommentLines drops every line whose first non-space character is `#`.
+//
+// Applied before counting mentions because release.yml is heavily commented and
+// those comments discuss the very globs being counted. Without it, writing
+// `*.deb` in a comment would tip the parity check into "release.yml names .deb
+// 5 time(s) but .rpm 4 time(s)" -- an error that names counts rather than the
+// comment that caused them, sending the reader to look for a missing artefact
+// that is not missing.
+//
+// KNOWN LIMIT, stated rather than closed: this catches whole-line comments,
+// not a trailing `# *.deb` after code. That form does not occur here and
+// catching it means knowing where each line's shell ends, which is more
+// machinery than the failure deserves.
+func withoutCommentLines(src []byte) []byte {
+	// Joined rather than written line-by-line with a trailing newline each:
+	// splitting "a\n" yields a final empty element, so appending a newline per
+	// line would add one the input did not have. Joining round-trips a
+	// comment-free input to itself exactly.
+	lines := bytes.Split(src, []byte("\n"))
+	kept := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("#")) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return bytes.Join(kept, []byte("\n"))
+}
+
+// sbomExtensionsIn returns the SBOM extensions named in release.yml: every
+// globbed extension that is neither the tarball's nor a package's. Both are
+// listed alongside the SBOMs at most of these sites and both have their own
+// count checks, so leaving them in would make the SBOM set check fail on a
+// perfectly correct workflow.
+//
+// The exclusions are a subtraction rather than an allow-list on purpose. A
+// third SBOM format added to generate-sbom must show up here, because that is
+// how the guard notices release.yml has not been taught to publish it.
+func sbomExtensionsIn(src []byte) []string {
+	pkgs := packageExtensions()
+	var out []string
+	for _, ext := range globbedExtensionsIn(src) {
+		if ext == distArchiveExtension || slices.Contains(pkgs, ext) {
+			continue
+		}
+		out = append(out, ext)
+	}
+	return out
+}
+
+// packageExtensionsIn returns the package extensions named in release.yml.
+func packageExtensionsIn(src []byte) []string {
+	pkgs := packageExtensions()
+	var out []string
+	for _, ext := range globbedExtensionsIn(src) {
+		if slices.Contains(pkgs, ext) {
 			out = append(out, ext)
 		}
 	}
@@ -853,12 +1331,73 @@ func verifyAutomergeBasePinIn(name string, src []byte) error {
 var automergeActionRE = regexp.MustCompile(`(?i)auto-?merge`)
 
 // distVariantSpec describes one release artefact: its short name (the
-// artefact-name suffix, e.g. "linux_arm64_fips") and the build environment
-// that produces it.
+// artefact-name suffix, e.g. "linux_arm64_fips"), the build environment that
+// produces it, and whether it is also published as native packages.
 type distVariantSpec struct {
 	name string
 	env  map[string]string
+
+	// packaged marks a variant that is additionally shipped as one package
+	// per entry in packageFormats. It is a field on the variant rather than a
+	// second list of names because the packaged set is a subset of this one:
+	// a separate list is a list that can drift, and the whole purpose of
+	// verifyDistVariants is to stop copies of this list drifting apart.
+	//
+	// The FIPS variants are deliberately excluded. They exist so an operator
+	// under a FIPS obligation can run a boringcrypto build; that operator is
+	// installing into a controlled estate, not apt-getting from a repository,
+	// and packaging them would double the package matrix to serve a case
+	// nobody has asked for. Not an oversight -- flip this to true and
+	// release.yml's package counts must move with it, which is what
+	// verifyDistVariants enforces.
+	packaged bool
 }
+
+// packagedDistVariants returns the subset of distVariants() published as
+// packages. Callers that want a count want this, not len(distVariants()).
+func packagedDistVariants() []distVariantSpec {
+	out := make([]distVariantSpec, 0, len(distVariants()))
+	for _, v := range distVariants() {
+		if v.packaged {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// packageFormats are the nfpm packagers built for each packaged variant, and
+// release.yml's completeness gate is checked against it by verifyDistVariants.
+// nfpm's packager names and the file extensions it writes are the same
+// strings, which is why one list serves both (see packageExtensions).
+//
+// OBLIGATION ON #250, stated because nothing here can enforce it: whatever
+// implements `mage build:packages` MUST drive nfpm from this variable rather
+// than from a slice of its own or an `nfpm.yaml` `packagers:` key. The gate
+// below only holds release.yml to this list; it cannot see the producer, and
+// a second list is exactly the drift the packaged field was made a field to
+// avoid. The two ways it goes wrong are not symmetric. A format added here
+// alone forces release.yml to name it at every site and then fails a tag with
+// "Expected 2 release apk packages, found 0" -- loud, and precisely the
+// failure this guard exists to move earlier. A format added to the producer
+// alone is built into dist/ and silently dropped, because the upload list
+// globs only the declared extensions.
+var packageFormats = []string{"deb", "rpm"}
+
+// packageExtensions are the file extensions of the packages published for each
+// packaged variant, derived from packageFormats so the two cannot diverge.
+func packageExtensions() []string {
+	out := make([]string, 0, len(packageFormats))
+	for _, f := range packageFormats {
+		out = append(out, "."+f)
+	}
+	return out
+}
+
+// distArchiveExtension is the extension of a variant's tarball. Named because
+// the extension checks below have to exclude it: it is listed alongside the
+// SBOMs and the packages at most of the sites they scan, and it has its own
+// count check.
+const distArchiveExtension = ".tar.gz"
 
 // distVariants returns the full set of release artefact variants. The FIPS
 // variants are cgo builds, so they need a Linux host with a C toolchain for
@@ -874,20 +1413,28 @@ func distVariants() []distVariantSpec {
 	}
 	return []distVariantSpec{
 		{
-			name: "linux_amd64",
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
+			name:     "linux_amd64",
+			env:      map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
+			packaged: true,
 		},
 		{
-			name: "linux_arm64",
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+			name:     "linux_arm64",
+			env:      map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+			packaged: true,
+		},
+		// packaged is stated rather than left to the zero value on the FIPS
+		// variants: which variants are packaged is the decision this field
+		// records, and a decision written as an omission reads as an oversight
+		// to the next person to add a variant.
+		{
+			name:     "linux_amd64_fips",
+			env:      fipsEnv("amd64"),
+			packaged: false,
 		},
 		{
-			name: "linux_amd64_fips",
-			env:  fipsEnv("amd64"),
-		},
-		{
-			name: "linux_arm64_fips",
-			env:  fipsEnv("arm64"),
+			name:     "linux_arm64_fips",
+			env:      fipsEnv("arm64"),
+			packaged: false,
 		},
 	}
 }

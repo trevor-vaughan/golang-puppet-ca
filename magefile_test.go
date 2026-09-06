@@ -153,6 +153,129 @@ var _ = Describe("distVariants", func() {
 			}
 		}
 	})
+
+	// Which variants are packaged is a decision, not an implementation
+	// detail: release.yml's package counts are derived from it, and the FIPS
+	// exclusion is the reason those counts are two rather than four. Asserted
+	// by name so that packaging a FIPS variant is a deliberate edit to this
+	// spec rather than something that slips through as a count changing.
+	It("packages the two pure-Go variants and neither FIPS variant", func() {
+		packaged := map[string]bool{}
+		for _, v := range distVariants() {
+			packaged[v.name] = v.packaged
+		}
+		Expect(packaged).To(Equal(map[string]bool{
+			"linux_amd64":      true,
+			"linux_arm64":      true,
+			"linux_amd64_fips": false,
+			"linux_arm64_fips": false,
+		}))
+	})
+})
+
+var _ = Describe("packagedDistVariants", func() {
+	It("returns exactly the variants distVariants marks packaged", func() {
+		var want []string
+		for _, v := range distVariants() {
+			if v.packaged {
+				want = append(want, v.name)
+			}
+		}
+		var got []string
+		for _, v := range packagedDistVariants() {
+			Expect(v.packaged).To(BeTrue(), "returned an unpackaged variant")
+			got = append(got, v.name)
+		}
+		Expect(got).To(Equal(want))
+		Expect(got).To(HaveLen(2))
+	})
+})
+
+var _ = Describe("workflowRunScripts", func() {
+	// Both error branches were unreachable from any spec before this: every
+	// fixture called it with "release" (always present, always carrying run
+	// steps) or "" (never empty for the same reason), so the messages could
+	// have said anything.
+	src := []byte(`
+jobs:
+  build:
+    steps:
+      - run: mage build:dist
+  actionsOnly:
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
+`)
+
+	It("returns one job's run steps", func() {
+		Expect(workflowRunScripts(src, "build")).To(Equal("mage build:dist\n"))
+	})
+
+	It("names the job it could not find", func() {
+		_, err := workflowRunScripts(src, "nope")
+		Expect(err).To(MatchError(ContainSubstring(`job "nope" not found`)))
+	})
+
+	// A step that is purely `uses:` has an empty Run, and splitting "" yields
+	// one empty line -- so counting written bytes rather than run steps made
+	// this branch fire only for a job with no steps at all, which workflow
+	// YAML does not produce.
+	It("reports a job whose steps are all uses:", func() {
+		_, err := workflowRunScripts(src, "actionsOnly")
+		Expect(err).To(MatchError(ContainSubstring(`job "actionsOnly" has no run: steps`)))
+	})
+
+	It("does not say `job \"\"` when asked for every job", func() {
+		_, err := workflowRunScripts([]byte("jobs:\n  a:\n    steps:\n      - uses: x\n"), "")
+		Expect(err).To(MatchError(ContainSubstring("no job in the workflow has no run: steps")))
+	})
+})
+
+var _ = Describe("withoutCommentLines", func() {
+	It("drops whole-line comments at any indentation", func() {
+		src := []byte("keep *.deb\n# drop *.rpm\n      # drop *.rpm too\nkeep *.rpm\n")
+		Expect(string(withoutCommentLines(src))).To(Equal("keep *.deb\nkeep *.rpm\n"))
+	})
+
+	It("returns a comment-free input unchanged", func() {
+		src := []byte("keep *.deb\nkeep *.rpm\n")
+		Expect(withoutCommentLines(src)).To(Equal(src))
+	})
+
+	// The stated KNOWN LIMIT, asserted rather than only described. Recording
+	// it as a spec is what stops a later reader assuming the stripping is
+	// thorough, and what makes closing the limit a deliberate change to this
+	// expectation rather than a silent widening.
+	It("keeps a trailing comment after code, which is the limit it documents", func() {
+		src := []byte("sha256sum -- *.deb  # and *.rpm\n")
+		Expect(string(withoutCommentLines(src))).To(ContainSubstring("# and *.rpm"))
+	})
+})
+
+var _ = Describe("packageExtensions", func() {
+	// Two specs, because they pin different things and only one of them can
+	// tell a derivation from a literal. Asserting `[".deb", ".rpm"]` against
+	// the real packageFormats is satisfied just as well by a function that
+	// returns that slice outright, so on its own it would leave the property
+	// its comment claims to protect completely untested.
+	It("follows packageFormats rather than restating it", func() {
+		original := packageFormats
+		DeferCleanup(func() { packageFormats = original })
+
+		packageFormats = []string{"deb", "rpm", "apk"}
+		Expect(packageExtensions()).To(Equal([]string{".deb", ".rpm", ".apk"}))
+
+		packageFormats = []string{"rpm"}
+		Expect(packageExtensions()).To(Equal([]string{".rpm"}))
+	})
+
+	// And a plain regression anchor on today's value. Not a derivation check
+	// -- that is the spec above -- but the thing that makes adding a format a
+	// deliberate edit here rather than a number quietly changing in
+	// release.yml's gate.
+	It("is deb and rpm today", func() {
+		Expect(packageFormats).To(Equal([]string{"deb", "rpm"}))
+		Expect(packageExtensions()).To(Equal([]string{".deb", ".rpm"}))
+	})
 })
 
 var _ = Describe("release archive contents", func() {
@@ -456,6 +579,14 @@ jobs:
           - variant: linux_arm64
           - variant: linux_amd64_fips
           - variant: linux_arm64_fips
+  package:
+    steps:
+      - run: mage build:packages
+      - uses: actions/upload-artifact@0000000000000000000000000000000000000000
+        with:
+          path: |
+            dist/*.deb
+            dist/*.rpm
   release:
     steps:
       - run: |
@@ -470,7 +601,24 @@ jobs:
           if [ "$sboms" -ne 8 ]; then
             exit 1
           fi
-          sha256sum -- *.tar.gz *.spdx.json *.cdx.json > checksums.txt
+          debs="$(find . -maxdepth 1 -name '*.deb' | wc -l)"
+          if [ "$debs" -ne 2 ]; then
+            exit 1
+          fi
+          rpms="$(find . -maxdepth 1 -name '*.rpm' | wc -l)"
+          if [ "$rpms" -ne 2 ]; then
+            exit 1
+          fi
+          sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt
+      - run: |
+          gh release create "${args[@]}" \
+            dist/*.tar.gz \
+            dist/*.spdx.json \
+            dist/*.cdx.json \
+            dist/*.deb \
+            dist/*.rpm \
+            dist/provenance.sigstore.json \
+            dist/checksums.txt
 `)
 
 		// The generate-sbom action's output formats, whose count must equal
@@ -579,6 +727,368 @@ jobs:
 				[]byte(`sha256sum -- *.tar.gz *.spdx.json`), 1)
 			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
 				ContainSubstring("every place that lists one SBOM document must list them all")))
+		})
+
+		// The package counts are the one place release.yml records that the
+		// packaged set is smaller than the variant set. Nothing else in the
+		// workflow names it, so if these literals stop agreeing with
+		// packagedDistVariants() the disagreement is invisible until a tag.
+		It("rejects a stale deb-count literal and names the counts", func() {
+			badRel := bytes.Replace(goodRel, []byte(`"$debs" -ne 2`), []byte(`"$debs" -ne 4`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("expects 4 debs"), ContainSubstring("implies 2"))))
+		})
+
+		It("rejects a stale rpm-count literal and names the counts", func() {
+			badRel := bytes.Replace(goodRel, []byte(`"$rpms" -ne 2`), []byte(`"$rpms" -ne 3`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("expects 3 rpms"), ContainSubstring("implies 2"))))
+		})
+
+		// Same distinction the SBOM-count specs draw: a check the guard cannot
+		// parse is a different failure from a check that disagrees, and it
+		// gets a message naming the pattern rather than a count.
+		It("rejects a package-count check the guard cannot parse", func() {
+			badRel := bytes.Replace(goodRel, []byte(`"$debs" -ne 2`), []byte(`"$debs" -lt 2`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring(`no debs-count check matching`)))
+		})
+
+		// A format built by `mage build:packages` that release.yml never names
+		// is built into dist/ and then left there: not counted, not
+		// checksummed, not attested, not published.
+		It("rejects a release.yml that names no site for one package format", func() {
+			badRel := bytes.ReplaceAll(goodRel, []byte(`*.rpm`), nil)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("packageFormats implies"), ContainSubstring(".rpm"))))
+		})
+
+		// The subtraction in sbomExtensionsIn makes the SBOM set the catch-all:
+		// an extension that is neither the tarball's nor a declared package
+		// format lands there, and is rejected for not being something
+		// generate-sbom writes. That is the intended behaviour -- nothing
+		// release.yml globs for may go undeclared -- but the message it
+		// produces attributes the extension to the SBOMs, so record which
+		// check actually fires rather than leaving a reader to assume it is
+		// the package one. Verified by mutation: removing the package set
+		// check leaves this spec passing.
+		It("rejects an extension no list declares, through the SBOM set check", func() {
+			badRel := bytes.Replace(goodRel, []byte(`*.tar.gz *.spdx.json`), []byte(`*.tar.gz *.apk *.spdx.json`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("generate-sbom writes"), ContainSubstring(".apk"))))
+		})
+
+		// The failure that costs the most: a package published as a release
+		// asset but absent from the sha256sum operands is absent from
+		// checksums.txt, and the attestation's subjects are that file's lines.
+		// An unattested artefact in a release whose whole point is that
+		// everything in it is attested.
+		It("rejects a release.yml that checksums one package format but not the other", func() {
+			badRel := bytes.Replace(goodRel, []byte(`*.cdx.json *.deb *.rpm > checksums.txt`),
+				[]byte(`*.cdx.json *.deb > checksums.txt`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("every place that lists one package must list them all")))
+		})
+
+		// The tarball extension and the package extensions are subtracted from
+		// the SBOM set before it is compared. Getting that subtraction wrong
+		// in either direction breaks a correct workflow, so this reads the
+		// real release.yml rather than the fixture: the argument for the
+		// subtraction is that all three kinds are named at overlapping sites,
+		// and only the real file actually has all of them.
+		//
+		// ConsistOf, not Equal: parity depends on duplicates being preserved,
+		// so the multiset matters and the order does not. Nothing downstream
+		// reads the order -- verifyExtensionParity builds a map and the set
+		// check sorts -- so pinning it would fail on a reviewer reordering two
+		// operands that the guard itself is happy to accept either way.
+		It("does not confuse package extensions for SBOM documents", func() {
+			relSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "release.yml"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(sbomExtensionsIn(relSrc)).NotTo(ContainElement(".deb"))
+			Expect(sbomExtensionsIn(relSrc)).NotTo(ContainElement(".rpm"))
+			Expect(sbomExtensionsIn(relSrc)).NotTo(ContainElement(".tar.gz"))
+			Expect(sbomExtensionsIn(relSrc)).NotTo(BeEmpty())
+			// Counted, not compared as an ordered slice. Parity depends on
+			// duplicates being preserved, so the multiset matters; the order
+			// does not, because nothing downstream reads it -- and pinning it
+			// would fail on a reviewer reordering two operands the guard
+			// itself accepts either way. Four sites name each package: the
+			// packaging job's upload list, the gate's count glob, the
+			// sha256sum operands, and the release asset list.
+			mentions := map[string]int{}
+			for _, ext := range packageExtensionsIn(relSrc) {
+				mentions[ext]++
+			}
+			Expect(mentions).To(Equal(map[string]int{".deb": 4, ".rpm": 4}))
+		})
+
+		// Everything above this point is relative: it compares copies of a
+		// list against each other, so dropping a whole set from one site keeps
+		// every comparison satisfied. These are the specs for the floor, and
+		// each one is a mutation that passed the parity, set and count checks
+		// before the floor existed.
+		//
+		// The first is the one that matters most, because it is not a
+		// contrived edit. Taking main's side of the sha256sum line during a
+		// rebase produces exactly this, and the result is a release whose
+		// packages appear in no line of checksums.txt and therefore in no
+		// subject of the attestation -- published unattested, in a release
+		// whose entire claim is that everything in it is attested.
+		It("rejects dropping both package formats from the checksums.txt operands together", func() {
+			badRel := bytes.Replace(goodRel, []byte(`*.cdx.json *.deb *.rpm > checksums.txt`),
+				[]byte(`*.cdx.json > checksums.txt`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("checksums.txt operand list"), ContainSubstring("*.deb"))))
+		})
+
+		// The SBOM pair has the same exposure, and had it on main before this
+		// branch: dropping both documents from a site together moves each
+		// mention count from five to four in step, so parity holds, the set
+		// check still sees both at the four remaining sites, and the
+		// SBOM-count literal lives elsewhere in the step. The pre-existing
+		// SBOM spec covers only the asymmetric case. Without these two, the
+		// SBOM third of `published` could be deleted with the suite green.
+		It("rejects dropping both SBOM formats from the checksums.txt operands together", func() {
+			badRel := bytes.Replace(goodRel, []byte(`*.tar.gz *.spdx.json *.cdx.json *.deb`),
+				[]byte(`*.tar.gz *.deb`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("checksums.txt operand list"), ContainSubstring("*.spdx.json"))))
+		})
+
+		It("rejects dropping both SBOM formats from the release asset list together", func() {
+			badRel := bytes.Replace(goodRel, []byte("            dist/*.spdx.json \\\n            dist/*.cdx.json \\\n"), nil, 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("gh release create asset list"), ContainSubstring("*.spdx.json"))))
+		})
+
+		// The tarball has the same exposure and had it before this change:
+		// nothing else asserts that *.tar.gz reaches the operand list either.
+		It("rejects dropping the tarballs from the checksums.txt operands", func() {
+			badRel := bytes.Replace(goodRel, []byte(`sha256sum -- *.tar.gz `), []byte(`sha256sum -- `), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("checksums.txt operand list"), ContainSubstring("*.tar.gz"))))
+		})
+
+		// The mirror image: built, checksummed, attested, never published. The
+		// consumer-visible symptom is the opposite of silent -- every
+		// `sha256sum -c checksums.txt` fails on files that are not there.
+		It("rejects dropping both package formats from the release asset list together", func() {
+			badRel := bytes.Replace(goodRel, []byte("            dist/*.deb \\\n            dist/*.rpm \\\n"), nil, 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("gh release create asset list"), ContainSubstring("*.deb"))))
+		})
+
+		// A guard that finds nothing to guard has abstained, not passed --
+		// the same reasoning as verifyAutomergeLabelExclusionIn's `merging ==
+		// 0` branch. Delete the packaging job and every other check here still
+		// passes, because they all read the release job.
+		It("refuses to pass when nothing in the workflow builds packages at all", func() {
+			badRel := bytes.Replace(goodRel, []byte("      - run: mage build:packages\n"), nil, 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("no step runs"), ContainSubstring("mage build:packages"))))
+		})
+
+		// The site checks read the release job's parsed `run:` shell, not the
+		// file, and skip comment lines within it. Without that, a comment
+		// quoting either command is found first -- FindAllStringSubmatch
+		// returns matches in order -- and checked in the real site's place,
+		// leaving the real site free to lose an operand with `mage dev:check`
+		// still green. release.yml quotes both commands in prose today, and
+		// the commit that added these checks quotes the operand list too.
+		//
+		// This is the property automergeRequiredClauses pins for itself with
+		// "a comment naming any of this cannot satisfy it"; these two specs
+		// are the same pin for the same reason.
+		It("is not satisfied by a comment quoting the checksums.txt operand list", func() {
+			badRel := bytes.Replace(goodRel,
+				[]byte("          sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt\n"),
+				[]byte("          # sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt\n"+
+					"          sha256sum -- *.tar.gz *.spdx.json *.cdx.json > checksums.txt\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("checksums.txt operand list"), ContainSubstring("*.deb"))))
+		})
+
+		// The variant loop and the count literals had the same exposure as the
+		// two sites, and had it before this branch: both were matched against
+		// the file. A comment quoting either shadows the real one, and the
+		// real one is then free to disagree with distVariants().
+		It("is not satisfied by a comment quoting the variant loop", func() {
+			badRel := bytes.Replace(goodRel,
+				[]byte("          for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do\n"),
+				[]byte("          # for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do\n"+
+					"          for variant in linux_amd64 linux_arm64; do\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("checksum-step shell loop")))
+		})
+
+		It("is not satisfied by a comment quoting a count check", func() {
+			badRel := bytes.Replace(goodRel, []byte(`          if [ "$tarballs" -ne 4 ]; then`),
+				[]byte("          # if [ \"$tarballs\" -ne 4 ]; then\n          if [ \"$tarballs\" -ne 3 ]; then"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("expects 3 tarballs")))
+		})
+
+		// Relocating packaging into the release job satisfies every other
+		// check here -- the sites, parity, the set and the counts all still
+		// hold, and the tag would publish a correct set of artefacts. What
+		// changes is that the magefile and its dependency tree execute beside
+		// id-token: write. A reviewer reading a diff that deletes one job and
+		// adds one step has to notice what those permissions mean; this does
+		// not require them to.
+		It("refuses to let packaging move into the job that holds the signing identity", func() {
+			badRel := bytes.Replace(goodRel, []byte("      - run: mage build:packages\n"), nil, 1)
+			badRel = bytes.Replace(badRel, []byte("  release:\n    steps:\n"),
+				[]byte("  release:\n    steps:\n      - run: mage build:packages\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("release job runs mage"), ContainSubstring("id-token: write"))))
+		})
+
+		// Shell is one of two ways repository code enters a job, and the
+		// other is the one release.yml already reaches for three times. A
+		// guard reading only `run:` cannot see `uses: ./...`, so moving
+		// packaging behind a local composite action -- the more idiomatic
+		// refactor here than inlining mage -- would have walked straight past
+		// it into the job holding id-token: write.
+		It("refuses a local action in the job that holds the signing identity", func() {
+			badRel := bytes.Replace(goodRel, []byte("  release:\n    steps:\n"),
+				[]byte("  release:\n    steps:\n      - uses: ./.github/actions/build-packages\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("local action"), ContainSubstring("id-token: write"))))
+		})
+
+		It("refuses a checkout in the job that holds the signing identity", func() {
+			badRel := bytes.Replace(goodRel, []byte("  release:\n    steps:\n"),
+				[]byte("  release:\n    steps:\n      - uses: actions/checkout@0000000000000000000000000000000000000000\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("checks the repository out")))
+		})
+
+		// "mage " is a substring of "image ". The gate is deliberately broad
+		// over mage targets, and must not be broad over English.
+		It("does not mistake the word image for a mage invocation", func() {
+			ok := bytes.Replace(goodRel, []byte("          sha256sum -- "),
+				[]byte("          echo \"the image digest is pinned\"\n          sha256sum -- "), 1)
+			Expect(ok).NotTo(Equal(goodRel))
+			Expect(verifyDistVariantsIn(goodCI, ok, goodSBOM)).To(Succeed())
+		})
+
+		It("is not satisfied by a comment mentioning the package build command", func() {
+			badRel := bytes.Replace(goodRel, []byte("      - run: mage build:packages\n"),
+				[]byte("      - run: |\n          # mage build:packages builds them\n          true\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("no step runs"), ContainSubstring("mage build:packages"))))
+		})
+
+		// Two candidate sites is not "use the first". The guard would be
+		// choosing between them with no way to know which one publishes the
+		// release, and choosing silently is how a shadowed site goes
+		// unchecked -- the same failure the comment specs above cover, by a
+		// route parsing does not close.
+		It("refuses to choose between two candidate sites", func() {
+			badRel := bytes.Replace(goodRel,
+				[]byte("          sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt\n"),
+				[]byte("          sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt\n"+
+					"          sha256sum -- *.tar.gz > checksums.txt\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("found 2 candidates"), ContainSubstring("checksums.txt operand list"))))
+		})
+
+		// Emptying either list is what this guard's own remediation text tells
+		// a maintainer to do when packaging goes away, and both used to end
+		// badly: packageFormats reached verifyExtensionParity's want[1:] and
+		// panicked, and either one left every package check passing vacuously
+		// while release.yml still published packages. Both now say so, and say
+		// it before sbomExtensionsIn's catch-all can report .deb and .rpm as
+		// missing SBOM documents.
+		It("reports an empty packageFormats rather than passing vacuously", func() {
+			original := packageFormats
+			DeferCleanup(func() { packageFormats = original })
+			packageFormats = nil
+			Expect(verifyDistVariantsIn(goodCI, goodRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("package set is empty"), ContainSubstring("packageFormats lists no formats"))))
+		})
+
+		It("reports no variant being marked packaged rather than passing vacuously", func() {
+			Expect(verifyPackageSetNonEmpty(packageFormats, nil)).To(MatchError(
+				ContainSubstring("no variant in distVariants() is marked packaged")))
+		})
+
+		// And the panic itself, at the function that used to take it. Reached
+		// through verifyDistVariantsIn only when the check above is absent, so
+		// it is asserted directly rather than through a workflow.
+		It("refuses an empty set in verifyExtensionParity rather than panicking on want[1:]", func() {
+			Expect(verifyExtensionParity(nil, nil, "package")).To(MatchError(
+				ContainSubstring("package set is empty")))
+		})
+
+		// Only *relative* indentation is a real variation to test. A block
+		// scalar's common leading indentation is stripped by the YAML parse
+		// before any pattern sees it, so shifting every line of a step by the
+		// same amount feeds the site patterns byte-identical input and asserts
+		// nothing they do not already get from the baseline spec above. What
+		// does survive the parse is the offset of the continuation lines from
+		// the command they belong to, so that is what this varies.
+		It("accepts the asset list however its continuation lines are indented", func() {
+			reindented := bytes.ReplaceAll(goodRel, []byte("\n            dist/"), []byte("\n                dist/"))
+			Expect(reindented).NotTo(Equal(goodRel), "the fixture must actually have changed")
+			Expect(verifyDistVariantsIn(goodCI, reindented, goodSBOM)).To(Succeed())
+		})
+
+		// Mention counting strips comment lines too, and until now nothing
+		// asserted it: neither the fixture nor the real release.yml contains a
+		// comment naming a glob, so the branch never ran to any effect and
+		// could be deleted with the suite green.
+		//
+		// The path it closes is narrow but real. Two sites that name every
+		// package are deliberately unpinned -- the packaging job's upload list
+		// and the gate's count globs -- and both are covered by parity alone.
+		// A comment naming *.rpm can therefore make up for an *.rpm dropped
+		// from one of them, holding the count at four against .deb's four.
+		//
+		// The comment names one glob, not both: naming both moves the two
+		// counts together and parity holds either way, which would leave this
+		// spec passing whether the stripping happened or not.
+		It("does not count a glob named in a comment", func() {
+			withComment := bytes.Replace(goodRel, []byte("  release:\n"),
+				[]byte("  # the package job uploads dist/*.rpm too\n  release:\n"), 1)
+			Expect(withComment).NotTo(Equal(goodRel))
+			Expect(verifyDistVariantsIn(goodCI, withComment, goodSBOM)).To(Succeed())
+		})
+
+		It("does not let a comment restore a mention a real site has lost", func() {
+			badRel := bytes.Replace(goodRel, []byte("            dist/*.rpm\n"), nil, 1)
+			badRel = bytes.Replace(badRel, []byte("  release:\n"),
+				[]byte("  # the package job uploads dist/*.rpm too\n  release:\n"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("every place that lists one package must list them all")))
+		})
+
+		// releaseArtefactSites' doc comment names this edit as the one the
+		// operand pattern cannot absorb -- the capture class excludes
+		// newlines, so a backslash continuation stops it matching. Asserting
+		// it makes the documented failure mode a tested one, and pins that it
+		// is loud rather than silently wrong.
+		It("reports a wrapped checksums operand line rather than silently missing it", func() {
+			badRel := bytes.Replace(goodRel,
+				[]byte("          sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt\n"),
+				[]byte("          sha256sum -- *.tar.gz *.spdx.json *.cdx.json \\\n            *.deb *.rpm > checksums.txt\n"), 1)
+			Expect(badRel).NotTo(Equal(goodRel))
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("could not find the checksums.txt operand list"),
+					ContainSubstring("teach releaseArtefactSites"))))
+		})
+
+		// Zero matches is not an omission: the guard's own pattern stopped
+		// matching, which is a different problem with a different fix, so it
+		// says which site it could not find rather than which artefact is
+		// missing from it.
+		It("says which site it could not find when the release step is reshaped", func() {
+			badRel := bytes.Replace(goodRel, []byte("gh release create"), []byte("gh release publish"), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				And(ContainSubstring("could not find the gh release create asset list"),
+					ContainSubstring("teach releaseArtefactSites"))))
 		})
 	})
 })

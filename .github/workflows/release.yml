@@ -5,14 +5,15 @@ on:
     tags:
       - 'v*'
 
-# The verify and build jobs only read; contents: write, id-token: write and
-# attestations: write are granted to the release job alone, so a compromise in
-# the build path cannot push refs, publish releases, or mint a signing
-# certificate that speaks for this repository. The cost of keeping the signing
+# The verify, build and package jobs only read; contents: write, id-token:
+# write and attestations: write are granted to the release job alone, so a
+# compromise in the build path cannot push refs, publish releases, or mint a
+# signing certificate that speaks for this repository. The cost of keeping the signing
 # identity in one job is that provenance binds the bytes the release job
 # downloaded from the run's artifact store, rather than binding them to the
-# individual build job that compiled them; attesting in build instead would
-# tighten that at the price of granting attestations: write to four more jobs.
+# individual build job that compiled them; attesting where each artefact is
+# produced instead would tighten that at the price of granting attestations:
+# write to five more jobs -- the four build legs and the packaging job.
 permissions:
   contents: read
   checks: read  # verify-release-tag reads the tagged commit's check runs
@@ -87,10 +88,88 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # -- Package the built binaries as .deb and .rpm ----------------------------
+  # One runner packages both packaged variants -- the FIPS pair is deliberately
+  # not packaged, see distVariantSpec.packaged. The build matrix above spends a
+  # native runner per variant because the FIPS builds are cgo and would
+  # otherwise need a cross toolchain; packaging has no such constraint. nfpm is
+  # pure Go and takes the target architecture from its configuration rather
+  # than from the host, so a second per-variant matrix would buy nothing.
+  #
+  # It is a job of its own rather than a step in `release` for the reason the
+  # header comment gives: packaging means executing this repository's magefile,
+  # and `release` is the one job holding contents: write, id-token: write and
+  # attestations: write. Keeping repository code out of that job leaves it
+  # running only pinned actions and inline shell. The packages consequently
+  # reach `release` exactly as the tarballs do -- as artefacts it downloads,
+  # whose bytes its attestation binds.
+  package:
+    name: Build packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout first: it cleans the workspace, so it must not run after the
+      # artefacts have been downloaded into it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Cold, for the same reason the build job is: see the note there.
+          cache: false
+      - name: Install Mage
+        run: go install github.com/magefile/mage@v1.17.2
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Build packages
+        # THIS TARGET DOES NOT EXIST YET. It is #250, implemented by PR #282,
+        # and until #282 merges this step fails with mage's "unknown target"
+        # and nothing in the log says why -- hence this line. The PR number is
+        # the one that matters here because the thing being waited on is a
+        # merge; elsewhere in this file #250 is named instead, because there
+        # the subject is whose work it is rather than when it lands. See the
+        # "Packages" section of docs/development/releasing.md before pushing a
+        # v* tag.
+        #
+        # The contract with `mage build:packages`: it reads the variant
+        # tarballs already in dist/ and writes one package per format for each
+        # packaged variant into the same directory. Nothing in this workflow
+        # knows the package filenames -- they are the format-native ones that
+        # apt and dnf expect, and they carry no variant name, which is why the
+        # completeness gate below counts them rather than globbing per variant.
+        #
+        # NOT VERIFIED HERE, and said plainly rather than left to be noticed:
+        # the build job runs verify-dist-artifact over the tarballs, executing
+        # the exact binaries it is about to publish, and the packages have no
+        # counterpart. A package that is well formed but wrong -- a binary at
+        # the wrong path, a missing unit, the wrong mode -- passes the count
+        # gate, is checksummed, is attested and is published. Closing it means
+        # asserting an install layout, which is #250's to define and #254's to
+        # exercise in CI; a check written here first would be asserting a
+        # payload that does not exist yet. Until then the rehearsal checklist
+        # in docs/development/releasing.md asks a maintainer to open one by
+        # hand, which is a worse guarantee honestly labelled.
+        run: mage build:packages
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+          retention-days: 1
+
   # -- Aggregate the artefacts and publish the GitHub release -----------------
   release:
     name: Publish release
-    needs: build
+    # build is named as well as package, which needs it, so that removing the
+    # packaging job cannot silently leave this one with no dependency on the
+    # matrix that produces the tarballs.
+    needs: [build, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release and upload assets
@@ -98,6 +177,8 @@ jobs:
       attestations: write  # record the attestation against the repository
     steps:
       - name: Download artifacts
+        # dist-* covers the per-variant artefacts from the build matrix and
+        # dist-packages from the packaging job alike.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -111,38 +192,77 @@ jobs:
           ls -l
           # Refuse to publish an incomplete release: every variant in the
           # build matrix must have produced exactly one tarball and one SBOM
-          # per format, and nothing unexpected may sneak in. This list, the
-          # matrix above, ci.yml's dist matrix, and distVariants() in
-          # magefile.go are checked for agreement by `mage dev:check`
-          # (verifyDistVariants).
+          # per format, every packaged variant one package per format, and
+          # nothing unexpected may sneak in. This list, the matrix above,
+          # ci.yml's dist matrix, and distVariants() in magefile.go are checked
+          # for agreement by `mage dev:check` (verifyDistVariants).
           for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
             ls -- openvox-ca_*_"$variant".tar.gz > /dev/null
             ls -- openvox-ca_*_"$variant".spdx.json > /dev/null
             ls -- openvox-ca_*_"$variant".cdx.json > /dev/null
           done
-          tarballs="$(ls -- *.tar.gz | wc -l)"
+          # Counted with find, not `ls | wc -l`. This step declares no shell:
+          # key and the workflow has no defaults: block, so it runs under
+          # bash -e with pipefail off, where an unmatched glob leaves ls
+          # failing and the pipeline reporting wc's zero -- which happens to
+          # give the right answer. It stops giving the right answer the moment
+          # anyone adds `shell: bash` or `set -o pipefail`, which is the house
+          # style everywhere else here (see verify-dist-artifact, which opts
+          # into pipefail deliberately). find exits 0 on no matches, so the
+          # count below is the assertion under every combination of options
+          # rather than only under today's.
+          tarballs="$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)"
           if [ "$tarballs" -ne 4 ]; then
             echo "::error::Expected 4 release tarballs, found $tarballs"
             exit 1
           fi
           # Two documents per variant: SPDX-JSON and CycloneDX-JSON.
-          sboms="$(ls -- *.spdx.json *.cdx.json | wc -l)"
+          sboms="$(find . -maxdepth 1 \( -name '*.spdx.json' -o -name '*.cdx.json' \) | wc -l)"
           if [ "$sboms" -ne 8 ]; then
             echo "::error::Expected 8 release SBOMs, found $sboms"
             exit 1
           fi
-          # The SBOMs are checksummed alongside the tarballs: they are
-          # published artefacts in their own right, and the attestation below
-          # takes its subject list from this file.
-          sha256sum -- *.tar.gz *.spdx.json *.cdx.json > checksums.txt
+          # One package per format for each packaged variant -- the FIPS
+          # variants are deliberately not packaged, so this is two, not four.
+          # Both literals are checked against packagedDistVariants() by
+          # verifyDistVariants, so a variant that starts or stops being
+          # packaged fails `mage dev:check` on a pull request rather than at
+          # tag time.
+          #
+          # Counted, not globbed per variant: a package's filename is the
+          # format-native one and carries no variant name, and renaming them
+          # to match would break the convention apt and dnf expect. Globbing
+          # per architecture instead was considered and is not worth it --
+          # dist/ is one directory, so two files cannot share a name, and a
+          # count of two therefore already means two distinct packages. The
+          # only extra case a per-architecture glob would catch is a wrong
+          # architecture spelling, which would mean hard-coding nfpm's output
+          # names here and failing a tag if #250 chooses differently. It would
+          # add a way to be wrong and almost no way to be right.
+          debs="$(find . -maxdepth 1 -name '*.deb' | wc -l)"
+          if [ "$debs" -ne 2 ]; then
+            echo "::error::Expected 2 release deb packages, found $debs"
+            exit 1
+          fi
+          rpms="$(find . -maxdepth 1 -name '*.rpm' | wc -l)"
+          if [ "$rpms" -ne 2 ]; then
+            echo "::error::Expected 2 release rpm packages, found $rpms"
+            exit 1
+          fi
+          # The SBOMs and packages are checksummed alongside the tarballs: they
+          # are published artefacts in their own right, and the attestation
+          # below takes its subject list from this file. A package left out of
+          # this line would be published with no provenance at all.
+          sha256sum -- *.tar.gz *.spdx.json *.cdx.json *.deb *.rpm > checksums.txt
           cat checksums.txt
       - name: Attest build provenance
         id: attest
         # One call, whose subjects are exactly the lines of checksums.txt —
-        # every tarball and every SBOM. Using the checksum file as the subject
-        # list rather than a glob means the attested set and the published set
-        # cannot drift apart, and it authenticates checksums.txt's contents as
-        # a side effect: the signed subject list is the same list.
+        # every tarball, every SBOM and every package. Using the checksum
+        # file as the subject list rather than a glob means the attested set
+        # and the published set cannot drift apart, and it authenticates
+        # checksums.txt's contents as a side effect: the signed subject list
+        # is the same list.
         #
         # Provenance only, no SBOM attestation. The SBOM documents are
         # published as release assets and are themselves subjects of this
@@ -189,5 +309,7 @@ jobs:
             dist/*.tar.gz \
             dist/*.spdx.json \
             dist/*.cdx.json \
+            dist/*.deb \
+            dist/*.rpm \
             dist/provenance.sigstore.json \
             dist/checksums.txt

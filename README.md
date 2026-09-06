@@ -79,7 +79,8 @@ root for a Docker/Podman Compose deployment.
 ### Release tarballs
 
 Each release publishes four tarballs — `linux_amd64` and `linux_arm64`, each in a standard and a
-FIPS (`_fips`) build — plus an SBOM pair per tarball, `checksums.txt`, and a signed provenance
+FIPS (`_fips`) build — plus a `.deb` and an `.rpm` for each of the two non-FIPS architectures, an
+SBOM pair per tarball, `checksums.txt`, and a signed provenance
 bundle (see [verifying what you downloaded](#verifying-what-you-downloaded)). Every archive
 contains both binaries (`openvox-ca`, `openvox-ca-ctl`) and the systemd unit
 `openvox-ca.service`. Asset names carry the release version, so set `VERSION` to the release you
@@ -99,8 +100,8 @@ See [running under systemd](docs/systemd.md) for the rest of a VM install.
 ### Verifying what you downloaded
 
 `checksums.txt` establishes that a download arrived intact. Provenance establishes
-where it came from: every tarball, container image and chart published from a
-release tag carries a [SLSA v1.0](https://slsa.dev/spec/v1.0/provenance) build
+where it came from: every tarball, package, container image and chart published
+from a release tag carries a [SLSA v1.0](https://slsa.dev/spec/v1.0/provenance) build
 provenance attestation, signed through [Sigstore](https://www.sigstore.dev/) with a
 short-lived certificate — there is no long-lived signing key to trust or rotate.
 
@@ -138,8 +139,10 @@ $ cosign verify-blob-attestation openvox-ca_${VERSION}_linux_amd64.tar.gz \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-The bundle covers every file listed in `checksums.txt` — each tarball and each SBOM —
-so the same bundle verifies any of them.
+The bundle covers every file listed in `checksums.txt` — each tarball, each SBOM and
+each `.deb`/`.rpm` — so the same bundle verifies any of them. Note what that does *not*
+include: the `.rpm` carries no rpm header signature, so `dnf` with `gpgcheck=1` has
+nothing of its own to check. Verify the package with the bundle above before installing it.
 
 Container images and the Helm chart are both attested and signed. Because images are
 also built for pull requests, whose certificates name `refs/pull/N/merge`, pin the
