@@ -200,8 +200,25 @@ fi
 # server process under a name none of first-boot's checks ever saw.
 if [ ! -e "$ENABLED_MARKER" ]; then
 	if systemctl enable openvox-ca-first-boot.service >/dev/null 2>&1; then
-		mkdir -p "$STATEDIR" 2>/dev/null || :
-		: >"$ENABLED_MARKER" 2>/dev/null || :
+		# Reported, not swallowed, like every other step in this script. The
+		# unit is enabled at this point whatever happens next, so a failure
+		# here is not an install failure -- but it leaves no record that we
+		# enabled it, and the marker is the only thing that stops the NEXT
+		# upgrade enabling it again. An operator who has since run
+		# `systemctl disable openvox-ca-first-boot` would have that decision
+		# silently undone, which is the one outcome this marker exists to
+		# prevent. Causes are mundane and real: a read-only /var during an
+		# image build, a full filesystem, an SELinux denial, something already
+		# occupying $STATEDIR.
+		if mkdir -p "$STATEDIR" 2>/dev/null && : >"$ENABLED_MARKER" 2>/dev/null; then
+			:
+		else
+			warn "enabled openvox-ca-first-boot.service but could not record it at" \
+				"$ENABLED_MARKER. Provisioning is set up correctly and will run. The only" \
+				"consequence is later: if you run 'systemctl disable openvox-ca-first-boot'," \
+				"the next package upgrade will re-enable it. Create that file yourself to" \
+				"make the disable stick."
+		fi
 	else
 		warn "could not enable openvox-ca-first-boot.service. First-boot provisioning will not" \
 			"run, and 'systemctl start openvox-ca' will bootstrap a CA under a name none of its" \

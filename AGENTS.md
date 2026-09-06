@@ -327,7 +327,28 @@ not** be rebranded:
 - HTTP route prefix `/puppet-ca/v1`
 - Environment-variable prefix `PUPPET_CA_` (and `PUPPET_CA_CTL_` for the CLI)
 - Prometheus metric namespace `puppetca_`
-- Storage key prefixes / default paths (`puppet-ca`, `/etc/puppet-ca`, `/var/lib/puppet-ca`)
+- Storage key prefixes and the config-file location (`puppet-ca`, `/etc/puppet-ca`)
+- The `puppet-ca` spelling itself, wherever a path uses it — `/var/lib/puppet-ca`
+  included
+
+**This is a contract about names, not about which path is the default.** A
+default may move; the spelling may not be rebranded to `openvox-ca`.
+`/var/lib/puppet-ca` is the case where the two are easy to confuse: it is still
+a supported `--cadir`, and it remains the Helm chart's `persistence.mountPath`
+default — but it is no longer what the packages or the systemd unit default to.
+Those default to `/etc/puppetlabs/puppet/ssl/ca`, which is the Clojure CA's own
+layout and the one path the hardened unit grants under `ProtectSystem=strict`
+(see [docs/systemd.md](docs/systemd.md)). Neither of those is a rename, so
+neither breaches this contract.
+
+One deliberate exception, and it is the only path in the tree spelled the new
+way: the packages record whether they have enabled their provisioning oneshot
+under **`/var/lib/openvox-ca`** (`packaging/scripts/postinstall`). It is not a
+rebrand of `/var/lib/puppet-ca` but a different directory for a different
+thing — packaging bookkeeping that never existed in Puppet Server, so there is
+nothing to be a drop-in for. It must not be moved under `/var/lib/puppet-ca`,
+which is a cadir on any host upgraded from an earlier release; a marker file
+dropped inside somebody's CA directory is the confusion this avoids.
 
 ## Helm chart
 

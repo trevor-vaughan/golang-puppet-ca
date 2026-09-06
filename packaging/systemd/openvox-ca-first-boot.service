@@ -72,7 +72,27 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RemoveIPC=yes
+# RemoveIPC= is deliberately absent, and must stay absent.
+#
+# It removes every System V and POSIX IPC object owned by the unit's UID when
+# the unit stops -- the UID, not this unit's processes. That was harmless while
+# the service ran as a private `puppet-ca` account. It is not once the account
+# is `puppet`, which is shared with openvox-agent and openvox-server by design
+# (see above), because a co-located CA and Server is exactly the deployment
+# that sharing exists for.
+#
+# It is dropped rather than justified, because it protects nothing here.
+# openvox-ca creates no System V or POSIX IPC object at all: its only IPC is
+# the AF_UNIX socketpair the launcher passes to the isolated signer on fd 3
+# (internal/signer/signer.go), which RemoveIPC= does not cover and which the
+# kernel reclaims when the last descriptor closes. So the directive had no
+# cleanup to do for this service, and the only thing it could ever have acted
+# on belongs to somebody else.
+#
+# Note what this reasoning does NOT rest on: any claim about whether
+# openvox-server holds SysV IPC under that UID. That is another product's
+# internals, it can change without us, and a hardening directive should not
+# need it to be true.
 # The same set as the service, and AF_INET/AF_INET6 are here for one reason:
 # resolving this host's own name. `hostname -f` goes through NSS, which for
 # anything but a files-only nsswitch means a DNS query over UDP -- so denying

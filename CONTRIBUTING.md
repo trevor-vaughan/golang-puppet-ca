@@ -85,7 +85,7 @@ markdownlint-cli2 --fix
 See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
 
 - **Tests use [Ginkgo](https://onsi.github.io/ginkgo/) v2 + [Gomega](https://onsi.github.io/gomega/)** — no plain `testing.T` tests (beyond the one suite bootstrap per package) and no other assertion library.
-- **Compatibility contracts must not be renamed.** openvox-ca is a drop-in for the Puppet CA, so the `/puppet-ca/v1` route prefix, the `PUPPET_CA_` / `PUPPET_CA_CTL_` environment prefixes, the `puppetca_` metric namespace, and the default `puppet-ca` / `/etc/puppet-ca` / `/var/lib/puppet-ca` paths are deliberately preserved.
+- **Compatibility contracts must not be renamed.** openvox-ca is a drop-in for the Puppet CA, so the `/puppet-ca/v1` route prefix, the `PUPPET_CA_` / `PUPPET_CA_CTL_` environment prefixes, the `puppetca_` metric namespace, and the `puppet-ca` path spelling (`/etc/puppet-ca`, `/var/lib/puppet-ca`) are deliberately preserved. It is a contract about **names, not defaults** — a default path may move where there is a reason, as the packaged `cadir` has, but nothing spelled `puppet-ca` may be rebranded to `openvox-ca`. See [`AGENTS.md`](AGENTS.md) for the one exception and why it is one.
 - **Non-test code logs through `log/slog`** — no other logging library, and no in-tree `slog.Handler`. slog's handlers escape control characters, which is what the CodeQL `go/log-injection` exclusion depends on; the lint rule that backs this is a denylist, so it will not stop you reaching for an unlisted one.
 - **Route test artifacts to `.test-output/`** (gitignored).
 - **British English** in prose (docs, comments, commit messages, PR text); code identifiers follow the surrounding codebase.

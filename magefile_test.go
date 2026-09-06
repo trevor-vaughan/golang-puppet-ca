@@ -2488,6 +2488,24 @@ var _ = Describe("the provisioning oneshot's unit", func() {
 		Entry("the oneshot", firstBootUnit),
 	)
 
+	// RemoveIPC= acts on the UID rather than the unit, and this account is
+	// shared with openvox-agent and openvox-server -- so stopping the CA would
+	// reap IPC objects belonging to a neighbouring service. It protects
+	// nothing here either: openvox-ca's only IPC is an AF_UNIX socketpair,
+	// which RemoveIPC= does not cover. Both units must stay without it, and a
+	// hardening sweep that adds it back to either is the regression this
+	// catches.
+	DescribeTable("does not set RemoveIPC, which would reach a shared account",
+		func(path string) {
+			d, err := unitDirectives(path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(d).NotTo(HaveKey("RemoveIPC"),
+				"%s sets RemoveIPC on an account shared with openvox-server", path)
+		},
+		Entry("the service", filepath.Join("packaging", "systemd", distUnitFile)),
+		Entry("the oneshot", firstBootUnit),
+	)
+
 	// The oneshot handles the CA private key for as long as it takes to sign,
 	// so it is no less sensitive than the service -- and the two hardening
 	// blocks are maintained by hand in two files. Drift here is silent: the
@@ -2500,7 +2518,7 @@ var _ = Describe("the provisioning oneshot's unit", func() {
 			"ProtectSystem", "ProtectHome", "ProtectProc", "ProtectClock",
 			"ProtectHostname", "ProtectKernelLogs", "ProtectKernelModules",
 			"ProtectKernelTunables", "ProtectControlGroups", "RestrictNamespaces",
-			"RestrictRealtime", "RestrictSUIDSGID", "LockPersonality", "RemoveIPC",
+			"RestrictRealtime", "RestrictSUIDSGID", "LockPersonality",
 			"RestrictAddressFamilies", "SystemCallArchitectures", "SystemCallFilter",
 			"SystemCallErrorNumber", "CapabilityBoundingSet", "AmbientCapabilities",
 		}
