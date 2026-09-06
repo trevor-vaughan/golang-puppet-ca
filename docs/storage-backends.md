@@ -928,7 +928,9 @@ sql_dsn: file:/var/lib/puppet-ca/ca.db
 ```
 
 The migration copies the whole CA — certificate, keys, CRL, serial, the
-inventory (with its tamper-detection preserved), every pending CSR and every
+inventory (its integrity value is recomputed under the destination's own
+scheme, so tamper detection continues to work there — but a mismatch present
+before the copy does not survive it), every pending CSR and every
 signed certificate. Per-subject generated private keys are **not** copied: they
 always live on the local filesystem under `cadir`, so on a remote backend they
 stay put across a migration. The `ca_cert_file` / `ca_key_file` overrides are

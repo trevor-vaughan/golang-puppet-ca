@@ -440,9 +440,9 @@ CRL and every replica caches the CA certificate for its process lifetime.
 > this is not advice you can weigh up: those backends support one running
 > instance, so the command is refused outright while a server holds the store,
 > naming the process that holds it. On the backends that do coordinate across
-> nodes the command can run, but what no lock covers anywhere is the inventory
-> append, so an import racing issuance can still leave the inventory's integrity
-> value inconsistent. Stopping the CA is a one-line step; the import is not the
+> nodes the command can run, but the import is a read-modify-write over the
+> certificate and CRL that no lock covers end to end, so one racing issuance can
+> still interleave with it. Stopping the CA is a one-line step; the import is not the
 > place to economise. See [running a second process against a live
 > store](storage-backends.md#running-a-second-process-against-a-live-store).
 

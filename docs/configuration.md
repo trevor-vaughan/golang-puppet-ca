@@ -745,7 +745,8 @@ What that window does and does not mean:
   response with it, so `puppetca_ocsp_index_serials` tracks the inventory
   downward as well as upward.
 - **`filesystem` and `sqlite` are single-node**, so the job has nothing to find
-  there; it costs one local inventory read per interval.
+  there and is not started at all: the index stays as it was built at startup,
+  and no periodic inventory read is paid.
 
 The read takes no cluster lock and does not re-sign anything, but it is not
 free: it is the whole inventory, so unlike the CRL sync its cost grows with the

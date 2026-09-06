@@ -445,7 +445,7 @@ alongside a live server only when a backend has **both**:
 | --- | --- | --- | --- |
 | `postgres`, `mysql` | yes | yes | safe |
 | `etcd` | yes | yes | safe |
-| `redis` | yes | no | stop the server |
+| `redis` | yes | yes | safe |
 | `sqlite` | no (single-node) | yes | refused while the server runs |
 | `filesystem` (default) | no (single-node) | no | refused while the server runs |
 
@@ -454,9 +454,9 @@ one running instance, so the server holds the store while it runs and `generate`
 is refused outright, naming the process holding it — see [running a second
 process against a live
 store](storage-backends.md#running-a-second-process-against-a-live-store).
-`redis` is the row where the verdict really is advice: it coordinates across
-nodes, so several instances are supported, but its inventory append is not
-atomic and this command can still corrupt the integrity value.
+`redis` coordinates across nodes and appends atomically — its Lua append
+advances the integrity head in the same script — so several instances are
+supported and this command is safe beside them.
 
 Note which lock the first column measures: the **cross-node** one, which is what
 `SupportsDistributedLocking` probes and the only one that helps when the other
@@ -467,15 +467,18 @@ single-instance rule is enforced with rather than a substitute for it.
 
 What each missing capability costs is different. Without cross-node locking, two
 writers on different hosts can each decide a subject has no certificate and both
-issue one. Without an atomic inventory append — `filesystem` and `redis` — the
+issue one. Without an atomic inventory append — `filesystem` alone — the
 integrity record is recomputed from a snapshot, so an interleaved append leaves
 an HMAC covering a state that never existed, after which the server refuses to
-start and there is no supported repair
-([#188](https://github.com/voxpupuli/openvox-ca/issues/188)). That second
-failure is the reason to take this seriously. It does not apply to `sqlite`,
-which is single-node but appends atomically, nor to `etcd`, whose inventory is
-decomposed into per-entry keys and whose append commits the entry and the
-integrity head in one transaction.
+start. Recovery is a cutover: `migrate` rebuilds the integrity value on the
+destination, so it needs a second store, and a supported in-place rebuild is
+still open ([#188](https://github.com/voxpupuli/openvox-ca/issues/188)). That
+second failure is the reason to take this seriously. It does not apply to
+`sqlite`, which is single-node but appends atomically, nor to `etcd` and
+`redis`, whose inventories are decomposed into per-entry keys and fields and
+whose appends commit the entry and the integrity head together. The threat model
+is in
+[inventory-store.md](development/inventory-store.md#inventory-integrity-threat-model-and-rationale).
 
 On a fresh install this costs nothing, because there is no server running yet.
 It is re-minting on an established CA that forces a real outage.

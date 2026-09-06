@@ -1,8 +1,9 @@
 # CA key security
 
 This page covers how the CA private key is protected while the CA is running and
-at rest, the options for moving key custody off the CA host entirely, and the
-detective control that watches for anomalous destructive operations.
+at rest, the options for moving key custody off the CA host entirely, the
+detective control that watches for anomalous destructive operations, and where
+inventory integrity's own key lives.
 
 ## Process isolation
 
@@ -294,3 +295,23 @@ operators to potentially anomalous administrative activity. Operators should:
 
 The threshold (5 ops/minute) is a sensible default for environments where
 bulk revocation is uncommon. Future versions may make this configurable.
+
+## Inventory integrity, and the key that protects it
+
+The certificate inventory has its own integrity control — an HMAC-SHA256 over
+the inventory, or a hash chain on backends that store it as rows — keyed by
+`hmac_key`. It is documented, with its threat model, in
+[inventory-store.md](development/inventory-store.md#inventory-integrity-threat-model-and-rationale).
+
+It is mentioned here because it is a **key-custody** question as much as an
+integrity one, and the custody choice is the opposite of the one this page makes
+for the CA private key. `hmac_key` lives in the same storage backend as the
+inventory it protects, behind the same permissions. An attacker who can write
+the inventory can usually also read the key and recompute a valid MAC, so the
+control is aimed at accidental corruption and at tampering that cannot reach the
+key — not at an adversary with write access to the store. Unlike the CA private
+key, there is at present no option to move `hmac_key` outside that boundary.
+
+Whether that should change is an open question, and moving the key would close
+only part of the gap: the cheaper bypass needs no key at all. The trade-offs are
+set out in the threat model linked above.

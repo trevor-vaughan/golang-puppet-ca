@@ -356,20 +356,21 @@ whether it is safe to write to storage a live server is also using.
 | --- | --- | --- |
 | `postgres`, `mysql` | yes | yes |
 | `sqlite` | no | yes |
-| `etcd`, `redis` | yes | no |
+| `etcd`, `redis` | yes | yes |
 | `filesystem` | no | no |
 
 **"Atomic" here covers the line append *and* the integrity-head update
 together**, which is narrower than the word's use in the backend sections above.
-etcd's CAS append and Redis's Lua append are genuinely atomic for the line
-itself; what follows them is a separate write of a recomputed whole-blob HMAC,
-and it is that pair being non-atomic which makes a concurrent appender able to
-leave an integrity value covering a state that never existed. A backend can
-therefore append atomically and still answer `false` here without either claim
-being wrong.
+Only the filesystem backend now answers `false`: it reads the whole inventory,
+appends, and writes a recomputed whole-blob HMAC as a separate step, and it is
+that pair being non-atomic which lets a concurrent appender leave an integrity
+value covering a state that never existed. etcd and Redis once answered `false`
+for the same reason; their decompositions closed it, advancing the chain head
+inside the CAS append and the Lua script respectively.
 
 `SupportsAtomicInventory` wraps `asInventoryStore`, so it is true exactly for
-backends implementing `InventoryStore` — the SQL backends, including SQLite.
+backends implementing `InventoryStore` — the SQL backends including SQLite, plus
+etcd and Redis.
 It is a method rather than a caller-side type assertion because
 `asInventoryStore` unwraps `OverlayBackend`, and a caller asserting on the
 wrapper would answer "no" for a SQL backend that happens to be overlaid by

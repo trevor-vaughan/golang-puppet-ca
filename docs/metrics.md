@@ -105,7 +105,12 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > every path that calls it, which is what makes this counter cover all five
 > rather than only the one that noticed. On the revoke paths alone it also counts
 > a malformed serial, or an inventory read that failed while resolving the
-> subject's serial. That last one
+> subject's serial — which on the filesystem backend includes an **integrity
+> MAC that no longer verifies**, since both revoke paths verify there, so this
+> counter is the one a tamper signal reaches on the default backend (see the
+> [inventory integrity threat
+> model](development/inventory-store.md#inventory-integrity-threat-model-and-rationale)).
+> That last one
 > includes a revocation whose wait for the per-subject lock spent the 60-second
 > budget behind another goroutine *in this process* on the single-node backends,
 > which reach the read with the deadline already gone; see
@@ -163,8 +168,8 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > MySQL, etcd and Redis; the single-node backends take the subject lock and fail
 > at the CRL lock beneath it, which *is* counted, by the rule above — *unless*
 > another process on the same host was holding it, the one case where they too
-> refuse at acquisition), a revocation that failed before reaching the CRL
-> because the inventory could not resolve the subject's serial (though `PUT
+> refuse at acquisition), a revocation whose subject or serial was simply **not
+> present** in the inventory — a read that *failed* is counted, per above (though `PUT
 > /certificate_status` also answers its caller `409` in both cases), and a
 > malformed serial met by the cleanup job.
 >

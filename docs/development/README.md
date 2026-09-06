@@ -16,6 +16,6 @@ style).
 | [Testing](testing.md) | Unit, integration, compose, and load test suites and how to run them |
 | [Storage internals](storage-internals.md) | Backend key layouts, cross-node coordination, SQL schema, and how to add a backend |
 | [Locking and concurrency](locking.md) | The three locking tiers, lock names and ordering, read-path policy, and rules for new code |
-| [Inventory store](inventory-store.md) | Internal design of the structured (`InventoryStore`) inventory capability |
+| [Inventory store](inventory-store.md) | Internal design of the structured (`InventoryStore`) inventory capability, and the inventory integrity threat model |
 | [Publishing container images](publishing-images.md) | The GHCR publishing workflow and one-time repository setup |
 | [Cutting a release](releasing.md) | Tagging a release, what the automation publishes, release notes, and rehearsing on a fork |
