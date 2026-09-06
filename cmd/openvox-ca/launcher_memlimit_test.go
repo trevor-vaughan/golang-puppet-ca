@@ -517,6 +517,28 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Entry("GOMEMLIMIT off", memLimitEnv("off"), budgetNoCeiling),
 		)
 
+		DescribeTable("an unusable launcher reservation falls back to its own default",
+			func(value string) {
+				// The signer's equivalent asserted the resulting VALUE; the
+				// launcher's asserted only that a note mentioned the right key.
+				// A note naming the correct key while the share fell back to the
+				// wrong number would have passed -- the observation was scoped
+				// wider than the property it was named for.
+				cfg := &serverConfig{MemoryReserveLauncher: value}
+				budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+
+				Expect(kind).To(Equal(budgetApplied))
+				Expect(budget.launcher).To(Equal(int64(8<<20)),
+					"the launcher's own default, not the signer's")
+				Expect(budget.signer).To(Equal(int64(24<<20)), "and the signer's is untouched")
+			},
+			Entry("not a byte count", "64MB"),
+			Entry("zero", "0"),
+			Entry("negative", "-1"),
+			Entry("below the floor", "1MiB"),
+			Entry("one byte below the floor", "8388607"),
+		)
+
 		It("names the launcher's own key in its note, not the signer's", func() {
 			// byteCountOrDefault takes the key name as a string, and only the
 			// signer's was ever asserted: a copy-paste making both resolvers
@@ -527,6 +549,7 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(kind).To(Equal(budgetApplied))
 			joined := strings.Join(budget.notes, "\n")
 			Expect(joined).To(ContainSubstring("memory_reserve_launcher"))
+			Expect(joined).To(ContainSubstring(`"64MB"`), "and the value it ignored")
 			Expect(joined).NotTo(ContainSubstring("memory_reserve_signer"))
 		})
 
