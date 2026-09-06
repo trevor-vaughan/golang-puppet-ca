@@ -164,13 +164,29 @@ func preflightInstanceLock(ctx context.Context, cfg *serverConfig) error {
 // because Close runs closers in reverse and the lock must outlive the backend
 // handle it protects. Why that ordering matters, and why openvox-ca-ctl reaches
 // it by a different route, is stated once on StorageService.AcquireInstanceLock.
-func holdInstanceLock(ctx context.Context, rt *caRuntime, opts ...storage.InstanceLockOption) error {
+//
+// enforced reports whether the lock actually excludes a second instance.
+// AcquireInstanceLock returns a working no-op — nil error, usable Unlocker —
+// on every backend it has nothing to enforce for: one that coordinates across
+// hosts (many replicas are expected), one offering no store-wide lock at all,
+// and one whose lock set is unavailable.
+//
+// Three of the four callers discard it today, and the reason differs per
+// caller rather than following a rule: csr and import-ca-cert displace a writer
+// rather than compute over a snapshot, so a lost race is a conflict they would
+// notice; generate has the same snapshot exposure the rebuild does — its own
+// pre-flight says a concurrent append can leave an HMAC covering a blob that
+// never existed — but warns rather than refusing, and changing that is out of
+// scope for #188. Only rebuild-inventory-hmac acts on the answer. A fifth
+// caller should decide deliberately rather than copy whichever neighbour it
+// read first.
+func holdInstanceLock(ctx context.Context, rt *caRuntime, opts ...storage.InstanceLockOption) (enforced bool, err error) {
 	ul, err := rt.Store.AcquireInstanceLock(ctx, opts...)
 	if err != nil {
-		return err
+		return false, err
 	}
 	rt.closers = append([]func() error{ul.Unlock}, rt.closers...)
-	return nil
+	return storage.LockIsEnforced(ul), nil
 }
 
 // resolveRuntimeForRole resolves the runtime a process running as role should

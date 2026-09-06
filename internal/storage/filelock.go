@@ -317,6 +317,10 @@ type fileUnlocker struct {
 	path  string
 }
 
+// enforcesInstance is true: an flock(2) really does exclude a second process on
+// this host. See LockIsEnforced for why this is answered positively.
+func (u *fileUnlocker) enforcesInstance() bool { return true }
+
 func (u *fileUnlocker) Unlock() error {
 	// close(2) drops every flock this descriptor holds; there is no window
 	// between the two where the lock is held without an owner.

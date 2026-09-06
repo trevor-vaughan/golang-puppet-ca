@@ -799,7 +799,7 @@ var _ = Describe("openvox-ca generate", func() {
 			_, stderr, err := runGenerate("--cadir", caDir, "--certname", "admin",
 				"--ttl", "8760h", "--pp-cli-auth", "--key-out", keyPath("admin"))
 			Expect(err).NotTo(HaveOccurred())
-			Expect(stderr).To(ContainSubstring("terminal-only"))
+			Expect(stderr).To(ContainSubstring("the audit record for this mint is terminal-only"))
 		})
 
 		It("falls back to stderr when the configured logfile cannot be opened", func() {

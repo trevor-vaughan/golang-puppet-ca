@@ -572,3 +572,28 @@ func (c *countingLocker) calls() int {
 	defer c.mu.Unlock()
 	return c.n
 }
+
+var _ = Describe("LockIsEnforced", func() {
+	// The predicate is the sole input to rebuild-inventory-hmac's refusal, and
+	// it must fail closed: an Unlocker it does not recognise has to read as
+	// unenforced, because the cost of the other direction is proceeding on a
+	// store nothing proved was quiet.
+	It("is false for the no-op AcquireInstanceLock hands back", func() {
+		Expect(LockIsEnforced(noopUnlocker{})).To(BeFalse())
+	})
+
+	It("is false for an unrecognised Unlocker rather than assuming enforcement", func() {
+		Expect(LockIsEnforced(strangeUnlocker{})).To(BeFalse(),
+			"an Unlocker this predicate has not been told about must not read as a real lock")
+	})
+
+	It("is true for the file lock, which really does exclude another process", func() {
+		Expect(LockIsEnforced(&fileUnlocker{})).To(BeTrue())
+	})
+})
+
+// strangeUnlocker is an Unlocker from outside this package's knowledge — a
+// wrapper, or a no-op variant added later.
+type strangeUnlocker struct{}
+
+func (strangeUnlocker) Unlock() error { return nil }

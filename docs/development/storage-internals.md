@@ -339,18 +339,42 @@ integrity value under the whole-blob HMAC scheme when a local cert/key override
 wrapped a SQL backend, instead of that backend's hash chain. The first start
 after upgrading such a deployment reports `ErrInventoryTampered` even though
 nothing was tampered with — only the *scheme* changed, not the data. The
-inventory rows are intact, so recompute the integrity head by running
-`openvox-ca-ctl migrate` from the affected backend into a fresh destination (the
-migration rewrites the head under the correct scheme; a store cannot be migrated
-onto itself) and then serve from that destination. This affects pre-release
-builds only; deployments created after the fix are unaffected.
+inventory rows are intact, so the head simply needs recomputing under the scheme
+the backend is now read as.
+
+`openvox-ca rebuild-inventory-hmac --yes-re-bless --replicas-stopped` does
+exactly that, in place:
+it recomputes from the current entries under the current scheme, which is the
+head the migration below would have written. Read its own warning first — it
+re-asserts integrity rather than verifying it — though in this state the premise
+above ("the inventory rows are intact") is what makes that safe.
+
+`--replicas-stopped` is required on PostgreSQL and MySQL, which coordinate locks
+across hosts: the command cannot tell whether a replica is appending, so it asks
+you to say so. Stop every replica first. On SQLite the flag is unnecessary — the
+instance lock enforces the same thing, and the command refuses on its own while
+a server holds the store. See
+[`rebuild-inventory-hmac`](../operator-cli.md#rebuild-inventory-hmac-re-asserting-inventory-integrity).
+
+The older route still works and remains the fallback: `openvox-ca-ctl migrate`
+from the affected backend into a fresh destination (the migration rewrites the
+head under the correct scheme; a store cannot be migrated onto itself), then
+serve from that destination. It is a whole-store copy and a reconfiguration
+where the rebuild is one command.
+
+This affects pre-release builds only; deployments created after the fix are
+unaffected.
 
 ## Optional capabilities
 
 Two properties vary by backend and are not visible from the `Backend` interface
 alone. `StorageService` answers both, because callers that need to know cannot
-determine them for themselves — `openvox-ca generate` uses them to decide
-whether it is safe to write to storage a live server is also using.
+determine them for themselves. `openvox-ca generate` uses them to decide whether
+it is safe to write to storage a live server is also using, and `openvox-ca
+rebuild-inventory-hmac` uses them to decide whether it can refuse at all — on a
+backend that coordinates across hosts the single-instance rule does not apply,
+so it requires an explicit `--replicas-stopped` assertion instead. See the
+`capability-probe` row in [tier 1: cluster-wide named locks](locking.md#tier-1-cluster-wide-named-locks-withlock).
 
 | Backend | `SupportsDistributedLocking` | `SupportsAtomicInventory` |
 | --- | --- | --- |

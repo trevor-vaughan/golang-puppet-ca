@@ -98,7 +98,7 @@ identically whether the key is a local PEM file or lives in OpenBao Transit.`,
 			// Refuse while a server holds the store. --create-key writes the CA
 			// key, and a backend without distributed locking supports exactly
 			// one running process against it.
-			if err := holdInstanceLock(cmd.Context(), rt); err != nil {
+			if _, err := holdInstanceLock(cmd.Context(), rt); err != nil {
 				return err
 			}
 

@@ -160,6 +160,13 @@ recomputes the destination's integrity head from its entries
 (`RebuildInventoryHMAC`). This resolves the otherwise-spurious
 `ErrInventoryTampered` that copying a foreign `inventory_hmac` would cause.
 
+`RebuildInventoryHMAC` is no longer reached only from a migration: the offline
+[`openvox-ca rebuild-inventory-hmac`](../operator-cli.md#rebuild-inventory-hmac-re-asserting-inventory-integrity)
+calls it too, as the supported repair for a CA whose stored integrity value has
+stopped verifying. Note what that command
+re-asserts rather than verifies, and why it cannot say *which* entry diverged —
+one head is persisted, not one per entry.
+
 ### The certificate index (`CertIndex`)
 
 The inventory table doubles as a **certificate index**: alongside the four

@@ -4,8 +4,9 @@ This is the full configuration reference for the `openvox-ca` server. For the
 operator CLI, see [operator CLI (`openvox-ca-ctl`)](operator-cli.md), which also
 covers the offline subcommands that run on the `openvox-ca` binary itself
 against this configuration — `csr` and `import-ca-cert`, for running under an
-external root CA with any `ca_key_provider`, and `generate`, for minting a
-certificate with no running server.
+external root CA with any `ca_key_provider`, `generate`, for minting a
+certificate with no running server, and `rebuild-inventory-hmac`, for
+re-asserting inventory integrity on a CA that will not start.
 
 ## Flags
 
@@ -1350,8 +1351,10 @@ and so must anything else that touches the store. `openvox-ca-ctl` and the
 offline `openvox-ca` subcommands take the same locks the server does, so run
 them as that user rather than under `sudo`: a root-owned lock file left in
 `locks/` will fail the server's next acquisition of that name. They also require
-the server to be stopped, because the filesystem backend supports a single
-running instance. See [running a second process against a live
+the server to be stopped before they write, because the filesystem backend
+supports a single running instance. `rebuild-inventory-hmac` is the one
+exception, and only in its reporting mode, which takes no store-wide
+instance lock, so a CA can be inspected while it runs. See [running a second process against a live
 store](storage-backends.md#running-a-second-process-against-a-live-store).
 
 ## Graceful shutdown
