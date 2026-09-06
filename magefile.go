@@ -865,11 +865,18 @@ var automergeActionRE = regexp.MustCompile(`(?i)auto-?merge`)
 //
 // build:packages is listed BEFORE its caller exists. Nothing in this tree runs
 // it: release.yml here has three jobs (verify, build, release) and no
-// packaging job, and docs/development/releasing.md does not mention packages
-// at all. The packaging job that calls it twice arrives with #266, which was
-// held until this target existed. So this entry is deliberately early rather
-// than describing the tree you are reading -- do not delete it as unused on
-// the evidence of a grep through release.yml.
+// packaging job. The job that calls it -- once, at release.yml:155 on #266's
+// branch -- arrives with #266, which was held until this target existed. So
+// this entry is deliberately early rather than describing the tree you are
+// reading, and a grep through release.yml is not evidence that it is unused.
+//
+// The count is stated because it was got wrong: `git grep -c` reports 2 for
+// that file, and the second line is a comment describing the target rather
+// than a second invocation. It counts matching lines, not occurrences.
+//
+// docs/development/releasing.md DOES describe packages, as of the commit that
+// made the build reproducible -- what it does not have is a release job that
+// builds them, which is the thing this entry stands in for.
 //
 // What it is worth once that caller lands: a workflow names a target as a
 // string, so deleting or renaming the target would compile cleanly, pass every
